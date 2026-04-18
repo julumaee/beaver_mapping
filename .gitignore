@@ -17,6 +17,10 @@ data/hydrography/
 data/labels/
 data/output/
 
+# Generated artefacts — models and training chips
+*.pkl
+*.npy
+
 # IDE
 .vscode/
 .idea/
