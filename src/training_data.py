@@ -4,8 +4,13 @@ import zipfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+import numpy as np
+import rasterio
+from rasterio.windows import Window
 from pyproj import Transformer
 from shapely.geometry import Point, MultiPoint
+
+from ingestion import TILE_SIZE
 
 _KML_NS = "http://www.opengis.net/kml/2.2"
 
@@ -38,6 +43,79 @@ def parse_kml_labels(kml_path: str) -> list[Point]:
         coords_3067.append(Point(x, y))
 
     return coords_3067
+
+
+def extract_chips(
+    jp2_path: str,
+    seed_points: list[Point],
+    out_dir: str,
+    label: int,
+    manifest_rows: list[dict] | None = None,
+) -> list[str]:
+    """
+    For each seed point (EPSG:3067) extract a TILE_SIZE×TILE_SIZE chip centred
+    on that point from jp2_path and save it as a .npy file under out_dir.
+
+    Returns a list of written file paths.  If manifest_rows is provided,
+    appends one dict per chip (path, label, x, y) to it.
+    """
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    written: list[str] = []
+    half = TILE_SIZE // 2
+
+    with rasterio.open(jp2_path) as src:
+        for i, pt in enumerate(seed_points):
+            col, row = ~src.transform * (pt.x, pt.y)
+            col, row = int(col), int(row)
+
+            col_off = col - half
+            row_off = row - half
+
+            if (
+                col_off + TILE_SIZE <= 0
+                or row_off + TILE_SIZE <= 0
+                or col_off >= src.width
+                or row_off >= src.height
+            ):
+                continue
+
+            win = Window(
+                col_off=max(col_off, 0),
+                row_off=max(row_off, 0),
+                width=min(TILE_SIZE, src.width - max(col_off, 0)),
+                height=min(TILE_SIZE, src.height - max(row_off, 0)),
+            )
+
+            data = src.read(window=win)
+
+            if data.shape[1] != TILE_SIZE or data.shape[2] != TILE_SIZE:
+                padded = np.zeros(
+                    (data.shape[0], TILE_SIZE, TILE_SIZE), dtype=data.dtype
+                )
+                pad_row = max(-row_off, 0)
+                pad_col = max(-col_off, 0)
+                padded[
+                    :,
+                    pad_row : pad_row + data.shape[1],
+                    pad_col : pad_col + data.shape[2],
+                ] = data
+                data = padded
+
+            stem = Path(jp2_path).stem
+            tag = "pos" if label == 1 else "neg"
+            fname = f"{stem}_{tag}_{i:04d}.npy"
+            fpath = out_path / fname
+            np.save(str(fpath), data)
+            written.append(str(fpath))
+
+            if manifest_rows is not None:
+                manifest_rows.append(
+                    {"path": str(fpath), "label": label, "x": pt.x, "y": pt.y}
+                )
+
+    return written
 
 
 # ---------------------------------------------------------------------------
