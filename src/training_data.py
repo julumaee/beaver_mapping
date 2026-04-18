@@ -4,13 +4,20 @@ import zipfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+import csv
+import random
+
 import numpy as np
 import rasterio
 from rasterio.windows import Window
 from pyproj import Transformer
 from shapely.geometry import Point, MultiPoint
+from shapely.ops import unary_union
 
 from ingestion import TILE_SIZE
+
+# Minimum separation (metres) between a negative sample and any positive point.
+NEGATIVE_EXCLUSION_RADIUS = 300
 
 _KML_NS = "http://www.opengis.net/kml/2.2"
 
@@ -116,6 +123,85 @@ def extract_chips(
                 )
 
     return written
+
+
+def sample_negatives(
+    stream_mask,
+    positive_points: list[Point],
+    n: int,
+    rng_seed: int = 42,
+) -> list[Point]:
+    """
+    Draw n random points from inside stream_mask that are at least
+    NEGATIVE_EXCLUSION_RADIUS metres away from every positive point.
+
+    stream_mask must be a Shapely geometry in EPSG:3067.
+    Returns at most n points (may be fewer if the mask area is small).
+    """
+    if positive_points:
+        exclusion = unary_union(
+            [p.buffer(NEGATIVE_EXCLUSION_RADIUS) for p in positive_points]
+        )
+        candidate_area = stream_mask.difference(exclusion)
+    else:
+        candidate_area = stream_mask
+
+    if candidate_area.is_empty:
+        return []
+
+    minx, miny, maxx, maxy = candidate_area.bounds
+    rng = random.Random(rng_seed)
+    samples: list[Point] = []
+
+    for _ in range(n * 200):
+        if len(samples) >= n:
+            break
+        x = rng.uniform(minx, maxx)
+        y = rng.uniform(miny, maxy)
+        pt = Point(x, y)
+        if candidate_area.contains(pt):
+            samples.append(pt)
+
+    return samples
+
+
+def build_training_dataset(
+    jp2_paths: list[str],
+    kml_paths: list[str],
+    stream_mask,
+    out_dir: str,
+    n_negatives: int | None = None,
+    rng_seed: int = 42,
+) -> str:
+    """
+    Orchestrate the full training data pipeline:
+      1. Parse all KML labels → positive seed points (EPSG:3067)
+      2. Sample equal-count (or n_negatives) negative points from stream_mask
+      3. Extract chips from each jp2 for both positive and negative points
+      4. Write a manifest CSV and return its path
+    """
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    positive_points: list[Point] = []
+    for kml_path in kml_paths:
+        positive_points.extend(parse_kml_labels(kml_path))
+
+    n_neg = n_negatives if n_negatives is not None else len(positive_points)
+    negative_points = sample_negatives(stream_mask, positive_points, n_neg, rng_seed)
+
+    manifest_rows: list[dict] = []
+    for jp2_path in jp2_paths:
+        extract_chips(jp2_path, positive_points, out_dir, label=1, manifest_rows=manifest_rows)
+        extract_chips(jp2_path, negative_points, out_dir, label=0, manifest_rows=manifest_rows)
+
+    manifest_path = out_path / "manifest.csv"
+    with open(manifest_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["path", "label", "x", "y"])
+        writer.writeheader()
+        writer.writerows(manifest_rows)
+
+    return str(manifest_path)
 
 
 # ---------------------------------------------------------------------------
