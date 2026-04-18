@@ -1,0 +1,7 @@
+rasterio
+fiona
+pyproj
+geopandas
+shapely
+opencv-python
+scikit-learn
