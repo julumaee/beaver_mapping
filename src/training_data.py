@@ -23,48 +23,59 @@ _KML_NS = "http://www.opengis.net/kml/2.2"
 
 _WGS84_TO_ETRS = Transformer.from_crs(4326, 3067, always_xy=True)
 
+# Feature types excluded from training by default.
+# wet_forest and beaver_flood are treated as the same positive class (label=1)
+# because they are spectrally indistinguishable at 512×512 chip resolution.
+DEFAULT_EXCLUDE: frozenset[str] = frozenset({"lodge"})
 
-def parse_kml_labels(kml_path: str) -> list[Point]:
+
+def parse_kml_labels(kml_path: str) -> list[tuple[Point, str]]:
     """
-    Parse a KML or KMZ file and return Placemark centroids in EPSG:3067.
+    Parse a KML or KMZ file and return (centroid_epsg3067, feature_type) pairs.
 
-    Placemarks may contain Point, Polygon, or LineString geometry; the centroid
-    of each is used so callers get a uniform list of seed coordinates.
+    feature_type is taken from the Placemark <name> tag, lowercased and stripped.
+    Placemarks with no name get type "unknown".
+    Geometry centroid is used for Polygons and LineStrings.
     """
     kml_text = _read_kml_text(kml_path)
     root = ET.fromstring(kml_text)
 
     ns = _KML_NS if root.tag.startswith("{") else ""
 
-    coords_3067: list[Point] = []
+    results: list[tuple[Point, str]] = []
     for pm in root.iter(f"{{{ns}}}Placemark" if ns else "Placemark"):
         raw = _extract_coords(pm, ns)
         if not raw:
             continue
+
+        name_el = pm.find(f"{{{ns}}}name" if ns else "name")
+        feature_type = name_el.text.strip().lower() if (name_el is not None and name_el.text) else "unknown"
+
         if len(raw) == 1:
             lon, lat = raw[0]
         else:
             mp = MultiPoint(raw)
             lon, lat = mp.centroid.x, mp.centroid.y
-        x, y = _WGS84_TO_ETRS.transform(lon, lat)
-        coords_3067.append(Point(x, y))
 
-    return coords_3067
+        x, y = _WGS84_TO_ETRS.transform(lon, lat)
+        results.append((Point(x, y), feature_type))
+
+    return results
 
 
 def extract_chips(
     jp2_path: str,
-    seed_points: list[Point],
+    labeled_points: list[tuple[Point, str]],
     out_dir: str,
     label: int,
     manifest_rows: list[dict] | None = None,
 ) -> list[str]:
     """
-    For each seed point (EPSG:3067) extract a TILE_SIZE×TILE_SIZE chip centred
+    For each (point, feature_type) extract a TILE_SIZE×TILE_SIZE chip centred
     on that point from jp2_path and save it as a .npy file under out_dir.
 
     Returns a list of written file paths.  If manifest_rows is provided,
-    appends one dict per chip (path, label, x, y) to it.
+    appends one dict per chip (path, label, feature_type, x, y) to it.
     """
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
@@ -73,7 +84,7 @@ def extract_chips(
     half = TILE_SIZE // 2
 
     with rasterio.open(jp2_path) as src:
-        for i, pt in enumerate(seed_points):
+        for i, (pt, feature_type) in enumerate(labeled_points):
             col, row = ~src.transform * (pt.x, pt.y)
             col, row = int(col), int(row)
 
@@ -118,9 +129,13 @@ def extract_chips(
             written.append(str(fpath))
 
             if manifest_rows is not None:
-                manifest_rows.append(
-                    {"path": str(fpath), "label": label, "x": pt.x, "y": pt.y}
-                )
+                manifest_rows.append({
+                    "path": str(fpath),
+                    "label": label,
+                    "feature_type": feature_type,
+                    "x": pt.x,
+                    "y": pt.y,
+                })
 
     return written
 
@@ -172,32 +187,41 @@ def build_training_dataset(
     out_dir: str,
     n_negatives: int | None = None,
     rng_seed: int = 42,
+    exclude_features: frozenset[str] = DEFAULT_EXCLUDE,
 ) -> str:
     """
     Orchestrate the full training data pipeline:
-      1. Parse all KML labels → positive seed points (EPSG:3067)
+      1. Parse all KML labels → (point, feature_type) pairs, filtering excluded types
       2. Sample equal-count (or n_negatives) negative points from stream_mask
       3. Extract chips from each jp2 for both positive and negative points
-      4. Write a manifest CSV and return its path
+      4. Write a manifest CSV (columns: path, label, feature_type, x, y) and return its path
+
+    wet_forest and beaver_flood are both treated as label=1 — they are spectrally
+    indistinguishable at chip resolution and combining them increases sample count.
+    lodge is excluded by default (too small to produce a usable chip-level signal).
     """
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
-    positive_points: list[Point] = []
+    positive_labeled: list[tuple[Point, str]] = []
     for kml_path in kml_paths:
-        positive_points.extend(parse_kml_labels(kml_path))
+        for pt, ftype in parse_kml_labels(kml_path):
+            if ftype not in exclude_features:
+                positive_labeled.append((pt, ftype))
 
-    n_neg = n_negatives if n_negatives is not None else len(positive_points)
+    positive_points = [pt for pt, _ in positive_labeled]
+    n_neg = n_negatives if n_negatives is not None else len(positive_labeled)
     negative_points = sample_negatives(stream_mask, positive_points, n_neg, rng_seed)
+    negative_labeled = [(pt, "negative") for pt in negative_points]
 
     manifest_rows: list[dict] = []
     for jp2_path in jp2_paths:
-        extract_chips(jp2_path, positive_points, out_dir, label=1, manifest_rows=manifest_rows)
-        extract_chips(jp2_path, negative_points, out_dir, label=0, manifest_rows=manifest_rows)
+        extract_chips(jp2_path, positive_labeled, out_dir, label=1, manifest_rows=manifest_rows)
+        extract_chips(jp2_path, negative_labeled, out_dir, label=0, manifest_rows=manifest_rows)
 
     manifest_path = out_path / "manifest.csv"
     with open(manifest_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["path", "label", "x", "y"])
+        writer = csv.DictWriter(f, fieldnames=["path", "label", "feature_type", "x", "y"])
         writer.writeheader()
         writer.writerows(manifest_rows)
 
