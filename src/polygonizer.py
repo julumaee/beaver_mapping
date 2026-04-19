@@ -35,10 +35,16 @@ def detect_rois(
     If stream_mask is None the full raster is scanned.
     stream_lines (virtavesikapea geometry) is used to orient dam lines.
     """
-    if stream_mask is None:
-        meta = read_metadata(jp2_path)
-        b = meta["bounds"]
-        stream_mask = box(b.left, b.bottom, b.right, b.top)
+    with rasterio.open(jp2_path) as src:
+        b = src.bounds
+        raster_box = box(b.left, b.bottom, b.right, b.top)
+
+    # If the stream mask doesn't cover this raster at all, scan the full image.
+    if stream_mask is not None and not stream_mask.intersects(raster_box):
+        print("  No hydrography coverage for this image — scanning full raster")
+        effective_mask = None
+    else:
+        effective_mask = stream_mask
 
     dam_candidates: list[tuple] = []
     flood_candidates: list[tuple] = []
@@ -57,11 +63,11 @@ def detect_rois(
                 win_box = box(*win_bounds)
                 tiles_checked += 1
 
-                # Require the inner half of the tile to intersect the stream
-                # mask — looser than centroid-only but tighter than any-intersect.
-                inner_box = win_box.buffer(-(TILE_SIZE * src.transform.a / 4))
-                if inner_box.is_empty or not stream_mask.intersects(inner_box):
-                    continue
+                if effective_mask is not None:
+                    # Require the inner half of the tile to intersect the stream mask.
+                    inner_box = win_box.buffer(-(TILE_SIZE * src.transform.a / 4))
+                    if inner_box.is_empty or not effective_mask.intersects(inner_box):
+                        continue
                 tiles_passed += 1
 
                 data = src.read(window=win)
