@@ -61,6 +61,30 @@ def _load_stream_layers(path: Path) -> list[gpd.GeoDataFrame]:
     return [gpd.read_file(path, layer=l) for l in layers]
 
 
+def load_stream_lines(hydro_path: str):
+    """
+    Return a merged Shapely geometry of stream centrelines (virtavesikapea)
+    for use in computing dam line orientations.  Returns None if no line
+    layers are found.
+    """
+    files = _resolve_files(hydro_path)
+    gdfs = []
+    for f in files:
+        try:
+            available = fiona.listlayers(str(f))
+        except Exception:
+            continue
+        if "virtavesikapea" in available:
+            gdf = gpd.read_file(f, layer="virtavesikapea")
+            if gdf.crs is not None and gdf.crs.to_epsg() != 3067:
+                gdf = gdf.to_crs(epsg=3067)
+            gdfs.append(gdf)
+    if not gdfs:
+        return None
+    combined = gpd.pd.concat(gdfs, ignore_index=True)
+    return combined.geometry.unary_union
+
+
 def _resolve_files(path: str) -> list[Path]:
     p = Path(path)
     if p.is_file():

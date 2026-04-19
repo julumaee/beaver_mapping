@@ -75,6 +75,7 @@ def cmd_train(args: argparse.Namespace) -> None:
 
 def cmd_detect(args: argparse.Namespace) -> None:
     from classifier import load_model
+    from masking import load_stream_lines
     from polygonizer import detect_rois
     from export import export_kml
 
@@ -84,21 +85,27 @@ def cmd_detect(args: argparse.Namespace) -> None:
 
     clf = load_model(args.model)
     stream_mask = _load_mask(args.hydro)
+    stream_lines = load_stream_lines(args.hydro) if args.hydro else None
 
-    all_rois: list[tuple] = []
+    all_dams: list[tuple] = []
+    all_floods: list[tuple] = []
+
     for jp2_path in jp2_files:
         print(f"Processing {jp2_path} ...")
-        rois = detect_rois(
+        dam_lines, flood_rois = detect_rois(
             jp2_path,
             clf,
             stream_mask=stream_mask,
+            stream_lines=stream_lines,
             confidence_threshold=args.threshold,
         )
-        print(f"  Found {len(rois)} ROI(s)")
-        all_rois.extend(rois)
+        print(f"  Dams: {len(dam_lines)}, Flooded areas: {len(flood_rois)}")
+        all_dams.extend(dam_lines)
+        all_floods.extend(flood_rois)
 
-    print(f"Exporting {len(all_rois)} total ROI(s) to {args.output} ...")
-    export_kml(all_rois, args.output)
+    print(f"Exporting {len(all_dams)} dam(s) and {len(all_floods)} flooded area(s) "
+          f"to {args.output} ...")
+    export_kml(all_dams, all_floods, args.output)
     print("Done.")
 
 
