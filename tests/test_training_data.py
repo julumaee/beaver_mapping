@@ -222,11 +222,10 @@ class TestSampleNegatives:
         for pt in sample_negatives(mask, [], n=30):
             assert mask.contains(pt)
 
-    def test_exclusion_zone_respected(self):
+    def test_all_points_inside_mask(self):
         mask = self._mask()
-        centroid = mask.centroid
-        for pt in sample_negatives(mask, [centroid], n=20, rng_seed=0):
-            assert pt.distance(centroid) >= NEGATIVE_EXCLUSION_RADIUS - 1
+        for pt in sample_negatives(mask, [], n=20, rng_seed=0):
+            assert mask.contains(pt)
 
     def test_deterministic_with_same_seed(self):
         mask = self._mask()
