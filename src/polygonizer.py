@@ -46,7 +46,7 @@ def detect_rois(
                 win_bounds = rasterio.windows.bounds(win, src.transform)
                 win_box = box(*win_bounds)
 
-                if not stream_mask.intersects(win_box):
+                if not stream_mask.contains(win_box.centroid):
                     continue
 
                 data = src.read(window=win)

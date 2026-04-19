@@ -17,7 +17,9 @@ from shapely.ops import unary_union
 from ingestion import TILE_SIZE
 
 # Minimum separation (metres) between a negative sample and any positive point.
-NEGATIVE_EXCLUSION_RADIUS = 100
+# Small enough to leave plenty of stream area available for negative sampling,
+# large enough to avoid placing a negative chip directly on top of a feature.
+NEGATIVE_EXCLUSION_RADIUS = 50
 
 _KML_NS = "http://www.opengis.net/kml/2.2"
 
@@ -144,40 +146,34 @@ def sample_negatives(
     positive_points: list[Point],
     n: int,
     rng_seed: int = 42,
-    fallback_area=None,
 ) -> list[Point]:
     """
-    Draw n random points that are at least NEGATIVE_EXCLUSION_RADIUS metres
-    from every positive point, sampling first from stream_mask then falling
-    back to fallback_area (e.g. the imagery bounds) if not enough are found.
+    Draw n random points from inside stream_mask that are at least
+    NEGATIVE_EXCLUSION_RADIUS metres from every positive point.
 
-    stream_mask must be a Shapely geometry in EPSG:3067.
+    Negatives are always drawn from stream areas so the classifier learns
+    "beaver stream vs. normal stream", not "stream vs. land".
+    Returns however many could be found (may be fewer than n).
     """
     exclusion = (
         unary_union([p.buffer(NEGATIVE_EXCLUSION_RADIUS) for p in positive_points])
         if positive_points else None
     )
+    candidate = stream_mask.difference(exclusion) if exclusion else stream_mask
 
-    def _sample_from(area, needed, rng) -> list[Point]:
-        candidate = area.difference(exclusion) if exclusion else area
-        if candidate.is_empty:
-            return []
-        minx, miny, maxx, maxy = candidate.bounds
-        found = []
-        for _ in range(needed * 500):
-            if len(found) >= needed:
-                break
-            pt = Point(rng.uniform(minx, maxx), rng.uniform(miny, maxy))
-            if candidate.contains(pt):
-                found.append(pt)
-        return found
+    if candidate.is_empty:
+        return []
 
+    minx, miny, maxx, maxy = candidate.bounds
     rng = random.Random(rng_seed)
-    samples = _sample_from(stream_mask, n, rng)
+    samples: list[Point] = []
 
-    if len(samples) < n and fallback_area is not None:
-        remaining = n - len(samples)
-        samples += _sample_from(fallback_area, remaining, rng)
+    for _ in range(n * 500):
+        if len(samples) >= n:
+            break
+        pt = Point(rng.uniform(minx, maxx), rng.uniform(miny, maxy))
+        if candidate.contains(pt):
+            samples.append(pt)
 
     return samples
 
@@ -213,14 +209,7 @@ def build_training_dataset(
 
     positive_points = [pt for pt, _ in positive_labeled]
     n_neg = n_negatives if n_negatives is not None else len(positive_labeled)
-
-    # Build a fallback area from imagery bounds so negative sampling always
-    # has somewhere to draw from if the stream mask is too densely covered
-    # by positive exclusion zones.
-    imagery_bounds = _imagery_union(jp2_paths)
-    negative_points = sample_negatives(
-        stream_mask, positive_points, n_neg, rng_seed, fallback_area=imagery_bounds
-    )
+    negative_points = sample_negatives(stream_mask, positive_points, n_neg, rng_seed)
     negative_labeled = [(pt, "negative") for pt in negative_points]
 
     manifest_rows: list[dict] = []
@@ -266,17 +255,6 @@ def _extract_coords(placemark_el, ns: str) -> list[tuple[float, float]]:
             if coords_el is not None and coords_el.text:
                 return _parse_coord_string(coords_el.text)
     return []
-
-
-def _imagery_union(jp2_paths: list[str]):
-    """Return a Shapely geometry covering the union of all jp2 raster extents."""
-    from shapely.geometry import box as shapely_box
-    boxes = []
-    for path in jp2_paths:
-        with rasterio.open(path) as src:
-            b = src.bounds
-            boxes.append(shapely_box(b.left, b.bottom, b.right, b.top))
-    return unary_union(boxes)
 
 
 def _parse_coord_string(text: str) -> list[tuple[float, float]]:
