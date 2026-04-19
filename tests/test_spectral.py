@@ -73,7 +73,7 @@ class TestExtractFeatures:
     def test_output_shape(self):
         chip = _chip(nir=100, red=80, grn=60, size=64)
         feats = extract_features(chip)
-        assert feats.shape == (18,)
+        assert feats.shape == (36,)
 
     def test_output_dtype(self):
         chip = _chip(nir=100, red=80, grn=60, size=64)

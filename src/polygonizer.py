@@ -10,6 +10,7 @@ from ingestion import TILE_SIZE, read_metadata
 from classifier import predict as clf_predict
 
 MIN_AREA_M2 = 500
+DETECTION_STRIDE = TILE_SIZE // 2  # 50% overlap reduces boundary-misalignment misses
 
 
 def detect_rois(
@@ -20,8 +21,8 @@ def detect_rois(
     min_area_m2: float = MIN_AREA_M2,
 ) -> list[tuple]:
     """
-    Slide 512×512 tiles over jp2_path (restricted to stream_mask if provided),
-    classify each, merge positive tiles, and return ROIs.
+    Slide 512×512 tiles (with 50% overlap) over jp2_path, classify each,
+    merge positive tiles, and return ROIs.
 
     Returns list of (polygon_epsg3067, confidence, area_m2).
     If stream_mask is None, the full raster extent is used.
@@ -34,8 +35,8 @@ def detect_rois(
     candidates: list[tuple] = []
 
     with rasterio.open(jp2_path) as src:
-        for row_off in range(0, src.height, TILE_SIZE):
-            for col_off in range(0, src.width, TILE_SIZE):
+        for row_off in range(0, src.height, DETECTION_STRIDE):
+            for col_off in range(0, src.width, DETECTION_STRIDE):
                 win = Window(
                     col_off=col_off,
                     row_off=row_off,

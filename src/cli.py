@@ -35,14 +35,39 @@ def cmd_train(args: argparse.Namespace) -> None:
     stream_mask = _load_mask(args.hydro)
 
     with tempfile.TemporaryDirectory() as chip_dir:
-        print(f"Extracting training chips to {chip_dir} ...")
+        print(f"Extracting training chips ...")
         manifest = build_training_dataset(
             jp2_paths=jp2_files,
             kml_paths=kml_files,
             stream_mask=stream_mask,
             out_dir=chip_dir,
         )
-        print(f"Training Random Forest from {manifest} ...")
+
+        import csv
+        with open(manifest) as f:
+            rows = list(csv.DictReader(f))
+        pos = [r for r in rows if int(r["label"]) == 1]
+        neg = [r for r in rows if int(r["label"]) == 0]
+        by_type: dict[str, int] = {}
+        for r in pos:
+            by_type[r["feature_type"]] = by_type.get(r["feature_type"], 0) + 1
+
+        print(f"  Positive chips : {len(pos)}")
+        for ftype, count in sorted(by_type.items()):
+            print(f"    {ftype}: {count}")
+        print(f"  Negative chips : {len(neg)}")
+
+        if len(pos) == 0:
+            sys.exit(
+                "\nERROR: No positive chips were extracted.\n"
+                "Check that your imagery tiles cover the labeled feature locations.\n"
+                "Run: python src/cli.py check-labels --imagery ... --labels ..."
+            )
+        if len(pos) < 20:
+            print(f"\nWARNING: Only {len(pos)} positive chips — model will be unreliable. "
+                  "Add more imagery tiles that cover your labeled features.")
+
+        print(f"Training Random Forest ...")
         train(manifest, args.model)
 
     print(f"Model saved to {args.model}")
