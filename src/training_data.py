@@ -99,26 +99,25 @@ def extract_chips(
             ):
                 continue
 
-            win = Window(
-                col_off=max(col_off, 0),
-                row_off=max(row_off, 0),
-                width=min(TILE_SIZE, src.width - max(col_off, 0)),
-                height=min(TILE_SIZE, src.height - max(row_off, 0)),
-            )
+            # Offset into the padded output where raster data begins.
+            pad_col = max(-col_off, 0)
+            pad_row = max(-row_off, 0)
 
+            # Raster read window — width/height reduced by the pad so the data
+            # always fits exactly into the padded output array.
+            win_col = max(col_off, 0)
+            win_row = max(row_off, 0)
+            win_w = min(TILE_SIZE - pad_col, src.width - win_col)
+            win_h = min(TILE_SIZE - pad_row, src.height - win_row)
+
+            win = Window(col_off=win_col, row_off=win_row, width=win_w, height=win_h)
             data = src.read(window=win)
 
-            if data.shape[1] != TILE_SIZE or data.shape[2] != TILE_SIZE:
+            if pad_col > 0 or pad_row > 0 or win_w < TILE_SIZE or win_h < TILE_SIZE:
                 padded = np.zeros(
                     (data.shape[0], TILE_SIZE, TILE_SIZE), dtype=data.dtype
                 )
-                pad_row = max(-row_off, 0)
-                pad_col = max(-col_off, 0)
-                padded[
-                    :,
-                    pad_row : pad_row + data.shape[1],
-                    pad_col : pad_col + data.shape[2],
-                ] = data
+                padded[:, pad_row : pad_row + win_h, pad_col : pad_col + win_w] = data
                 data = padded
 
             stem = Path(jp2_path).stem
