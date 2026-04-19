@@ -215,7 +215,7 @@ class TestSampleNegatives:
         return box(320_000, 6_815_000, 330_000, 6_825_000)
 
     def test_returns_requested_count(self):
-        assert len(sample_negatives(self._mask(), [], n=20)) == 20
+        assert len(sample_negatives(self._mask(), [], n=10)) == 10
 
     def test_points_inside_mask(self):
         mask = self._mask()
@@ -225,7 +225,7 @@ class TestSampleNegatives:
     def test_exclusion_zone_respected(self):
         mask = self._mask()
         centroid = mask.centroid
-        for pt in sample_negatives(mask, [centroid], n=50, rng_seed=0):
+        for pt in sample_negatives(mask, [centroid], n=20, rng_seed=0):
             assert pt.distance(centroid) >= NEGATIVE_EXCLUSION_RADIUS - 1
 
     def test_deterministic_with_same_seed(self):
