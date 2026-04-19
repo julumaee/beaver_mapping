@@ -46,25 +46,29 @@ def cmd_train(args: argparse.Namespace) -> None:
         import csv
         with open(manifest) as f:
             rows = list(csv.DictReader(f))
-        pos = [r for r in rows if int(r["label"]) == 1]
-        neg = [r for r in rows if int(r["label"]) == 0]
+        dam_chips   = [r for r in rows if int(r["label"]) == 1]
+        flood_chips = [r for r in rows if int(r["label"]) == 2]
+        neg_chips   = [r for r in rows if int(r["label"]) == 0]
+
         by_type: dict[str, int] = {}
-        for r in pos:
+        for r in dam_chips + flood_chips:
             by_type[r["feature_type"]] = by_type.get(r["feature_type"], 0) + 1
 
-        print(f"  Positive chips : {len(pos)}")
+        print(f"  Dam chips      : {len(dam_chips)}")
+        print(f"  Flood chips    : {len(flood_chips)}")
         for ftype, count in sorted(by_type.items()):
             print(f"    {ftype}: {count}")
-        print(f"  Negative chips : {len(neg)}")
+        print(f"  Negative chips : {len(neg_chips)}")
 
-        if len(pos) == 0:
+        if len(dam_chips) + len(flood_chips) == 0:
             sys.exit(
                 "\nERROR: No positive chips were extracted.\n"
                 "Check that your imagery tiles cover the labeled feature locations.\n"
                 "Run: python src/cli.py check-labels --imagery ... --labels ..."
             )
-        if len(pos) < 20:
-            print(f"\nWARNING: Only {len(pos)} positive chips — model will be unreliable. "
+        if len(dam_chips) + len(flood_chips) < 20:
+            total = len(dam_chips) + len(flood_chips)
+            print(f"\nWARNING: Only {total} positive chips — model will be unreliable. "
                   "Add more imagery tiles that cover your labeled features.")
 
         print(f"Training Random Forest ...")
