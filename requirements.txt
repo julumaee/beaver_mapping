@@ -5,3 +5,7 @@ geopandas
 shapely
 opencv-python
 scikit-learn
+torch
+torchvision
+timm
+huggingface_hub
