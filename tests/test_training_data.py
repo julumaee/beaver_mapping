@@ -128,11 +128,11 @@ class TestExtractChips:
         cx, cy = 328_000.0, 6_821_000.0
         jp2 = _write_raster(tmp_path, cx, cy, size=2048)
         rows: list[dict] = []
-        extract_chips(jp2, [(Point(cx, cy), "dam")],
+        extract_chips(jp2, [(Point(cx, cy), "wet_forest")],
                       str(tmp_path / "chips"), manifest_rows=rows)
         assert len(rows) == 1
-        assert rows[0]["label"] == FEATURE_TO_LABEL["dam"]   # == 1
-        assert rows[0]["feature_type"] == "dam"
+        assert rows[0]["label"] == FEATURE_TO_LABEL["wet_forest"]   # == 1
+        assert rows[0]["feature_type"] == "wet_forest"
 
     def test_flood_label(self, tmp_path):
         cx, cy = 328_000.0, 6_821_000.0
@@ -140,7 +140,7 @@ class TestExtractChips:
         rows: list[dict] = []
         extract_chips(jp2, [(Point(cx, cy), "wet_forest")],
                       str(tmp_path / "chips"), manifest_rows=rows)
-        assert rows[0]["label"] == FEATURE_TO_LABEL["wet_forest"]  # == 2
+        assert rows[0]["label"] == FEATURE_TO_LABEL["wet_forest"]  # == 1
 
     def test_negative_label(self, tmp_path):
         cx, cy = 328_000.0, 6_821_000.0
@@ -166,12 +166,9 @@ class TestExtractChips:
 
 
 class TestFeatureToLabel:
-    def test_dam_is_1(self):
-        assert FEATURE_TO_LABEL["dam"] == 1
-
-    def test_wet_forest_and_beaver_flood_are_2(self):
-        assert FEATURE_TO_LABEL["wet_forest"] == 2
-        assert FEATURE_TO_LABEL["beaver_flood"] == 2
+    def test_wet_forest_and_beaver_flood_are_1(self):
+        assert FEATURE_TO_LABEL["wet_forest"] == 1
+        assert FEATURE_TO_LABEL["beaver_flood"] == 1
 
     def test_negative_is_0(self):
         assert FEATURE_TO_LABEL["negative"] == 0
@@ -206,7 +203,7 @@ class TestBuildTrainingDataset:
         cx, cy = 328_000.0, 6_821_000.0
         jp2 = _write_raster(tmp_path, cx, cy, size=2048)
         lon, lat = _TO_WGS84.transform(cx, cy)
-        kml = _write_kml(tmp_path, lon=lon, lat=lat, name="dam")
+        kml = _write_kml(tmp_path, lon=lon, lat=lat, name="wet_forest")
         mask = box(cx - 900, cy - 900, cx + 900, cy + 900)
         return jp2, kml, mask
 
@@ -217,7 +214,7 @@ class TestBuildTrainingDataset:
         with open(manifest) as f:
             rows = list(csv.DictReader(f))
         labels = {int(r["label"]) for r in rows}
-        assert 1 in labels   # dam
+        assert 1 in labels   # flood
         assert 0 in labels   # negative
 
     def test_lodge_excluded_by_default(self, tmp_path):
@@ -234,3 +231,6 @@ class TestBuildTrainingDataset:
 
     def test_default_exclude_contains_lodge(self):
         assert "lodge" in DEFAULT_EXCLUDE
+
+    def test_default_exclude_contains_dam(self):
+        assert "dam" in DEFAULT_EXCLUDE

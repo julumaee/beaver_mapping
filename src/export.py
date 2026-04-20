@@ -1,4 +1,4 @@
-"""KML export for detected beaver ROIs (flood polygons and dam lines)."""
+"""KML export for detected beaver flood ROI polygons."""
 
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -15,10 +15,6 @@ _FLOOD_COLORS = {
     "low":    ("ff0000ff", "800000ff"),  # red
 }
 
-# Dam line style — thick brown line, no fill
-_DAM_LINE_COLOR = "ff1478ff"   # brown in AABBGGRR
-_DAM_LINE_WIDTH = "3"
-
 
 def _confidence_tier(confidence: float) -> str:
     if confidence >= 0.8:
@@ -28,16 +24,11 @@ def _confidence_tier(confidence: float) -> str:
     return "low"
 
 
-def export_kml(
-    dam_lines: list[tuple],
-    flood_rois: list[tuple],
-    output_path: str,
-) -> None:
+def export_kml(flood_rois: list[tuple], output_path: str) -> None:
     """
-    Write dam lines and flood ROIs to a styled KML file.
+    Write flood ROI polygons to a styled KML file.
 
-    dam_lines  : [(linestring_epsg3067, confidence), ...]
-    flood_rois : [(polygon_epsg3067, confidence, area_m2), ...]
+    flood_rois: [(polygon_epsg3067, confidence, area_m2), ...]
     """
     ET.register_namespace("", _KML_NS)
     kml = ET.Element(f"{{{_KML_NS}}}kml")
@@ -45,9 +36,6 @@ def export_kml(
     ET.SubElement(doc, f"{{{_KML_NS}}}name").text = "CastorDetector Results"
 
     _add_styles(doc)
-
-    for i, (line, confidence) in enumerate(dam_lines, 1):
-        _add_dam_placemark(doc, i, line, confidence)
 
     for i, (polygon, confidence, area_m2) in enumerate(flood_rois, 1):
         _add_flood_placemark(doc, i, polygon, confidence, area_m2)
@@ -61,13 +49,6 @@ def export_kml(
 
 
 def _add_styles(doc: ET.Element) -> None:
-    # Dam line style
-    style = ET.SubElement(doc, "Style", id="dam")
-    line = ET.SubElement(style, "LineStyle")
-    ET.SubElement(line, "color").text = _DAM_LINE_COLOR
-    ET.SubElement(line, "width").text = _DAM_LINE_WIDTH
-
-    # Flood polygon styles per confidence tier
     for tier, (line_color, fill_color) in _FLOOD_COLORS.items():
         style = ET.SubElement(doc, "Style", id=f"flood_{tier}")
         ls = ET.SubElement(style, "LineStyle")
@@ -76,21 +57,6 @@ def _add_styles(doc: ET.Element) -> None:
         ps = ET.SubElement(style, "PolyStyle")
         ET.SubElement(ps, "color").text = fill_color
         ET.SubElement(ps, "outline").text = "1"
-
-
-def _add_dam_placemark(doc: ET.Element, i: int, line, confidence: float) -> None:
-    pm = ET.SubElement(doc, f"{{{_KML_NS}}}Placemark")
-    ET.SubElement(pm, f"{{{_KML_NS}}}name").text = f"Dam {i}"
-    ET.SubElement(pm, f"{{{_KML_NS}}}description").text = (
-        f"Confidence: {confidence:.2f}"
-    )
-    ET.SubElement(pm, f"{{{_KML_NS}}}styleUrl").text = "#dam"
-
-    ls_el = ET.SubElement(pm, f"{{{_KML_NS}}}LineString")
-    ET.SubElement(ls_el, f"{{{_KML_NS}}}tessellate").text = "1"
-    ET.SubElement(ls_el, f"{{{_KML_NS}}}coordinates").text = (
-        _coords_from_line(line)
-    )
 
 
 def _add_flood_placemark(
@@ -110,14 +76,6 @@ def _add_flood_placemark(
     ET.SubElement(ring, f"{{{_KML_NS}}}coordinates").text = (
         _coords_from_polygon(polygon)
     )
-
-
-def _coords_from_line(line) -> str:
-    parts = []
-    for x, y in line.coords:
-        lon, lat = _ETRS_TO_WGS84.transform(x, y)
-        parts.append(f"{lon:.6f},{lat:.6f},0")
-    return " ".join(parts)
 
 
 def _coords_from_polygon(polygon) -> str:

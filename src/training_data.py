@@ -19,21 +19,18 @@ _KML_NS = "http://www.opengis.net/kml/2.2"
 _WGS84_TO_ETRS = Transformer.from_crs(4326, 3067, always_xy=True)
 
 # Feature types excluded from training by default.
-DEFAULT_EXCLUDE: frozenset[str] = frozenset({"lodge"})
+DEFAULT_EXCLUDE: frozenset[str] = frozenset({"lodge", "dam"})
 
 # Maps KML feature type names to integer class labels:
 #   0 = negative (no beaver activity)
-#   1 = dam
-#   2 = flooded area (wet_forest and beaver_flood are spectrally indistinguishable)
+#   1 = flooded area / wet forest (beaver-influenced water)
+# Dam points are excluded from training (see DEFAULT_EXCLUDE).
 FEATURE_TO_LABEL: dict[str, int] = {
     "negative":     0,
-    "dam":          1,
-    "wet_forest":   2,
-    "beaver_flood": 2,
-    "unknown":      2,
+    "wet_forest":   1,
+    "beaver_flood": 1,
+    "unknown":      1,
 }
-
-NEGATIVE_EXCLUSION_RADIUS = 50  # retained for API compatibility
 
 
 def parse_kml_labels(kml_path: str) -> list[tuple[Point, str]]:

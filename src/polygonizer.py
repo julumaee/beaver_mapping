@@ -1,52 +1,43 @@
-"""Sliding-window detection, ROI polygonization, and dam line extraction."""
-
-import math
+"""Sliding-window detection and ROI polygonization for beaver flood areas."""
 
 import numpy as np
 import rasterio
 from rasterio.windows import Window
-from shapely.geometry import LineString, Point, box
-from shapely.ops import nearest_points, unary_union
+from shapely.geometry import box
+from shapely.ops import unary_union
 
-from ingestion import TILE_SIZE, read_metadata
+from ingestion import TILE_SIZE
 from classifier import predict as clf_predict
 
 MIN_AREA_M2 = 500
 DETECTION_STRIDE = TILE_SIZE // 2  # 50% overlap
-DAM_LINE_LENGTH = 60.0             # metres — typical beaver dam width
 
 
 def detect_rois(
     jp2_path: str,
     clf,
     stream_mask=None,
-    stream_lines=None,
     confidence_threshold: float = 0.5,
     min_area_m2: float = MIN_AREA_M2,
-) -> tuple[list[tuple], list[tuple]]:
+) -> list[tuple]:
     """
-    Slide 512×512 tiles over jp2_path and classify each tile as:
-      0 = negative, 1 = dam, 2 = flooded area
+    Slide 512×512 tiles over jp2_path and classify each tile.
+    Label 1 = flooded/wet-forest area; label 0 = negative.
 
-    Returns (dam_lines, flood_rois) where:
-      dam_lines  = [(linestring_epsg3067, confidence), ...]
-      flood_rois = [(polygon_epsg3067, confidence, area_m2), ...]
+    Returns flood_rois: [(polygon_epsg3067, confidence, area_m2), ...]
 
-    If stream_mask is None the full raster is scanned.
-    stream_lines (virtavesikapea geometry) is used to orient dam lines.
+    If the stream mask doesn't cover this raster, the full image is scanned.
     """
     with rasterio.open(jp2_path) as src:
         b = src.bounds
         raster_box = box(b.left, b.bottom, b.right, b.top)
 
-    # If the stream mask doesn't cover this raster at all, scan the full image.
     if stream_mask is not None and not stream_mask.intersects(raster_box):
         print("  No hydrography coverage for this image — scanning full raster")
         effective_mask = None
     else:
         effective_mask = stream_mask
 
-    dam_candidates: list[tuple] = []
     flood_candidates: list[tuple] = []
     tiles_checked = tiles_passed = 0
 
@@ -64,7 +55,6 @@ def detect_rois(
                 tiles_checked += 1
 
                 if effective_mask is not None:
-                    # Require the inner half of the tile to intersect the stream mask.
                     inner_box = win_box.buffer(-(TILE_SIZE * src.transform.a / 4))
                     if inner_box.is_empty or not effective_mask.intersects(inner_box):
                         continue
@@ -79,82 +69,13 @@ def detect_rois(
                     data = padded
 
                 label, confidence = clf_predict(clf, data)
-                if confidence < confidence_threshold:
-                    continue
-
-                if label == 1:
-                    dam_candidates.append((win_box, confidence))
-                elif label == 2:
+                if label == 1 and confidence >= confidence_threshold:
                     flood_candidates.append((win_box, confidence))
 
     print(f"  Tiles checked: {tiles_checked}, passed mask: {tiles_passed}, "
-          f"dam candidates: {len(dam_candidates)}, flood candidates: {len(flood_candidates)}")
+          f"flood candidates: {len(flood_candidates)}")
 
-    dam_lines = _build_dam_lines(dam_candidates, stream_lines)
-    flood_rois = _merge_candidates(flood_candidates, min_area_m2)
-    return dam_lines, flood_rois
-
-
-def _build_dam_lines(candidates: list[tuple], stream_lines) -> list[tuple]:
-    """Merge adjacent dam tiles and compute a line perpendicular to the stream."""
-    if not candidates:
-        return []
-
-    polys = [p for p, _ in candidates]
-    confs = [c for _, c in candidates]
-
-    merged = unary_union(polys)
-    geoms = list(merged.geoms) if hasattr(merged, "geoms") else [merged]
-
-    lines = []
-    for geom in geoms:
-        center = geom.centroid
-        contributing = [confs[i] for i, p in enumerate(polys) if geom.intersects(p)]
-        confidence = float(np.mean(contributing))
-        dam_line = _dam_line(center, stream_lines)
-        lines.append((dam_line, confidence))
-
-    return lines
-
-
-def _dam_line(center: Point, stream_lines, length: float = DAM_LINE_LENGTH) -> LineString:
-    """
-    Return a LineString of given length through center, oriented perpendicular
-    to the nearest stream segment.  Falls back to east-west if no stream data.
-    """
-    if stream_lines is None or stream_lines.is_empty:
-        half = length / 2
-        return LineString([(center.x - half, center.y), (center.x + half, center.y)])
-
-    # Find which sub-line is nearest
-    if hasattr(stream_lines, "geoms"):
-        nearest_line = min(stream_lines.geoms, key=lambda g: center.distance(g))
-    else:
-        nearest_line = stream_lines
-
-    # Get stream direction at the nearest point using project/interpolate
-    frac = nearest_line.project(center)
-    step = min(5.0, nearest_line.length / 2)
-    p1 = nearest_line.interpolate(max(0.0, frac - step))
-    p2 = nearest_line.interpolate(min(nearest_line.length, frac + step))
-
-    dx = p2.x - p1.x
-    dy = p2.y - p1.y
-    dist = math.sqrt(dx * dx + dy * dy)
-
-    if dist < 0.1:
-        perp_dx, perp_dy = 1.0, 0.0
-    else:
-        # Stream direction: (dx/dist, dy/dist)
-        # Perpendicular (dam direction): (-dy/dist, dx/dist)
-        perp_dx = -dy / dist
-        perp_dy = dx / dist
-
-    half = length / 2
-    return LineString([
-        (center.x - perp_dx * half, center.y - perp_dy * half),
-        (center.x + perp_dx * half, center.y + perp_dy * half),
-    ])
+    return _merge_candidates(flood_candidates, min_area_m2)
 
 
 def _merge_candidates(candidates: list[tuple], min_area_m2: float) -> list[tuple]:

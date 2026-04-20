@@ -46,29 +46,25 @@ def cmd_train(args: argparse.Namespace) -> None:
         import csv
         with open(manifest) as f:
             rows = list(csv.DictReader(f))
-        dam_chips   = [r for r in rows if int(r["label"]) == 1]
-        flood_chips = [r for r in rows if int(r["label"]) == 2]
+        flood_chips = [r for r in rows if int(r["label"]) == 1]
         neg_chips   = [r for r in rows if int(r["label"]) == 0]
 
         by_type: dict[str, int] = {}
-        for r in dam_chips + flood_chips:
+        for r in flood_chips:
             by_type[r["feature_type"]] = by_type.get(r["feature_type"], 0) + 1
 
-        print(f"  Dam chips      : {len(dam_chips)}")
         print(f"  Flood chips    : {len(flood_chips)}")
         for ftype, count in sorted(by_type.items()):
             print(f"    {ftype}: {count}")
         print(f"  Negative chips : {len(neg_chips)}")
 
-        if len(dam_chips) + len(flood_chips) == 0:
+        if len(flood_chips) == 0:
             sys.exit(
                 "\nERROR: No positive chips were extracted.\n"
-                "Check that your imagery tiles cover the labeled feature locations.\n"
-                "Run: python src/cli.py check-labels --imagery ... --labels ..."
+                "Check that your imagery tiles cover the labeled feature locations."
             )
-        if len(dam_chips) + len(flood_chips) < 20:
-            total = len(dam_chips) + len(flood_chips)
-            print(f"\nWARNING: Only {total} positive chips — model will be unreliable. "
+        if len(flood_chips) < 20:
+            print(f"\nWARNING: Only {len(flood_chips)} positive chips — model will be unreliable. "
                   "Add more imagery tiles that cover your labeled features.")
 
         print(f"Training Random Forest ...")
@@ -79,7 +75,6 @@ def cmd_train(args: argparse.Namespace) -> None:
 
 def cmd_detect(args: argparse.Namespace) -> None:
     from classifier import load_model
-    from masking import load_stream_lines
     from polygonizer import detect_rois
     from export import export_kml
 
@@ -89,27 +84,22 @@ def cmd_detect(args: argparse.Namespace) -> None:
 
     clf = load_model(args.model)
     stream_mask = _load_mask(args.hydro)
-    stream_lines = load_stream_lines(args.hydro) if args.hydro else None
 
-    all_dams: list[tuple] = []
     all_floods: list[tuple] = []
 
     for jp2_path in jp2_files:
         print(f"Processing {jp2_path} ...")
-        dam_lines, flood_rois = detect_rois(
+        flood_rois = detect_rois(
             jp2_path,
             clf,
             stream_mask=stream_mask,
-            stream_lines=stream_lines,
             confidence_threshold=args.threshold,
         )
-        print(f"  Dams: {len(dam_lines)}, Flooded areas: {len(flood_rois)}")
-        all_dams.extend(dam_lines)
+        print(f"  Flooded areas: {len(flood_rois)}")
         all_floods.extend(flood_rois)
 
-    print(f"Exporting {len(all_dams)} dam(s) and {len(all_floods)} flooded area(s) "
-          f"to {args.output} ...")
-    export_kml(all_dams, all_floods, args.output)
+    print(f"Exporting {len(all_floods)} flooded area(s) to {args.output} ...")
+    export_kml(all_floods, args.output)
     print("Done.")
 
 
