@@ -1,6 +1,12 @@
-"""Prithvi-100M encoder wrapper, band adapter, BeaverCNN classifier, and inference helpers."""
+"""Prithvi-EO-1.0-100M encoder wrapper, band adapter, BeaverCNN classifier, and inference helpers.
 
-import json
+Uses the official PrithviMAE implementation downloaded from HuggingFace, giving exact
+weight loading with no architecture mismatches. The frozen ViT-Base encoder (embed_dim=768,
+depth=12) feeds a trainable MLP head. Only the head weights are saved to disk; the encoder
+is re-fetched from HF cache on load.
+"""
+
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -9,18 +15,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 try:
-    import timm
     from huggingface_hub import hf_hub_download
-    _DL_AVAILABLE = True
+    _HF_AVAILABLE = True
 except ImportError:
-    _DL_AVAILABLE = False
+    _HF_AVAILABLE = False
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BATCH_SIZE = 16 if DEVICE.type == "cuda" else 1
 
-_PRITHVI_REPO = "ibm-nasa-geospatial/Prithvi-100M"
-_PRITHVI_FILE = "Prithvi_100M.pt"
-_INPUT_SIZE = 224
+_PRITHVI_REPO    = "ibm-nasa-geospatial/prithvi-eo-1.0-100M"
+_PRITHVI_WEIGHTS = "Prithvi_EO_V1_100M.pt"
+_PRITHVI_SOURCE  = "prithvi_mae.py"
+_EMBED_DIM       = 768   # ViT-Base config of the 100M checkpoint
+_INPUT_SIZE      = 224
 
 # MML CIR band order: NIR=0, Red=1, Green=2
 # HLS band order:     Blue=0, Green=1, Red=2, NIR=3, SWIR1=4, SWIR2=5
@@ -41,16 +48,15 @@ class BandAdapter(nn.Module):
 
 
 class BeaverCNN(nn.Module):
-    """Frozen Prithvi-100M ViT encoder + trainable 2-class MLP head."""
+    """Frozen Prithvi-EO ViT-Base encoder + trainable 2-class MLP head."""
 
     def __init__(self, num_classes: int = 2):
         super().__init__()
         self.band_adapter = BandAdapter()
-        self.encoder = _build_encoder()
-        embed_dim = self.encoder.num_features
+        self.encoder = _build_prithvi_encoder()
         self.head = nn.Sequential(
-            nn.LayerNorm(embed_dim),
-            nn.Linear(embed_dim, 256),
+            nn.LayerNorm(_EMBED_DIM),
+            nn.Linear(_EMBED_DIM, 256),
             nn.GELU(),
             nn.Dropout(0.3),
             nn.Linear(256, num_classes),
@@ -59,55 +65,65 @@ class BeaverCNN(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, 3, H, W) float32, normalised
-        x = self.band_adapter(x)       # (B, 6, H, W)
-        features = self.encoder(x)     # (B, embed_dim)
-        return self.head(features)     # (B, num_classes)
+        x = self.band_adapter(x)          # (B, 6, H, W)
+        x = x.unsqueeze(2)                # (B, 6, 1, H, W) — T=1 temporal dim
+        features_list = self.encoder.forward_features(x)
+        # forward_features returns a list of (B, num_patches+1, embed_dim) tensors.
+        # Index 0 of the sequence is the CLS token from the last block.
+        cls = features_list[-1][:, 0]     # (B, embed_dim)
+        return self.head(cls)             # (B, num_classes)
 
 
 # ---------------------------------------------------------------------------
-# Model construction helpers
+# Model construction
 # ---------------------------------------------------------------------------
 
-def _build_encoder() -> nn.Module:
-    if not _DL_AVAILABLE:
-        raise ImportError("torch, timm, and huggingface_hub are required for CNN inference")
-    model = timm.create_model(
-        "vit_large_patch16_224",
-        pretrained=False,
+def _build_prithvi_encoder() -> nn.Module:
+    if not _HF_AVAILABLE:
+        raise ImportError("huggingface_hub is required — pip install huggingface_hub")
+
+    # Download official model source and weights to the HF cache
+    src_path     = hf_hub_download(repo_id=_PRITHVI_REPO, filename=_PRITHVI_SOURCE)
+    weights_path = hf_hub_download(repo_id=_PRITHVI_REPO, filename=_PRITHVI_WEIGHTS)
+
+    # Import PrithviMAE from the downloaded source file
+    src_dir = str(Path(src_path).parent)
+    if src_dir not in sys.path:
+        sys.path.insert(0, src_dir)
+    from prithvi_mae import PrithviMAE  # noqa: PLC0415
+
+    # Instantiate encoder-only model with the 100M ViT-Base config (T=1 for single images).
+    # Sin-cos 3D positional embeddings are computed dynamically so T=1 is compatible
+    # with weights trained on T=3.
+    mae = PrithviMAE(
+        img_size=224,
+        patch_size=(1, 16, 16),
+        num_frames=1,
         in_chans=6,
-        num_classes=0,
-        global_pool="avg",
+        embed_dim=_EMBED_DIM,
+        depth=12,
+        num_heads=12,
+        decoder_embed_dim=512,
+        decoder_depth=8,
+        decoder_num_heads=16,
+        encoder_only=True,
     )
-    _try_load_prithvi_weights(model)
-    return model
+
+    state = torch.load(weights_path, map_location="cpu")
+    if "model" in state:
+        state = state["model"]
+
+    missing, unexpected = mae.load_state_dict(state, strict=False)
+    n_loaded = len(state) - len(missing)
+    print(f"Prithvi-EO weights: {n_loaded}/{len(state)} keys loaded "
+          f"({len(missing)} missing, {len(unexpected)} unexpected)")
+
+    return mae.encoder
 
 
-def _try_load_prithvi_weights(model: nn.Module) -> None:
-    """Download Prithvi-100M and load all compatible encoder weights."""
-    try:
-        weights_path = hf_hub_download(repo_id=_PRITHVI_REPO, filename=_PRITHVI_FILE)
-        state = torch.load(weights_path, map_location="cpu")
-        if "model" in state:
-            state = state["model"]
-
-        # Strip optional 'encoder.' prefix from Prithvi keys
-        stripped = {k.removeprefix("encoder."): v for k, v in state.items()}
-
-        # Prithvi patch_embed weight has an extra temporal dimension [D, C, t, H, W].
-        # Squeeze t=1 to match the standard timm ViT shape [D, C, H, W].
-        if "patch_embed.proj.weight" in stripped:
-            w = stripped["patch_embed.proj.weight"]
-            if w.ndim == 5 and w.shape[2] == 1:
-                stripped["patch_embed.proj.weight"] = w.squeeze(2)
-
-        missing, unexpected = model.load_state_dict(stripped, strict=False)
-        n_loaded = len(stripped) - len(missing)
-        print(f"Prithvi weights: {n_loaded}/{len(stripped)} keys loaded "
-              f"({len(missing)} missing, {len(unexpected)} unexpected)")
-    except Exception as exc:
-        print(f"Warning: could not load Prithvi weights ({exc}). "
-              "Encoder will be randomly initialised.")
-
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _freeze(module: nn.Module) -> None:
     for p in module.parameters():
@@ -115,17 +131,18 @@ def _freeze(module: nn.Module) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Persistence
+# Persistence — save only the trainable head to keep the .pth file small.
+# The encoder is always re-fetched from the HF cache on load.
 # ---------------------------------------------------------------------------
 
 def save_cnn(model: BeaverCNN, model_path: str) -> None:
     Path(model_path).parent.mkdir(parents=True, exist_ok=True)
-    torch.save(model.state_dict(), model_path)
+    torch.save(model.head.state_dict(), model_path)
 
 
 def load_cnn(model_path: str) -> BeaverCNN:
     model = BeaverCNN()
-    model.load_state_dict(torch.load(model_path, map_location=DEVICE))
+    model.head.load_state_dict(torch.load(model_path, map_location=DEVICE))
     model.to(DEVICE)
     model.eval()
     return model
@@ -173,6 +190,6 @@ def _chip_to_tensor(chip: np.ndarray, norm_stats: dict | None) -> torch.Tensor:
     )[0]
     if norm_stats is not None:
         mean = torch.tensor(norm_stats["mean"], dtype=torch.float32).view(3, 1, 1)
-        std = torch.tensor(norm_stats["std"], dtype=torch.float32).view(3, 1, 1)
+        std  = torch.tensor(norm_stats["std"],  dtype=torch.float32).view(3, 1, 1)
         t = (t - mean) / (std + 1e-6)
     return t
