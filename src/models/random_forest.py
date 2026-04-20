@@ -26,13 +26,14 @@ def train(
     model_path: str,
     n_estimators: int = 100,
     random_state: int = 42,
+    n_jobs: int = -2,
 ) -> RandomForestClassifier:
     """Train a Random Forest on chips in manifest_path and save to model_path."""
     X, y = build_feature_matrix(manifest_path)
     clf = RandomForestClassifier(
         n_estimators=n_estimators,
         random_state=random_state,
-        n_jobs=-1,
+        n_jobs=n_jobs,
         class_weight="balanced",
     )
     clf.fit(X, y)

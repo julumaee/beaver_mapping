@@ -10,7 +10,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from classifier import train, predict, save_model, load_model, build_feature_matrix
+from models.random_forest import train, predict, save_model, load_model, build_feature_matrix
 
 
 def _make_chips_and_manifest(tmp_path: Path, n=10) -> str:
