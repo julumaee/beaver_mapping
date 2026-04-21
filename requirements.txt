@@ -7,5 +7,6 @@ opencv-python
 scikit-learn
 torch
 torchvision
+timm
 einops
 huggingface_hub
