@@ -188,7 +188,7 @@ def build_training_dataset(
     n_neg = n_negatives if n_negatives is not None else len(positive_labeled)
 
     imagery_extent = _imagery_union(jp2_paths)
-    sample_area = stream_mask.intersection(imagery_extent)
+    sample_area = stream_mask.intersection(imagery_extent) if stream_mask is not None else imagery_extent
     negative_points = sample_negatives(sample_area, positive_points, n_neg, rng_seed)
     negative_labeled = [(pt, "negative") for pt in negative_points]
 
