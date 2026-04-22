@@ -82,9 +82,12 @@ def _build_prithvi_encoder() -> nn.Module:
     if not _HF_AVAILABLE:
         raise ImportError("huggingface_hub is required — pip install huggingface_hub")
 
-    # Download official model source and weights to the HF cache
-    src_path     = hf_hub_download(repo_id=_PRITHVI_REPO, filename=_PRITHVI_SOURCE)
-    weights_path = hf_hub_download(repo_id=_PRITHVI_REPO, filename=_PRITHVI_WEIGHTS)
+    # Allow placing weights manually in data/models/ to avoid HF download issues
+    local_weights = Path("data/models") / _PRITHVI_WEIGHTS
+    local_src     = Path("data/models") / _PRITHVI_SOURCE
+
+    src_path     = str(local_src)     if local_src.exists()     else hf_hub_download(repo_id=_PRITHVI_REPO, filename=_PRITHVI_SOURCE)
+    weights_path = str(local_weights) if local_weights.exists() else hf_hub_download(repo_id=_PRITHVI_REPO, filename=_PRITHVI_WEIGHTS)
 
     # Import PrithviMAE from the downloaded source file
     src_dir = str(Path(src_path).parent)
