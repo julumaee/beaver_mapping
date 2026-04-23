@@ -6,7 +6,7 @@ import fiona
 import geopandas as gpd
 from shapely.ops import unary_union
 
-BUFFER_METERS = 100
+BUFFER_METERS = 50
 _VECTOR_SUFFIXES = {".gpkg", ".shp", ".geojson", ".json", ".fgb"}
 
 # MML GeoPackage layers that represent flowing water (streams and stream areas).
