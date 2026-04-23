@@ -120,7 +120,7 @@ def cmd_cnn_train(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 def cmd_detect(args: argparse.Namespace) -> None:
-    from polygonizer import detect_rois, detect_rois_cnn
+    from polygonizer import detect_rois_rf_segmentation, detect_rois_cnn
     from export import export_kml
 
     jp2_files = _find_files(args.imagery, ".jp2")
@@ -150,7 +150,7 @@ def cmd_detect(args: argparse.Namespace) -> None:
         print(f"Processing {jp2_path} ...")
 
         if method == "rf":
-            rois = detect_rois(jp2_path, rf_clf, stream_mask, args.threshold)
+            rois = detect_rois_rf_segmentation(jp2_path, rf_clf, stream_mask, args.threshold)
             print(f"  RF detections: {len(rois)}")
             all_rois.extend(rois)
 
@@ -160,7 +160,7 @@ def cmd_detect(args: argparse.Namespace) -> None:
             all_rois.extend(rois)
 
         elif method == "both":
-            rf_rois  = detect_rois(jp2_path, rf_clf, stream_mask, args.threshold)
+            rf_rois  = detect_rois_rf_segmentation(jp2_path, rf_clf, stream_mask, args.threshold)
             cnn_rois = detect_rois_cnn(jp2_path, cnn_model, norm_stats, stream_mask, args.threshold)
             print(f"  RF detections: {len(rf_rois)}  CNN detections: {len(cnn_rois)}")
             combined = _merge_multi_model(rf_rois, cnn_rois)
