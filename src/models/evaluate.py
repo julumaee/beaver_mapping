@@ -29,7 +29,7 @@ def evaluate_models(
     n_test = max(1, int(len(rows) * test_fraction))
     test_rows = [rows[i] for i in indices[:n_test]]
 
-    y_true = [int(r["label"]) for r in test_rows]
+    y_true = [min(int(r["label"]), 1) for r in test_rows]
     chips = [np.load(r["path"]) for r in test_rows]
 
     # RF

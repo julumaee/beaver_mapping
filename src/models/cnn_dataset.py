@@ -32,7 +32,7 @@ class ChipDataset(Dataset):
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, int]:
         row = self.rows[idx]
         chip = np.load(row["path"])
-        label = int(row["label"])
+        label = min(int(row["label"]), 1)  # collapse dam/flood (1,2) → positive (1)
         tensor = _to_tensor(chip, self.norm_stats)
         if self.augment:
             tensor = _augment(tensor)
