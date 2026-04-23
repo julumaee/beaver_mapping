@@ -66,7 +66,7 @@ class BeaverCNN(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, 3, H, W) float32, normalised
         x = self.band_adapter(x)          # (B, 6, H, W)
-        x = x.unsqueeze(2)                # (B, 6, 1, H, W) — T=1 temporal dim
+        x = x.unsqueeze(2).repeat(1, 1, 3, 1, 1)  # (B, 6, 3, H, W) — repeat to match T=3 checkpoint
         features_list = self.encoder.forward_features(x)
         # forward_features returns a list of (B, num_patches+1, embed_dim) tensors.
         # Index 0 of the sequence is the CLS token from the last block.
@@ -101,7 +101,7 @@ def _build_prithvi_encoder() -> nn.Module:
     mae = PrithviMAE(
         img_size=224,
         patch_size=(1, 16, 16),
-        num_frames=1,
+        num_frames=3,   # match checkpoint; forward() repeats the single frame 3×
         in_chans=6,
         embed_dim=_EMBED_DIM,
         depth=12,
