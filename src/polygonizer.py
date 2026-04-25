@@ -62,10 +62,9 @@ def detect_rois_rf_segmentation(
     """
     Dense patch-level RF detection using 64×64 px patches with 512×512 px context.
 
-    Slides a 64-pixel patch grid over the image.  For each patch the surrounding
-    512×512 context is fed to extract_features() — identical to the chip features
-    used during training — so no retraining is required.  A probability map is built
-    then polygonized with rasterio.features.shapes.
+    Reads the full image once into memory and edge-pads it so every patch can be
+    sliced in O(1) without further JP2 seeks — avoids ~150 repeated seeks into the
+    compressed tile that made the strip-based approach slow.
 
     Returns flood_rois: [(polygon_epsg3067, confidence, area_m2), ...]
     """
@@ -75,64 +74,55 @@ def detect_rois_rf_segmentation(
 
     with rasterio.open(jp2_path) as src:
         img_h, img_w = src.height, src.width
-        n_patch_rows = (img_h + PATCH_SIZE - 1) // PATCH_SIZE
-        n_patch_cols = (img_w + PATCH_SIZE - 1) // PATCH_SIZE
-
-        prob_map = np.full((n_patch_rows, n_patch_cols), np.nan, dtype=np.float32)
+        img_transform = src.transform
         patch_transform = src.transform * Affine.scale(PATCH_SIZE)
+        print("  Loading image into memory ...")
+        full_img = src.read()  # (3, img_h, img_w) uint8 — ~300 MB for a 10 000×10 000 tile
 
-        patches_total = patches_processed = 0
+    # Edge-pad by TILE_SIZE on all sides so every patch always has a full 512×512 context.
+    # _PAD_OFFSET converts patch grid coords to padded-array coords:
+    #   padded_row = pr * PATCH_SIZE + _PAD_OFFSET  (context window starts _CTX_OFFSET before the patch)
+    _PAD = TILE_SIZE  # 512 px — more than the 224 px worst-case offset needed
+    _PAD_OFFSET = _PAD - _CTX_OFFSET  # 512 - 224 = 288
+    padded = np.pad(full_img, ((0, 0), (_PAD, _PAD), (_PAD, _PAD)), mode="edge")
+    del full_img
 
-        for pr in range(n_patch_rows):
-            # Read a full-width strip covering the 512 px context for this patch row.
-            ctx_row_start = pr * PATCH_SIZE - _CTX_OFFSET  # image coords, may be < 0
-            read_row_start = max(0, ctx_row_start)
-            read_row_end = min(img_h, ctx_row_start + TILE_SIZE)
-            read_height = read_row_end - read_row_start
+    n_patch_rows = (img_h + PATCH_SIZE - 1) // PATCH_SIZE
+    n_patch_cols = (img_w + PATCH_SIZE - 1) // PATCH_SIZE
+    prob_map = np.full((n_patch_rows, n_patch_cols), np.nan, dtype=np.float32)
+    patches_total = patches_processed = 0
 
-            strip = src.read(window=Window(0, read_row_start, img_w, read_height))
-            # Pad vertically to TILE_SIZE
-            pad_top = read_row_start - ctx_row_start
-            pad_bottom = TILE_SIZE - pad_top - read_height
-            strip = np.pad(strip, ((0, 0), (pad_top, pad_bottom), (0, 0)), mode="edge")
-            # strip: (3, TILE_SIZE, img_w)
+    for pr in range(n_patch_rows):
+        batch_feats: list[np.ndarray] = []
+        batch_cols: list[int] = []
+        row_start = pr * PATCH_SIZE + _PAD_OFFSET
 
-            batch_feats: list[np.ndarray] = []
-            batch_cols: list[int] = []
+        for pc in range(n_patch_cols):
+            patches_total += 1
 
-            for pc in range(n_patch_cols):
-                patches_total += 1
+            if effective_mask is not None:
+                p_h = min(PATCH_SIZE, img_h - pr * PATCH_SIZE)
+                p_w = min(PATCH_SIZE, img_w - pc * PATCH_SIZE)
+                patch_box = box(*rasterio.windows.bounds(
+                    Window(pc * PATCH_SIZE, pr * PATCH_SIZE, p_w, p_h),
+                    img_transform,
+                ))
+                if not effective_mask.intersects(patch_box):
+                    continue
 
-                if effective_mask is not None:
-                    p_h = min(PATCH_SIZE, img_h - pr * PATCH_SIZE)
-                    p_w = min(PATCH_SIZE, img_w - pc * PATCH_SIZE)
-                    patch_box = box(*rasterio.windows.bounds(
-                        Window(pc * PATCH_SIZE, pr * PATCH_SIZE, p_w, p_h),
-                        src.transform,
-                    ))
-                    if not effective_mask.intersects(patch_box):
-                        continue
+            col_start = pc * PATCH_SIZE + _PAD_OFFSET
+            ctx = padded[:, row_start:row_start + TILE_SIZE, col_start:col_start + TILE_SIZE]
+            # ctx: (3, 512, 512) view — patch sits at [224:288, 224:288] (the central 64 px)
 
-                # Horizontal slice of the already-loaded strip
-                ctx_col_start = pc * PATCH_SIZE - _CTX_OFFSET  # image coords, may be < 0
-                read_col_start = max(0, ctx_col_start)
-                read_col_end = min(img_w, ctx_col_start + TILE_SIZE)
+            batch_feats.append(extract_features(ctx))
+            batch_cols.append(pc)
 
-                col_slice = strip[:, :, read_col_start:read_col_end]
-                pad_left = read_col_start - ctx_col_start
-                pad_right = TILE_SIZE - pad_left - (read_col_end - read_col_start)
-                ctx = np.pad(col_slice, ((0, 0), (0, 0), (pad_left, pad_right)), mode="edge")
-                # ctx: (3, TILE_SIZE, TILE_SIZE) — patch is at ctx[..., 224:288, 224:288]
-
-                batch_feats.append(extract_features(ctx))
-                batch_cols.append(pc)
-
-            if batch_feats:
-                X = np.array(batch_feats, dtype=np.float32)
-                proba = clf.predict_proba(X)[:, 1]
-                for pc_idx, pc in enumerate(batch_cols):
-                    prob_map[pr, pc] = proba[pc_idx]
-                    patches_processed += 1
+        if batch_feats:
+            X = np.array(batch_feats, dtype=np.float32)
+            proba = clf.predict_proba(X)[:, 1]
+            for pc_idx, pc in enumerate(batch_cols):
+                prob_map[pr, pc] = proba[pc_idx]
+                patches_processed += 1
 
     print(f"  Patches checked: {patches_total}, processed (in mask): {patches_processed}")
     return _prob_map_to_rois(prob_map, patch_transform, confidence_threshold, min_area_m2)
