@@ -10,21 +10,35 @@ from shapely.ops import unary_union
 BUFFER_METERS = 50
 _VECTOR_SUFFIXES = {".gpkg", ".shp", ".geojson", ".json", ".fgb"}
 
-# MML GeoPackage layers that represent flowing water (streams and stream areas).
-# Lakes (jarvi) and other features are intentionally excluded — beaver activity
-# is concentrated along stream corridors, not open lake shores.
 _MML_STREAM_LAYERS = ("virtavesialue", "tulvaalue", "virtavesikapea")
 
 
-def build_stream_mask(hydro_path: str) -> object:
+class StreamMask:
     """
-    Load MML hydrography vectors and return a single merged Shapely geometry
-    representing a BUFFER_METERS buffer around all stream features (EPSG:3067).
+    Buffered stream GeoDataFrame with a spatial index for fast per-patch queries.
 
-    hydro_path may be a single vector file or a directory; all recognised vector
-    files found directly inside a directory are loaded and merged.
-    For MML GeoPackages only the stream layers (virtavesialue, virtavesikapea)
-    are loaded; single-layer files (e.g. Shapefile) are loaded as-is.
+    Replaces the old unary_union approach: no upfront merge is required, so
+    startup is instant.  intersects() uses the R-tree sindex to find candidates
+    then does exact geometry tests only on those.
+    """
+
+    def __init__(self, gdf: gpd.GeoDataFrame) -> None:
+        self._gdf = gdf
+
+    def intersects(self, geom) -> bool:
+        candidates = self._gdf.sindex.query(geom)
+        if len(candidates) == 0:
+            return False
+        return bool(self._gdf.iloc[candidates].intersects(geom).any())
+
+
+def build_stream_mask(hydro_path: str) -> StreamMask:
+    """
+    Load MML hydrography vectors, buffer by BUFFER_METERS, and return a
+    StreamMask backed by a spatial index.
+
+    hydro_path may be a single vector file or a directory.  For MML GeoPackages
+    only the stream layers (virtavesialue, tulvaalue, virtavesikapea) are loaded.
     """
     files = _resolve_files(hydro_path)
     if not files:
@@ -47,8 +61,13 @@ def build_stream_mask(hydro_path: str) -> object:
         combined = gpd.GeoDataFrame(pd.concat(gdfs, ignore_index=True), crs=gdfs[0].crs)
     else:
         combined = gdfs[0]
-    print(f"  Buffering {len(combined)} features by {BUFFER_METERS} m and merging ...")
-    return unary_union(combined.geometry.buffer(BUFFER_METERS))
+
+    print(f"  Buffering {len(combined)} features by {BUFFER_METERS} m ...")
+    combined = combined[["geometry"]].copy()
+    combined["geometry"] = combined.geometry.buffer(BUFFER_METERS)
+    combined = combined[~combined.geometry.is_empty & combined.geometry.notna()]
+    print(f"  Stream mask ready ({len(combined)} buffered features).")
+    return StreamMask(combined)
 
 
 def _load_stream_layers(path: Path) -> list[gpd.GeoDataFrame]:
@@ -56,12 +75,10 @@ def _load_stream_layers(path: Path) -> list[gpd.GeoDataFrame]:
     try:
         available = fiona.listlayers(str(path))
     except Exception:
-        # Single-layer format (e.g. Shapefile) — load as-is.
         return [gpd.read_file(path)]
 
     layers = [l for l in _MML_STREAM_LAYERS if l in available]
     if not layers:
-        # GeoPackage doesn't contain expected MML layers — fall back to default.
         return [gpd.read_file(path)]
 
     return [gpd.read_file(path, layer=l) for l in layers]
@@ -70,8 +87,7 @@ def _load_stream_layers(path: Path) -> list[gpd.GeoDataFrame]:
 def load_stream_lines(hydro_path: str):
     """
     Return a merged Shapely geometry of stream centrelines (virtavesikapea)
-    for use in computing dam line orientations.  Returns None if no line
-    layers are found.
+    for dam orientation computation.  Returns None if no line layers are found.
     """
     files = _resolve_files(hydro_path)
     gdfs = []
