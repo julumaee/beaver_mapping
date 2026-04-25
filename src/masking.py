@@ -4,6 +4,7 @@ from pathlib import Path
 
 import fiona
 import geopandas as gpd
+import pandas as pd
 from shapely.ops import unary_union
 
 BUFFER_METERS = 50
@@ -12,7 +13,7 @@ _VECTOR_SUFFIXES = {".gpkg", ".shp", ".geojson", ".json", ".fgb"}
 # MML GeoPackage layers that represent flowing water (streams and stream areas).
 # Lakes (jarvi) and other features are intentionally excluded — beaver activity
 # is concentrated along stream corridors, not open lake shores.
-_MML_STREAM_LAYERS = ("virtavesialue", "virtavesikapea")
+_MML_STREAM_LAYERS = ("virtavesialue", "tulvaalue", "virtavesikapea")
 
 
 def build_stream_mask(hydro_path: str) -> object:
@@ -41,7 +42,10 @@ def build_stream_mask(hydro_path: str) -> object:
     if not gdfs:
         raise ValueError(f"No stream layers found in {hydro_path}")
 
-    combined = gpd.pd.concat(gdfs, ignore_index=True) if len(gdfs) > 1 else gdfs[0]
+    if len(gdfs) > 1:
+        combined = gpd.GeoDataFrame(pd.concat(gdfs, ignore_index=True), crs=gdfs[0].crs)
+    else:
+        combined = gdfs[0]
     return unary_union(combined.geometry.buffer(BUFFER_METERS))
 
 
@@ -81,7 +85,10 @@ def load_stream_lines(hydro_path: str):
             gdfs.append(gdf)
     if not gdfs:
         return None
-    combined = gpd.pd.concat(gdfs, ignore_index=True)
+    if len(gdfs) > 1:
+        combined = gpd.GeoDataFrame(pd.concat(gdfs, ignore_index=True), crs=gdfs[0].crs)
+    else:
+        combined = gdfs[0]
     return combined.geometry.unary_union
 
 
