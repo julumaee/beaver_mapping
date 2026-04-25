@@ -17,7 +17,10 @@ def _load_mask(hydro_path: str | None):
     if hydro_path is None:
         return None
     from masking import build_stream_mask
-    return build_stream_mask(hydro_path)
+    print(f"Building stream mask from {hydro_path} ...")
+    mask = build_stream_mask(hydro_path)
+    print("  Stream mask ready.")
+    return mask
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +138,7 @@ def cmd_detect(args: argparse.Namespace) -> None:
 
     if method in ("rf", "both"):
         from models.random_forest import load_model as load_rf
+        print(f"Loading RF model from {args.rf_model} ...")
         rf_clf = load_rf(args.rf_model)
 
     if method in ("cnn", "both"):

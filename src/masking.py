@@ -32,6 +32,7 @@ def build_stream_mask(hydro_path: str) -> object:
 
     gdfs = []
     for f in files:
+        print(f"  Reading {f.name} ...")
         for gdf in _load_stream_layers(f):
             if gdf.crs is None:
                 raise ValueError(f"No CRS found in {f}")
@@ -46,6 +47,7 @@ def build_stream_mask(hydro_path: str) -> object:
         combined = gpd.GeoDataFrame(pd.concat(gdfs, ignore_index=True), crs=gdfs[0].crs)
     else:
         combined = gdfs[0]
+    print(f"  Buffering {len(combined)} features by {BUFFER_METERS} m and merging ...")
     return unary_union(combined.geometry.buffer(BUFFER_METERS))
 
 
