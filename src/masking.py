@@ -10,7 +10,7 @@ from shapely.ops import unary_union
 BUFFER_METERS = 50
 _VECTOR_SUFFIXES = {".gpkg", ".shp", ".geojson", ".json", ".fgb"}
 
-_MML_STREAM_LAYERS = ("virtavesialue", "tulvaalue", "virtavesikapea")
+_MML_STREAM_LAYERS = ("virtavesialue", "virtavesikapea")
 
 
 class StreamMask:
