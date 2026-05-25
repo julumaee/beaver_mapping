@@ -258,9 +258,15 @@ def evaluate_rf_per_class(
 
 
 def _print_per_class_table(results: dict[str, dict]) -> None:
-    print(f"\n{'Class':<15} {'Precision':>10} {'Recall':>8} {'F1':>7} {'N':>6}")
-    print("-" * 45)
+    print(f"\n{'Class':<15} {'Precision':>10} {'Recall':>8} {'F1':>7} {'Specificity':>12} {'N':>6}")
+    print("-" * 60)
     for ftype, m in results.items():
         n = m["tp"] + m["fn"] + m["tn"] + m["fp"]
-        print(f"{ftype:<15} {m['precision']:>10.3f} {m['recall']:>8.3f} "
-              f"{m['f1']:>7.3f} {n:>6}")
+        specificity = m["tn"] / max(1, m["tn"] + m["fp"])
+        if ftype == "negative":
+            # For the negative class, precision/recall/F1 are undefined (no positive label).
+            # Report only specificity = fraction of negatives correctly classified.
+            print(f"{ftype:<15} {'—':>10} {'—':>8} {'—':>7} {specificity:>12.3f} {n:>6}")
+        else:
+            print(f"{ftype:<15} {m['precision']:>10.3f} {m['recall']:>8.3f} "
+                  f"{m['f1']:>7.3f} {specificity:>12.3f} {n:>6}")
