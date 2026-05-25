@@ -98,6 +98,9 @@ def evaluate_rf_spatial(
 
     Returns averaged metrics across folds plus per-fold details.
     """
+    from sklearn.ensemble import RandomForestClassifier
+    from spectral import extract_features
+
     with open(manifest_path) as f:
         rows = list(csv.DictReader(f))
 
@@ -106,33 +109,34 @@ def evaluate_rf_spatial(
     print(f"Spatial CV: {len(rows)} chips in {n_clusters} clusters "
           f"(radius={cluster_radius:.0f} m)")
 
+    # Precompute all features once — avoids recomputing per fold (expensive with GLCM).
+    print("Precomputing features ...")
+    X_all = np.array([extract_features(np.load(r["path"])) for r in rows], dtype=np.float32)
+    y_all = np.array([min(int(r["label"]), 1) for r in rows], dtype=np.int32)
+    clusters_arr = np.array(clusters)
+    print(f"  Done. Feature matrix: {X_all.shape}")
+
     fold_metrics: list[dict] = []
 
     for held_out in range(n_clusters):
-        test_rows  = [r for r, c in zip(rows, clusters) if c == held_out]
-        train_rows = [r for r, c in zip(rows, clusters) if c != held_out]
+        test_mask  = clusters_arr == held_out
+        train_mask = ~test_mask
 
-        if not test_rows or not train_rows:
+        if test_mask.sum() == 0 or train_mask.sum() == 0:
             continue
 
-        # Build train feature matrix and fit a fresh RF
-        from models.random_forest import load_model as load_rf
-        import pickle
-        from sklearn.ensemble import RandomForestClassifier
-        from spectral import extract_features
-
-        X_train = np.array([extract_features(np.load(r["path"])) for r in train_rows], dtype=np.float32)
-        y_train = np.array([min(int(r["label"]), 1) for r in train_rows], dtype=np.int32)
+        print(f"  Fold {held_out + 1}/{n_clusters}: "
+              f"train={train_mask.sum()}, test={test_mask.sum()} chips", end=" ... ")
 
         clf = RandomForestClassifier(n_estimators=100, class_weight="balanced",
                                      random_state=random_seed, n_jobs=-2)
-        clf.fit(X_train, y_train)
+        clf.fit(X_all[train_mask], y_all[train_mask])
 
-        X_test = np.array([extract_features(np.load(r["path"])) for r in test_rows], dtype=np.float32)
-        y_true = [min(int(r["label"]), 1) for r in test_rows]
-        y_pred = clf.predict(X_test).tolist()
-
-        fold_metrics.append(_metrics(y_true, y_pred))
+        y_true = y_all[test_mask].tolist()
+        y_pred = clf.predict(X_all[test_mask]).tolist()
+        m = _metrics(y_true, y_pred)
+        fold_metrics.append(m)
+        print(f"recall={m['recall']:.2f}  precision={m['precision']:.2f}")
 
     avg = _average_metrics(fold_metrics)
     _print_spatial_cv_table(avg, fold_metrics)
@@ -201,8 +205,18 @@ def evaluate_rf_per_class(
         by_type[r["feature_type"]] += 1
     print("Positive chips by type:", dict(by_type))
 
+    from sklearn.ensemble import RandomForestClassifier
+    from spectral import extract_features
+
     clusters = _spatial_clusters(rows, cluster_radius)
     n_clusters = max(clusters) + 1
+
+    print("Precomputing features ...")
+    X_all = np.array([extract_features(np.load(r["path"])) for r in rows], dtype=np.float32)
+    y_all = np.array([min(int(r["label"]), 1) for r in rows], dtype=np.int32)
+    ftypes = [r["feature_type"] for r in rows]
+    clusters_arr = np.array(clusters)
+    print(f"  Done. Feature matrix: {X_all.shape}")
 
     # Accumulate (y_true, y_pred, feature_type) across all folds
     all_true: list[int] = []
@@ -210,27 +224,25 @@ def evaluate_rf_per_class(
     all_ftype: list[str] = []
 
     for held_out in range(n_clusters):
-        test_rows  = [r for r, c in zip(rows, clusters) if c == held_out]
-        train_rows = [r for r, c in zip(rows, clusters) if c != held_out]
-        if not test_rows or not train_rows:
+        test_mask  = clusters_arr == held_out
+        train_mask = ~test_mask
+        if test_mask.sum() == 0 or train_mask.sum() == 0:
             continue
 
-        from sklearn.ensemble import RandomForestClassifier
-        from spectral import extract_features
+        print(f"  Fold {held_out + 1}/{n_clusters}: "
+              f"train={train_mask.sum()}, test={test_mask.sum()} chips", end=" ... ")
 
-        X_train = np.array([extract_features(np.load(r["path"])) for r in train_rows], dtype=np.float32)
-        y_train = np.array([min(int(r["label"]), 1) for r in train_rows], dtype=np.int32)
         clf = RandomForestClassifier(n_estimators=100, class_weight="balanced",
                                      random_state=random_seed, n_jobs=-2)
-        clf.fit(X_train, y_train)
+        clf.fit(X_all[train_mask], y_all[train_mask])
+        preds = clf.predict(X_all[test_mask]).tolist()
 
-        for r in test_rows:
-            chip = np.load(r["path"])
-            feat = extract_features(chip).reshape(1, -1)
-            pred = int(clf.predict(feat)[0])
-            all_true.append(min(int(r["label"]), 1))
+        test_indices = np.where(test_mask)[0]
+        for i, pred in zip(test_indices, preds):
+            all_true.append(int(y_all[i]))
             all_pred.append(pred)
-            all_ftype.append(r["feature_type"])
+            all_ftype.append(ftypes[i])
+        print("done")
 
     results: dict[str, dict] = {}
     for ftype in ("wet_forest", "beaver_flood", "negative"):
