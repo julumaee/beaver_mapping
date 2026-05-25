@@ -2,6 +2,7 @@
 
 import numpy as np
 from skimage.feature import graycomatrix, graycoprops
+from skimage.measure import label as skimage_label, regionprops
 
 # MML Vääräväri (CIR) band order (0-indexed): NIR=0, Red=1, Green=2
 _NIR = 0
@@ -34,17 +35,19 @@ FEATURE_REGION = 64  # pixels — 32×32m at 0.5m/px
 
 def extract_features(chip: np.ndarray) -> np.ndarray:
     """
-    Return a 46-element float32 feature vector from a (bands, H, W) chip.
+    Return a 64-element float32 feature vector from a (bands, H, W) chip.
 
     Features are computed separately on two spatial scales:
       - Central 64×64px (32m) — captures the feature itself
       - Full chip 512×512px (256m) — captures surrounding landscape context
-    Each scale contributes 23 values:
+    Each scale contributes 32 values:
       - Per-band mean, std, 25th and 75th percentile  (3 × 4 = 12)
       - NDVI mean, std, fraction of pixels > 0.2      (3)
       - NDWI mean, std, fraction of pixels > 0.0      (3)
       - NDWI gradient magnitude std                   (1)
       - GLCM on NIR: contrast, homogeneity, energy, correlation (4)
+      - Connected wet-region stats at 3 NDWI thresholds: wet fraction,
+        component count, largest component area fraction (3 × 3 = 9)
     """
     return np.concatenate([
         _features_for_region(_center_crop(chip, FEATURE_REGION)),
@@ -117,5 +120,34 @@ def _features_for_region(region: np.ndarray) -> np.ndarray:
     feats.append(float(grad_mag.std()))
 
     feats += _glcm_features(region).tolist()
+    feats += _connected_wet_features(ndwi).tolist()
 
+    return np.array(feats, dtype=np.float32)
+
+
+def _connected_wet_features(ndwi: np.ndarray) -> np.ndarray:
+    """
+    Connected-component statistics on the NDWI map at three thresholds.
+
+    For each threshold t in (0.0, 0.1, 0.2) returns:
+      - wet pixel fraction
+      - number of connected wet components (capped at 255 to avoid outliers)
+      - area of the largest wet component as a fraction of total pixels
+
+    Beaver floods produce a single large wet blob; wet forest produces
+    many small blobs; dry stream gives near-zero fraction.
+    """
+    total = ndwi.size
+    feats: list[float] = []
+    for thresh in (0.0, 0.1, 0.2):
+        binary = ndwi > thresh
+        wet_frac = float(binary.mean())
+        if wet_frac == 0.0:
+            feats += [0.0, 0.0, 0.0]
+            continue
+        labeled = skimage_label(binary)
+        props = regionprops(labeled)
+        n_components = min(len(props), 255)
+        max_area_frac = max(p.area for p in props) / total if props else 0.0
+        feats += [wet_frac, float(n_components), float(max_area_frac)]
     return np.array(feats, dtype=np.float32)
