@@ -194,12 +194,20 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
 
 
 def cmd_evaluate_rf(args: argparse.Namespace) -> None:
-    from models.evaluate import evaluate_rf_spatial
-    evaluate_rf_spatial(
-        manifest_path=args.manifest,
-        rf_model_path=args.rf_model,
-        cluster_radius=args.cluster_radius,
-    )
+    if args.per_class:
+        from models.evaluate import evaluate_rf_per_class
+        evaluate_rf_per_class(
+            manifest_path=args.manifest,
+            rf_model_path=args.rf_model,
+            cluster_radius=args.cluster_radius,
+        )
+    else:
+        from models.evaluate import evaluate_rf_spatial
+        evaluate_rf_spatial(
+            manifest_path=args.manifest,
+            rf_model_path=args.rf_model,
+            cluster_radius=args.cluster_radius,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -300,6 +308,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_eval_rf.add_argument("--rf-model",       required=True, dest="rf_model", help="RF model path (.pkl)")
     p_eval_rf.add_argument("--cluster-radius", type=float, default=500.0, dest="cluster_radius",
                            help="Group label points within this radius (metres) into one fold (default 500)")
+    p_eval_rf.add_argument("--per-class", action="store_true", dest="per_class",
+                           help="Break results down by feature type (wet_forest, beaver_flood)")
 
     return parser
 

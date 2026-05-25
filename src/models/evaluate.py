@@ -177,3 +177,78 @@ def _print_spatial_cv_table(avg: dict, folds: list[dict]) -> None:
         vals = [m[key] for m in folds]
         print(f"{key:<12} {avg[key]:>8.3f} {min(vals):>8.3f} {max(vals):>8.3f}")
     print(f"\n(spatial LOCO-CV over {len(folds)} folds)")
+
+
+def evaluate_rf_per_class(
+    manifest_path: str,
+    rf_model_path: str,
+    cluster_radius: float = 500.0,
+    random_seed: int = 42,
+) -> dict:
+    """
+    Spatial LOCO-CV broken down by feature type (wet_forest, beaver_flood).
+
+    For each fold, accumulates per-class predictions, then reports
+    Precision/Recall/F1 for wet_forest and beaver_flood separately so
+    you can see which label type the RF handles better.
+    """
+    with open(manifest_path) as f:
+        rows = list(csv.DictReader(f))
+
+    positive_rows = [r for r in rows if int(r["label"]) == 1]
+    by_type: dict[str, int] = defaultdict(int)
+    for r in positive_rows:
+        by_type[r["feature_type"]] += 1
+    print("Positive chips by type:", dict(by_type))
+
+    clusters = _spatial_clusters(rows, cluster_radius)
+    n_clusters = max(clusters) + 1
+
+    # Accumulate (y_true, y_pred, feature_type) across all folds
+    all_true: list[int] = []
+    all_pred: list[int] = []
+    all_ftype: list[str] = []
+
+    for held_out in range(n_clusters):
+        test_rows  = [r for r, c in zip(rows, clusters) if c == held_out]
+        train_rows = [r for r, c in zip(rows, clusters) if c != held_out]
+        if not test_rows or not train_rows:
+            continue
+
+        from sklearn.ensemble import RandomForestClassifier
+        from spectral import extract_features
+
+        X_train = np.array([extract_features(np.load(r["path"])) for r in train_rows], dtype=np.float32)
+        y_train = np.array([min(int(r["label"]), 1) for r in train_rows], dtype=np.int32)
+        clf = RandomForestClassifier(n_estimators=100, class_weight="balanced",
+                                     random_state=random_seed, n_jobs=-2)
+        clf.fit(X_train, y_train)
+
+        for r in test_rows:
+            chip = np.load(r["path"])
+            feat = extract_features(chip).reshape(1, -1)
+            pred = int(clf.predict(feat)[0])
+            all_true.append(min(int(r["label"]), 1))
+            all_pred.append(pred)
+            all_ftype.append(r["feature_type"])
+
+    results: dict[str, dict] = {}
+    for ftype in ("wet_forest", "beaver_flood", "negative"):
+        indices = [i for i, t in enumerate(all_ftype) if t == ftype]
+        if not indices:
+            continue
+        y_t = [all_true[i] for i in indices]
+        y_p = [all_pred[i] for i in indices]
+        results[ftype] = _metrics(y_t, y_p)
+
+    _print_per_class_table(results)
+    return results
+
+
+def _print_per_class_table(results: dict[str, dict]) -> None:
+    print(f"\n{'Class':<15} {'Precision':>10} {'Recall':>8} {'F1':>7} {'N':>6}")
+    print("-" * 45)
+    for ftype, m in results.items():
+        n = m["tp"] + m["fn"] + m["tn"] + m["fp"]
+        print(f"{ftype:<15} {m['precision']:>10.3f} {m['recall']:>8.3f} "
+              f"{m['f1']:>7.3f} {n:>6}")
