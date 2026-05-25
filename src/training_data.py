@@ -165,6 +165,8 @@ def sample_negatives(
             continue
         if any(pt.distance(pos) < min_pos_distance for pos in positive_points):
             continue
+        if any(pt.distance(neg) < min_neg_spacing for neg in samples):
+            continue
         samples.append(pt)
 
     return samples
