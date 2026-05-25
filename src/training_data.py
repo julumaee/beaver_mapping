@@ -139,10 +139,16 @@ def sample_negatives(
     positive_points: list[Point],
     n: int,
     rng_seed: int = 42,
+    min_pos_distance: float = 200.0,
+    min_neg_spacing: float = 100.0,
 ) -> list[Point]:
     """
-    Draw n random points from stream_mask.  The caller should pre-intersect
-    stream_mask with the imagery bounds so every returned point produces a chip.
+    Draw n random points from stream_mask, excluding areas near positive labels
+    and avoiding tight clustering of negatives.
+
+    min_pos_distance: reject candidates within this many metres of any positive.
+    min_neg_spacing:  reject candidates within this many metres of an already
+                      accepted negative (prevents spatial clustering).
     """
     if stream_mask is None or stream_mask.is_empty:
         return []
@@ -155,8 +161,11 @@ def sample_negatives(
         if len(samples) >= n:
             break
         pt = Point(rng.uniform(minx, maxx), rng.uniform(miny, maxy))
-        if stream_mask.contains(pt):
-            samples.append(pt)
+        if not stream_mask.contains(pt):
+            continue
+        if any(pt.distance(pos) < min_pos_distance for pos in positive_points):
+            continue
+        samples.append(pt)
 
     return samples
 
