@@ -141,19 +141,26 @@ def sample_negatives(
     rng_seed: int = 42,
     min_pos_distance: float = 200.0,
     min_neg_spacing: float = 100.0,
+    imagery_extent=None,
 ) -> list[Point]:
     """
     Draw n random points from stream_mask, excluding areas near positive labels
     and avoiding tight clustering of negatives.
 
+    imagery_extent: optional Shapely geometry; sampling is restricted to its
+                    bounding box and only points inside it are accepted.
     min_pos_distance: reject candidates within this many metres of any positive.
     min_neg_spacing:  reject candidates within this many metres of an already
                       accepted negative (prevents spatial clustering).
     """
-    if stream_mask is None or stream_mask.is_empty:
+    if stream_mask is None and imagery_extent is None:
         return []
 
-    minx, miny, maxx, maxy = stream_mask.bounds
+    if imagery_extent is not None:
+        minx, miny, maxx, maxy = imagery_extent.bounds
+    else:
+        minx, miny, maxx, maxy = stream_mask.bounds
+
     rng = random.Random(rng_seed)
     samples: list[Point] = []
 
@@ -161,7 +168,9 @@ def sample_negatives(
         if len(samples) >= n:
             break
         pt = Point(rng.uniform(minx, maxx), rng.uniform(miny, maxy))
-        if not stream_mask.contains(pt):
+        if imagery_extent is not None and not imagery_extent.contains(pt):
+            continue
+        if stream_mask is not None and not stream_mask.intersects(pt):
             continue
         if any(pt.distance(pos) < min_pos_distance for pos in positive_points):
             continue
@@ -199,8 +208,10 @@ def build_training_dataset(
     n_neg = n_negatives if n_negatives is not None else len(positive_labeled)
 
     imagery_extent = _imagery_union(jp2_paths)
-    sample_area = stream_mask.intersection(imagery_extent) if stream_mask is not None else imagery_extent
-    negative_points = sample_negatives(sample_area, positive_points, n_neg, rng_seed)
+    negative_points = sample_negatives(
+        stream_mask, positive_points, n_neg, rng_seed,
+        imagery_extent=imagery_extent,
+    )
     negative_labeled = [(pt, "negative") for pt in negative_points]
 
     manifest_rows: list[dict] = []

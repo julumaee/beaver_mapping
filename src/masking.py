@@ -31,6 +31,14 @@ class StreamMask:
     def __init__(self, gdf: gpd.GeoDataFrame) -> None:
         self._gdf = gdf
 
+    @property
+    def bounds(self) -> tuple[float, float, float, float]:
+        return tuple(self._gdf.total_bounds)
+
+    @property
+    def is_empty(self) -> bool:
+        return len(self._gdf) == 0
+
     def intersects(self, geom) -> bool:
         candidates = self._gdf.sindex.query(geom)
         if len(candidates) == 0:
