@@ -6,6 +6,20 @@ import tempfile
 from pathlib import Path
 
 
+class _NullContext:
+    """Context manager that yields a fixed path without creating/deleting it."""
+    def __init__(self, path: str) -> None:
+        import os
+        os.makedirs(path, exist_ok=True)
+        self._path = path
+
+    def __enter__(self) -> str:
+        return self._path
+
+    def __exit__(self, *_) -> None:
+        pass
+
+
 def _find_files(path: str, suffix: str) -> list[str]:
     p = Path(path)
     if p.is_file():
@@ -41,7 +55,12 @@ def cmd_train(args: argparse.Namespace) -> None:
 
     stream_mask = _load_mask(args.hydro)
 
-    with tempfile.TemporaryDirectory() as chip_dir:
+    chip_dir_ctx = (
+        tempfile.TemporaryDirectory()
+        if args.chip_dir is None
+        else _NullContext(args.chip_dir)
+    )
+    with chip_dir_ctx as chip_dir:
         print("Extracting training chips ...")
         manifest = build_training_dataset(
             jp2_paths=jp2_files,
@@ -77,6 +96,11 @@ def cmd_train(args: argparse.Namespace) -> None:
         train(manifest, args.model)
 
     print(f"Model saved to {args.model}")
+    if args.chip_dir is not None:
+        from pathlib import Path
+        manifest_path = Path(args.chip_dir) / "manifest.csv"
+        print(f"Chips and manifest saved to {args.chip_dir}/")
+        print(f"  Run evaluate-rf with: --manifest {manifest_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -261,7 +285,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--imagery", required=True, help="Directory of .jp2 files")
     p_train.add_argument("--labels",  required=True, help="KML/KMZ file or directory")
     p_train.add_argument("--model",   required=True, help="Output RF model path (.pkl)")
-    p_train.add_argument("--hydro",   default=None,  help="Hydrography directory or file (optional)")
+    p_train.add_argument("--hydro",     default=None, help="Hydrography directory or file (optional)")
+    p_train.add_argument("--chip-dir",  default=None, dest="chip_dir",
+                         help="Persist extracted chips to this directory (enables evaluate-rf later). "
+                              "Default: temp directory deleted after training.")
 
     # -- cnn-train --
     p_cnn = sub.add_parser("cnn-train", help="Train the CNN classifier (Prithvi head)")

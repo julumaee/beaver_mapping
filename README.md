@@ -1,17 +1,19 @@
 # CastorDetector — Beaver Activity Detection in MML Aerial Imagery
 
-CLI tool for detecting beaver activity in Finnish National Land Survey (MML) aerial imagery using spectral analysis and deep learning.
+CLI tool for detecting beaver activity in Finnish National Land Survey (MML) aerial imagery using spectral analysis.
 
 ## How It Works
 
 The pipeline slides a 512×512px window over MML `.jp2` tiles, classifies each window as beaver activity or background, and exports detections as KML polygons for verification in Google Earth.
 
-Two detection models are available:
+The primary detection model is the **Random Forest (RF)**, trained on manually labelled point observations (`wet_forest`, `beaver_flood`) placed on top of beaver-influenced landscape features in Google Earth. A CNN (Prithvi-EO) path also exists for experimental comparison.
 
-- **Random Forest (RF)** — uses NDWI/NDVI spectral indices. Fast, works well on CPU, good baseline.
-- **CNN (Prithvi-EO)** — frozen Prithvi-EO-1.0-100M ViT-Base encoder with a trainable classification head. Slower on CPU but captures spatial context.
-
-Both models can be run independently or together, with agreement detections highlighted in a third colour.
+**RF feature vector (70 elements, computed at two spatial scales):**
+- Per-band mean, std, p25, p75 (NIR, Red, Green)
+- NDVI and NDWI statistics + high-value pixel fractions
+- NDWI spatial gradient std (water-edge sharpness)
+- GLCM texture on NIR (contrast, homogeneity, energy, correlation)
+- Connected wet-region stats at three NDWI thresholds: wet fraction, component count, largest blob area fraction, blob shape index
 
 ## Data
 
@@ -26,14 +28,25 @@ Both models can be run independently or together, with agreement detections high
 ## Installation
 
 ```bash
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
 > **Note:** `requirements.txt` pins the CPU-only PyTorch wheel. If you have an NVIDIA GPU, replace the `--extra-index-url` line with the appropriate CUDA wheel URL from pytorch.org.
+>
+> All commands below assume the venv is active. If not, prefix with `.venv/bin/python`.
 
 ## Random Forest
+
+### Label format
+
+Place point placemarks in Google Earth and name them:
+- `wet_forest` — flooded/saturated forest with dead standing trees
+- `beaver_flood` — open water impoundment behind a beaver dam
+- `negative` — stream-adjacent area with no beaver activity (optional; the pipeline also auto-samples negatives)
+
+Placemarks named `dam` or `lodge` are excluded from training by default.
 
 ### Train
 
@@ -42,8 +55,14 @@ python src/cli.py train \
   --imagery data/imagery/ \
   --labels data/labels/ \
   --model data/models/model.pkl \
-  --hydro data/hydrography/        # optional but recommended
+  --hydro data/hydrography/ \       # optional but recommended
+  --chip-dir data/chips/            # optional: keep chips for evaluate-rf
 ```
+
+The training pipeline:
+1. Parses `wet_forest` and `beaver_flood` labels from all KML/KMZ files in `--labels`
+2. Auto-samples an equal number of negatives from the stream corridor, excluding any point within 200 m of a positive and enforcing 100 m minimum spacing between negatives
+3. Extracts 70-element feature vectors per chip and trains a balanced Random Forest
 
 ### Detect
 
@@ -56,6 +75,31 @@ python src/cli.py detect \
   --hydro data/hydrography/ \
   --threshold 0.5                  # optional, default 0.5
 ```
+
+### Evaluate RF (spatial cross-validation)
+
+Standard random splits are unreliable for spatial data. Use spatial leave-one-cluster-out CV instead — label points within 500 m of each other form one fold:
+
+```bash
+# Overall metrics (accuracy, precision, recall, F1 — mean/min/max across folds)
+python src/cli.py evaluate-rf \
+  --manifest data/chips/manifest.csv \
+  --rf-model data/models/model.pkl
+
+# Per-class breakdown (wet_forest vs beaver_flood separately)
+python src/cli.py evaluate-rf \
+  --manifest data/chips/manifest.csv \
+  --rf-model data/models/model.pkl \
+  --per-class
+
+# Adjust cluster radius if your territories are closer/further apart
+python src/cli.py evaluate-rf \
+  --manifest data/chips/manifest.csv \
+  --rf-model data/models/model.pkl \
+  --cluster-radius 300
+```
+
+> **Note:** The manifest CSV is written into the chip directory. By default `train` uses a temp directory that is deleted after training. Pass `--chip-dir data/chips/` to keep chips and the manifest on disk for use with `evaluate-rf`.
 
 ## CNN (Prithvi-EO-1.0-100M)
 
