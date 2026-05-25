@@ -2,7 +2,7 @@
 
 import numpy as np
 from skimage.feature import graycomatrix, graycoprops
-from skimage.measure import label as skimage_label, regionprops
+from skimage.measure import label as skimage_label, regionprops, perimeter as skimage_perimeter
 
 # MML Vääräväri (CIR) band order (0-indexed): NIR=0, Red=1, Green=2
 _NIR = 0
@@ -35,19 +35,20 @@ FEATURE_REGION = 64  # pixels — 32×32m at 0.5m/px
 
 def extract_features(chip: np.ndarray) -> np.ndarray:
     """
-    Return a 64-element float32 feature vector from a (bands, H, W) chip.
+    Return a 70-element float32 feature vector from a (bands, H, W) chip.
 
     Features are computed separately on two spatial scales:
       - Central 64×64px (32m) — captures the feature itself
       - Full chip 512×512px (256m) — captures surrounding landscape context
-    Each scale contributes 32 values:
+    Each scale contributes 35 values:
       - Per-band mean, std, 25th and 75th percentile  (3 × 4 = 12)
       - NDVI mean, std, fraction of pixels > 0.2      (3)
       - NDWI mean, std, fraction of pixels > 0.0      (3)
       - NDWI gradient magnitude std                   (1)
       - GLCM on NIR: contrast, homogeneity, energy, correlation (4)
       - Connected wet-region stats at 3 NDWI thresholds: wet fraction,
-        component count, largest component area fraction (3 × 3 = 9)
+        component count, largest area fraction, largest blob shape index
+        (3 × 4 = 12)
     """
     return np.concatenate([
         _features_for_region(_center_crop(chip, FEATURE_REGION)),
@@ -143,11 +144,19 @@ def _connected_wet_features(ndwi: np.ndarray) -> np.ndarray:
         binary = ndwi > thresh
         wet_frac = float(binary.mean())
         if wet_frac == 0.0:
-            feats += [0.0, 0.0, 0.0]
+            feats += [0.0, 0.0, 0.0, 0.0]
             continue
         labeled = skimage_label(binary)
         props = regionprops(labeled)
         n_components = min(len(props), 255)
         max_area_frac = max(p.area for p in props) / total if props else 0.0
-        feats += [wet_frac, float(n_components), float(max_area_frac)]
+
+        # Perimeter/sqrt(area) of the largest blob — low = compact circular pond,
+        # high = irregular wet forest edges.
+        largest = max(props, key=lambda p: p.area)
+        largest_mask = labeled == largest.label
+        perim = float(skimage_perimeter(largest_mask))
+        shape_index = perim / max(1.0, largest.area ** 0.5)
+
+        feats += [wet_frac, float(n_components), float(max_area_frac), shape_index]
     return np.array(feats, dtype=np.float32)
