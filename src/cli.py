@@ -193,6 +193,15 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
     )
 
 
+def cmd_evaluate_rf(args: argparse.Namespace) -> None:
+    from models.evaluate import evaluate_rf_spatial
+    evaluate_rf_spatial(
+        manifest_path=args.manifest,
+        rf_model_path=args.rf_model,
+        cluster_radius=args.cluster_radius,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Agreement merge logic
 # ---------------------------------------------------------------------------
@@ -282,6 +291,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_eval.add_argument("--test-fraction", type=float, default=0.2, dest="test_fraction",
                         help="Fraction of manifest to hold out (default 0.2)")
 
+    # -- evaluate-rf --
+    p_eval_rf = sub.add_parser(
+        "evaluate-rf",
+        help="Evaluate RF with spatial leave-one-cluster-out cross-validation",
+    )
+    p_eval_rf.add_argument("--manifest",       required=True, help="Training manifest CSV")
+    p_eval_rf.add_argument("--rf-model",       required=True, dest="rf_model", help="RF model path (.pkl)")
+    p_eval_rf.add_argument("--cluster-radius", type=float, default=500.0, dest="cluster_radius",
+                           help="Group label points within this radius (metres) into one fold (default 500)")
+
     return parser
 
 
@@ -299,10 +318,11 @@ def main() -> None:
             parser.error("--norm-stats is required when --method is 'cnn' or 'both'")
 
     dispatch = {
-        "train":     cmd_train,
-        "cnn-train": cmd_cnn_train,
-        "detect":    cmd_detect,
-        "evaluate":  cmd_evaluate,
+        "train":       cmd_train,
+        "cnn-train":   cmd_cnn_train,
+        "detect":      cmd_detect,
+        "evaluate":    cmd_evaluate,
+        "evaluate-rf": cmd_evaluate_rf,
     }
     dispatch[args.command](args)
 
