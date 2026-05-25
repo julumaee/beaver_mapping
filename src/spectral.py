@@ -34,15 +34,16 @@ FEATURE_REGION = 64  # pixels — 32×32m at 0.5m/px
 
 def extract_features(chip: np.ndarray) -> np.ndarray:
     """
-    Return a 44-element float32 feature vector from a (bands, H, W) chip.
+    Return a 46-element float32 feature vector from a (bands, H, W) chip.
 
     Features are computed separately on two spatial scales:
       - Central 64×64px (32m) — captures the feature itself
       - Full chip 512×512px (256m) — captures surrounding landscape context
-    Each scale contributes 22 values:
+    Each scale contributes 23 values:
       - Per-band mean, std, 25th and 75th percentile  (3 × 4 = 12)
       - NDVI mean, std, fraction of pixels > 0.2      (3)
       - NDWI mean, std, fraction of pixels > 0.0      (3)
+      - NDWI gradient magnitude std                   (1)
       - GLCM on NIR: contrast, homogeneity, energy, correlation (4)
     """
     return np.concatenate([
@@ -108,6 +109,12 @@ def _features_for_region(region: np.ndarray) -> np.ndarray:
 
     ndwi = compute_ndwi(region)
     feats += [float(ndwi.mean()), float(ndwi.std()), float(np.mean(ndwi > 0.0))]
+
+    # Gradient std: high at water/vegetation boundaries (pond perimeter),
+    # low for uniform open water or uniform dry forest.
+    dy, dx = np.gradient(ndwi)
+    grad_mag = np.sqrt(dx ** 2 + dy ** 2)
+    feats.append(float(grad_mag.std()))
 
     feats += _glcm_features(region).tolist()
 
