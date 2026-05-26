@@ -1,8 +1,9 @@
 """Gradio web UI for CastorDetector."""
 import csv
-import io
+import queue
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -37,18 +38,47 @@ class _NullContext:
         pass
 
 
-def _capture(fn, *args, **kwargs) -> str:
-    """Run fn synchronously, capture its stdout, return as string."""
-    buf = io.StringIO()
-    old = sys.stdout
-    sys.stdout = buf
-    try:
-        fn(*args, **kwargs)
-        return buf.getvalue() or "Done."
-    except Exception as exc:
-        return (buf.getvalue() or "") + f"\nERROR: {exc}"
-    finally:
-        sys.stdout = old
+class _QueueWriter:
+    """Redirect stdout lines into a queue for live streaming."""
+    def __init__(self, q: queue.Queue) -> None:
+        self._q = q
+        self._buf = ""
+
+    def write(self, s: str) -> None:
+        self._buf += s
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            self._q.put(line + "\n")
+
+    def flush(self) -> None:
+        if self._buf:
+            self._q.put(self._buf)
+            self._buf = ""
+
+
+def _stream(fn, *args, **kwargs):
+    """Run fn in a background thread, yielding its stdout output line-by-line."""
+    q: queue.Queue = queue.Queue()
+
+    def _run() -> None:
+        old = sys.stdout
+        sys.stdout = _QueueWriter(q)
+        try:
+            fn(*args, **kwargs)
+        except Exception as exc:
+            q.put(f"ERROR: {exc}\n")
+        finally:
+            sys.stdout = old
+            q.put(None)
+
+    threading.Thread(target=_run, daemon=True).start()
+    accumulated = ""
+    while True:
+        line = q.get()
+        if line is None:
+            break
+        accumulated += line
+        yield accumulated
 
 
 # --------------------------------------------------------------------------- #
@@ -118,8 +148,8 @@ def handle_train_rf(
     hydro_dir: str,
     chip_dir: str,
     augment: float,
-) -> str:
-    return _capture(
+):
+    yield from _stream(
         _do_train_rf,
         imagery_dir.strip(), labels_dir.strip(), model_path.strip(),
         hydro_dir.strip(), chip_dir.strip(), int(augment),
@@ -185,8 +215,8 @@ def handle_train_cnn(
     hydro_dir: str,
     epochs: float,
     lr: float,
-) -> str:
-    return _capture(
+):
+    yield from _stream(
         _do_train_cnn,
         imagery_dir.strip(), labels_dir.strip(), model_path.strip(),
         norm_stats_path.strip(), hydro_dir.strip(), int(epochs), float(lr),
@@ -282,16 +312,18 @@ def handle_detect(
     hydro_dir: str,
     threshold: float,
     output_path: str,
-) -> tuple[str, str | None]:
+):
     out = output_path.strip()
-    log = _capture(
+    last_log = ""
+    for log in _stream(
         _do_detect,
         imagery_dir.strip(), method,
         rf_model_path.strip(), cnn_model_path.strip(), norm_stats_path.strip(),
         hydro_dir.strip(), float(threshold), out,
-    )
-    kml_file = out if out and Path(out).exists() else None
-    return log, kml_file
+    ):
+        last_log = log
+        yield log, None
+    yield last_log, (out if out and Path(out).exists() else None)
 
 
 # --------------------------------------------------------------------------- #
