@@ -365,6 +365,49 @@ def handle_detect(
 
 
 # --------------------------------------------------------------------------- #
+# Evaluate RF backend
+# --------------------------------------------------------------------------- #
+
+def _do_evaluate_rf(
+    manifest_path: str,
+    rf_model_path: str,
+    cluster_radius: float,
+    per_class: bool,
+) -> None:
+    if per_class:
+        from models.evaluate import evaluate_rf_per_class
+        evaluate_rf_per_class(
+            manifest_path=manifest_path,
+            rf_model_path=rf_model_path,
+            cluster_radius=cluster_radius,
+        )
+    else:
+        from models.evaluate import evaluate_rf_spatial
+        evaluate_rf_spatial(
+            manifest_path=manifest_path,
+            rf_model_path=rf_model_path,
+            cluster_radius=cluster_radius,
+        )
+
+
+def handle_evaluate_rf(
+    manifest_path: str,
+    rf_model_path: str,
+    cluster_radius: float,
+    per_class: bool,
+):
+    if not manifest_path or not manifest_path.strip():
+        yield "ERROR: Manifest CSV path is required."; return
+    if not rf_model_path or not rf_model_path.strip():
+        yield "ERROR: RF model path is required."; return
+    yield from _stream(
+        _do_evaluate_rf,
+        manifest_path.strip(), rf_model_path.strip(),
+        float(cluster_radius), bool(per_class),
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Gradio layout
 # --------------------------------------------------------------------------- #
 
@@ -455,6 +498,31 @@ with gr.Blocks(title="CastorDetector") as demo:
                 inputs=[det_imagery, det_method, det_rf_model, det_cnn_model,
                         det_norm_stats, det_hydro, det_threshold, det_output],
                 outputs=[det_log, det_file],
+            )
+
+        # ------------------------------------------------------------------ #
+        # Evaluate RF
+        # ------------------------------------------------------------------ #
+        with gr.Tab("Evaluate RF"):
+            gr.Markdown(
+                "## Evaluate RF\n"
+                "Assess model quality using spatial leave-one-cluster-out cross-validation.\n"
+                "Label points within the cluster radius are grouped into the same fold, "
+                "avoiding the spatial autocorrelation leak that a random split introduces."
+            )
+            with gr.Row():
+                ev_manifest  = gr.Textbox(label="Manifest CSV path", placeholder="data/chips/manifest.csv")
+                ev_rf_model  = gr.Textbox(label="RF model path (.pkl)", placeholder="data/models/model.pkl")
+            with gr.Row():
+                ev_radius    = gr.Slider(minimum=100, maximum=2000, value=500, step=50,
+                                         label="Cluster radius (metres)")
+                ev_per_class = gr.Checkbox(label="Per-class breakdown (wet_forest / beaver_flood)", value=False)
+            ev_btn = gr.Button("Evaluate RF", variant="primary")
+            ev_log = gr.Textbox(label="Results", lines=20, interactive=False)
+            ev_btn.click(
+                fn=handle_evaluate_rf,
+                inputs=[ev_manifest, ev_rf_model, ev_radius, ev_per_class],
+                outputs=ev_log,
             )
 
 
