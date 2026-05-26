@@ -10,13 +10,8 @@ from shapely.ops import unary_union
 BUFFER_METERS = 50
 _VECTOR_SUFFIXES = {".gpkg", ".shp", ".geojson", ".json", ".fgb"}
 
-_MML_AREA_LAYERS = ("virtavesialue",)   # polygon water bodies — always included
-_MML_LINE_LAYERS = ("virtavesikapea",)  # narrow waterway lines — filtered by proximity to area layers
-
-# virtavesikapea includes both natural streams and forest drainage ditches.
-# Only keep line features within this distance of a virtavesialue polygon so
-# that isolated ditch networks in drained forests are excluded.
-STREAM_CONNECTIVITY_M = 500
+_MML_AREA_LAYERS = ("virtavesialue",)  # polygon water bodies
+_MML_LINE_LAYERS = ("virtavesikapea",) # narrow waterway lines (all included)
 
 
 class StreamMask:
@@ -53,60 +48,35 @@ class StreamMask:
         return int(self._gdf.iloc[candidates].intersects(geom).sum())
 
 
-def build_stream_mask(hydro_path: str, connectivity_m: float = STREAM_CONNECTIVITY_M) -> StreamMask:
+def build_stream_mask(hydro_path: str) -> StreamMask:
     """
     Load MML hydrography vectors and return a StreamMask backed by a spatial index.
 
-    virtavesialue (stream/river area polygons) are always included.
-    virtavesikapea (narrow waterway lines) are filtered to only those within
-    STREAM_CONNECTIVITY_M of a virtavesialue polygon — this excludes the vast
-    majority of forest drainage ditches which form isolated networks.
+    Both virtavesialue (polygon water bodies) and virtavesikapea (narrow waterway
+    lines) are included without filtering — beavers can colonise any watercourse.
     """
     files = _resolve_files(hydro_path)
     if not files:
         raise ValueError(f"No vector files found at {hydro_path}")
 
-    area_gdfs: list[gpd.GeoDataFrame] = []
-    line_gdfs: list[gpd.GeoDataFrame] = []
+    gdfs: list[gpd.GeoDataFrame] = []
 
     for f in files:
         print(f"  Reading {f.name} ...")
-        for layer_name, gdf in _load_stream_layers(f):
+        for _layer_name, gdf in _load_stream_layers(f):
             if gdf.crs is None:
                 raise ValueError(f"No CRS found in {f}")
             if gdf.crs.to_epsg() != 3067:
                 gdf = gdf.to_crs(epsg=3067)
-            if layer_name in _MML_AREA_LAYERS:
-                area_gdfs.append(gdf[["geometry"]])
-            else:
-                line_gdfs.append(gdf[["geometry"]])
+            gdfs.append(gdf[["geometry"]])
 
-    if not area_gdfs and not line_gdfs:
+    if not gdfs:
         raise ValueError(f"No stream layers found in {hydro_path}")
 
-    def _concat(gdfs):
-        if not gdfs:
-            return None
-        if len(gdfs) == 1:
-            return gdfs[0].reset_index(drop=True)
-        return gpd.GeoDataFrame(pd.concat(gdfs, ignore_index=True), crs=gdfs[0].crs)
-
-    areas = _concat(area_gdfs)
-    lines = _concat(line_gdfs)
-
-    # Filter narrow waterway lines to those connected to real water bodies.
-    if lines is not None and areas is not None and connectivity_m > 0:
-        print(f"  Filtering {len(lines)} narrow waterway lines by proximity to "
-              f"{len(areas)} stream areas (threshold {connectivity_m} m) ...")
-        area_buffered = gpd.GeoDataFrame(
-            geometry=areas.geometry.buffer(connectivity_m), crs=areas.crs
-        )
-        joined = gpd.sjoin(lines, area_buffered, how="inner", predicate="intersects")
-        lines = lines.iloc[joined.index.unique()].reset_index(drop=True)
-        print(f"  {len(lines)} connected waterway lines retained.")
-
-    parts = [g for g in (areas, lines) if g is not None]
-    combined = _concat(parts)
+    if len(gdfs) == 1:
+        combined = gdfs[0].reset_index(drop=True)
+    else:
+        combined = gpd.GeoDataFrame(pd.concat(gdfs, ignore_index=True), crs=gdfs[0].crs)
 
     print(f"  Buffering {len(combined)} features by {BUFFER_METERS} m ...")
     combined = combined.copy()

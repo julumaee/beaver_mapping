@@ -27,13 +27,12 @@ def _find_files(path: str, suffix: str) -> list[str]:
     return sorted(str(f) for f in p.rglob(f"*{suffix}"))
 
 
-def _load_mask(hydro_path: str | None, connectivity_m: float = 500.0):
+def _load_mask(hydro_path: str | None):
     if hydro_path is None:
         return None
     from masking import build_stream_mask
     print(f"Building stream mask from {hydro_path} ...")
-    mask = build_stream_mask(hydro_path, connectivity_m=connectivity_m)
-    return mask
+    return build_stream_mask(hydro_path)
 
 
 # ---------------------------------------------------------------------------
@@ -52,7 +51,7 @@ def cmd_train(args: argparse.Namespace) -> None:
     if not kml_files:
         sys.exit(f"No KML/KMZ files found in {args.labels}")
 
-    stream_mask = _load_mask(args.hydro, getattr(args, "connectivity_m", 500.0))
+    stream_mask = _load_mask(args.hydro)
 
     chip_dir_ctx = (
         tempfile.TemporaryDirectory()
@@ -154,7 +153,7 @@ def cmd_detect(args: argparse.Namespace) -> None:
     if not jp2_files:
         sys.exit(f"No .jp2 files found in {args.imagery}")
 
-    stream_mask = _load_mask(args.hydro, getattr(args, "connectivity_m", 500.0))
+    stream_mask = _load_mask(args.hydro)
     method = args.method
 
     # Load models as needed
@@ -285,10 +284,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--imagery", required=True, help="Directory of .jp2 files")
     p_train.add_argument("--labels",  required=True, help="KML/KMZ file or directory")
     p_train.add_argument("--model",   required=True, help="Output RF model path (.pkl)")
-    p_train.add_argument("--hydro",            default=None, help="Hydrography directory or file (optional)")
-    p_train.add_argument("--connectivity-m",   type=float, default=500.0, dest="connectivity_m",
-                         help="Max distance (m) from a virtavesialue polygon to keep virtavesikapea lines "
-                              "(default 500). Set to 0 to disable the filter.")
+    p_train.add_argument("--hydro",     default=None, help="Hydrography directory or file (optional)")
     p_train.add_argument("--chip-dir",  default=None, dest="chip_dir",
                          help="Persist extracted chips to this directory (enables evaluate-rf later). "
                               "Default: temp directory deleted after training.")
@@ -319,10 +315,7 @@ def build_parser() -> argparse.ArgumentParser:
                           help="CNN weights path (.pth) — required for --method cnn or both")
     p_detect.add_argument("--norm-stats", default=None, dest="norm_stats",
                           help="Norm stats JSON — required for --method cnn or both")
-    p_detect.add_argument("--hydro",           default=None, help="Hydrography directory or file (optional)")
-    p_detect.add_argument("--connectivity-m",  type=float, default=500.0, dest="connectivity_m",
-                          help="Max distance (m) from a virtavesialue polygon to keep virtavesikapea lines "
-                               "(default 500). Set to 0 to disable the filter.")
+    p_detect.add_argument("--hydro",     default=None, help="Hydrography directory or file (optional)")
     p_detect.add_argument("--threshold", type=float, default=0.5,
                           help="Confidence threshold (default 0.5)")
 
