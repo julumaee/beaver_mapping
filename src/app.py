@@ -149,10 +149,18 @@ def handle_train_rf(
     chip_dir: str,
     augment: float,
 ):
+    if not imagery_dir or not imagery_dir.strip():
+        yield "ERROR: Imagery directory is required."; return
+    if not labels_dir or not labels_dir.strip():
+        yield "ERROR: Labels directory is required."; return
+    if not model_path or not model_path.strip():
+        yield "ERROR: Model output path is required."; return
     yield from _stream(
         _do_train_rf,
         imagery_dir.strip(), labels_dir.strip(), model_path.strip(),
-        hydro_dir.strip(), chip_dir.strip(), int(augment),
+        hydro_dir.strip() if hydro_dir else "",
+        chip_dir.strip() if chip_dir else "",
+        int(augment),
     )
 
 
@@ -216,10 +224,20 @@ def handle_train_cnn(
     epochs: float,
     lr: float,
 ):
+    if not imagery_dir or not imagery_dir.strip():
+        yield "ERROR: Imagery directory is required."; return
+    if not labels_dir or not labels_dir.strip():
+        yield "ERROR: Labels directory is required."; return
+    if not model_path or not model_path.strip():
+        yield "ERROR: Model output path is required."; return
+    if not norm_stats_path or not norm_stats_path.strip():
+        yield "ERROR: Norm stats path is required."; return
     yield from _stream(
         _do_train_cnn,
         imagery_dir.strip(), labels_dir.strip(), model_path.strip(),
-        norm_stats_path.strip(), hydro_dir.strip(), int(epochs), float(lr),
+        norm_stats_path.strip(),
+        hydro_dir.strip() if hydro_dir else "",
+        int(epochs), float(lr),
     )
 
 
@@ -313,6 +331,16 @@ def handle_detect(
     threshold: float,
     output_path: str,
 ):
+    if not imagery_dir or not imagery_dir.strip():
+        yield "ERROR: Imagery directory is required.", None; return
+    if not output_path or not output_path.strip():
+        yield "ERROR: Output KML path is required.", None; return
+    if method in ("rf", "both") and (not rf_model_path or not rf_model_path.strip()):
+        yield "ERROR: RF model path is required for this method.", None; return
+    if method in ("cnn", "both") and (not cnn_model_path or not cnn_model_path.strip()):
+        yield "ERROR: CNN model path is required for this method.", None; return
+    if method in ("cnn", "both") and (not norm_stats_path or not norm_stats_path.strip()):
+        yield "ERROR: Norm stats path is required for this method.", None; return
     out = output_path.strip()
     last_log = ""
     for log in _stream(
