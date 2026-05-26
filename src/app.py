@@ -1,10 +1,20 @@
 """Gradio web UI for CastorDetector."""
+import subprocess
+import sys
+from pathlib import Path
+
+def _ensure_dependencies() -> None:
+    req = Path(__file__).parent.parent / "requirements.txt"
+    subprocess.check_call(
+        [sys.executable, "-m", "pip", "install", "-q", "-r", str(req)],
+    )
+
+_ensure_dependencies()
+
 import csv
 import queue
-import sys
 import tempfile
 import threading
-from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
