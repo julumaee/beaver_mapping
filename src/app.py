@@ -282,13 +282,16 @@ def handle_detect(
     hydro_dir: str,
     threshold: float,
     output_path: str,
-) -> str:
-    return _capture(
+) -> tuple[str, str | None]:
+    out = output_path.strip()
+    log = _capture(
         _do_detect,
         imagery_dir.strip(), method,
         rf_model_path.strip(), cnn_model_path.strip(), norm_stats_path.strip(),
-        hydro_dir.strip(), float(threshold), output_path.strip(),
+        hydro_dir.strip(), float(threshold), out,
     )
+    kml_file = out if out and Path(out).exists() else None
+    return log, kml_file
 
 
 # --------------------------------------------------------------------------- #
@@ -374,13 +377,14 @@ with gr.Blocks(title="CastorDetector") as demo:
                 det_norm_stats = gr.Textbox(label="Norm stats path (.json)", placeholder="data/models/norm_stats.json")
                 det_threshold  = gr.Slider(minimum=0.0, maximum=1.0, value=0.5, step=0.05,
                                            label="Confidence threshold")
-            det_btn = gr.Button("Detect & Export KML", variant="primary")
-            det_log = gr.Textbox(label="Log", lines=15, interactive=False, show_copy_button=True)
+            det_btn  = gr.Button("Detect & Export KML", variant="primary")
+            det_log  = gr.Textbox(label="Log", lines=15, interactive=False, show_copy_button=True)
+            det_file = gr.File(label="Download KML", interactive=False)
             det_btn.click(
                 fn=handle_detect,
                 inputs=[det_imagery, det_method, det_rf_model, det_cnn_model,
                         det_norm_stats, det_hydro, det_threshold, det_output],
-                outputs=det_log,
+                outputs=[det_log, det_file],
             )
 
 
