@@ -228,9 +228,11 @@ def _resolve_mask(jp2_path: str, stream_mask):
     with rasterio.open(jp2_path) as src:
         b = src.bounds
         raster_box = box(b.left, b.bottom, b.right, b.top)
-    if not stream_mask.intersects(raster_box):
+    n_features = stream_mask.count_intersecting(raster_box)
+    if n_features == 0:
         print("  No hydrography coverage for this image — scanning full raster")
         return None
+    print(f"  Stream mask: {n_features} buffered features intersect this tile")
     return stream_mask
 
 

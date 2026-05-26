@@ -45,8 +45,15 @@ class StreamMask:
             return False
         return bool(self._gdf.iloc[candidates].intersects(geom).any())
 
+    def count_intersecting(self, geom) -> int:
+        """Return the number of buffered features that intersect geom."""
+        candidates = self._gdf.sindex.query(geom)
+        if len(candidates) == 0:
+            return 0
+        return int(self._gdf.iloc[candidates].intersects(geom).sum())
 
-def build_stream_mask(hydro_path: str) -> StreamMask:
+
+def build_stream_mask(hydro_path: str, connectivity_m: float = STREAM_CONNECTIVITY_M) -> StreamMask:
     """
     Load MML hydrography vectors and return a StreamMask backed by a spatial index.
 
@@ -88,11 +95,11 @@ def build_stream_mask(hydro_path: str) -> StreamMask:
     lines = _concat(line_gdfs)
 
     # Filter narrow waterway lines to those connected to real water bodies.
-    if lines is not None and areas is not None:
+    if lines is not None and areas is not None and connectivity_m > 0:
         print(f"  Filtering {len(lines)} narrow waterway lines by proximity to "
-              f"{len(areas)} stream areas (threshold {STREAM_CONNECTIVITY_M} m) ...")
+              f"{len(areas)} stream areas (threshold {connectivity_m} m) ...")
         area_buffered = gpd.GeoDataFrame(
-            geometry=areas.geometry.buffer(STREAM_CONNECTIVITY_M), crs=areas.crs
+            geometry=areas.geometry.buffer(connectivity_m), crs=areas.crs
         )
         joined = gpd.sjoin(lines, area_buffered, how="inner", predicate="intersects")
         lines = lines.iloc[joined.index.unique()].reset_index(drop=True)
