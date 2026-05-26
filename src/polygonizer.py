@@ -12,11 +12,13 @@ from ingestion import TILE_SIZE
 from models.random_forest import predict as clf_predict
 
 MIN_AREA_M2 = 500
-DETECTION_STRIDE = TILE_SIZE // 2  # 50% overlap
+DETECTION_STRIDE = TILE_SIZE // 2  # 50% overlap — used by the legacy detect_rois path
 
 # Dense patch-level RF segmentation constants
-PATCH_SIZE = 64  # pixels — 32 m at 0.5 m/px; matches FEATURE_REGION in spectral.py
-_CTX_OFFSET = (TILE_SIZE - PATCH_SIZE) // 2  # 224 — distance from context top/left to patch top/left
+PATCH_SIZE = 64   # pixels — 32 m at 0.5 m/px; matches FEATURE_REGION_MD in spectral.py
+PATCH_STRIDE = PATCH_SIZE // 2  # 32 px — 50% overlap ensures small features always
+                                 # fall within the center crop of at least one patch
+_CTX_OFFSET = (TILE_SIZE - PATCH_SIZE) // 2  # 224 — patch position in 512px context
 
 
 def detect_rois(
@@ -75,44 +77,47 @@ def detect_rois_rf_segmentation(
     with rasterio.open(jp2_path) as src:
         img_h, img_w = src.height, src.width
         img_transform = src.transform
-        patch_transform = src.transform * Affine.scale(PATCH_SIZE)
+        # prob_map pixels correspond to PATCH_STRIDE × PATCH_STRIDE ground areas
+        patch_transform = src.transform * Affine.scale(PATCH_STRIDE)
         print("  Loading image into memory ...")
         full_img = src.read()  # (3, img_h, img_w) uint8 — ~300 MB for a 10 000×10 000 tile
 
-    # Edge-pad by TILE_SIZE on all sides so every patch always has a full 512×512 context.
-    # _PAD_OFFSET converts patch grid coords to padded-array coords:
-    #   padded_row = pr * PATCH_SIZE + _PAD_OFFSET  (context window starts _CTX_OFFSET before the patch)
-    _PAD = TILE_SIZE  # 512 px — more than the 224 px worst-case offset needed
-    _PAD_OFFSET = _PAD - _CTX_OFFSET  # 512 - 224 = 288
+    # Edge-pad so every patch always has a full 512×512 context window.
+    # With PATCH_STRIDE=32, _PAD_OFFSET = 512 - 224 = 288 (unchanged from stride=64):
+    #   padded_row = pr * PATCH_STRIDE + _PAD_OFFSET
+    #   context window: padded[row_start : row_start+512, ...]
+    #   patch in context: rows [224:288] — same as before regardless of stride
+    _PAD = TILE_SIZE  # 512 px
+    _PAD_OFFSET = _PAD - _CTX_OFFSET  # 288
     padded = np.pad(full_img, ((0, 0), (_PAD, _PAD), (_PAD, _PAD)), mode="edge")
     del full_img
 
-    n_patch_rows = (img_h + PATCH_SIZE - 1) // PATCH_SIZE
-    n_patch_cols = (img_w + PATCH_SIZE - 1) // PATCH_SIZE
+    n_patch_rows = (img_h + PATCH_STRIDE - 1) // PATCH_STRIDE
+    n_patch_cols = (img_w + PATCH_STRIDE - 1) // PATCH_STRIDE
     prob_map = np.full((n_patch_rows, n_patch_cols), np.nan, dtype=np.float32)
     patches_total = patches_processed = 0
 
     for pr in range(n_patch_rows):
         batch_feats: list[np.ndarray] = []
         batch_cols: list[int] = []
-        row_start = pr * PATCH_SIZE + _PAD_OFFSET
+        row_start = pr * PATCH_STRIDE + _PAD_OFFSET
 
         for pc in range(n_patch_cols):
             patches_total += 1
 
             if effective_mask is not None:
-                p_h = min(PATCH_SIZE, img_h - pr * PATCH_SIZE)
-                p_w = min(PATCH_SIZE, img_w - pc * PATCH_SIZE)
+                p_h = min(PATCH_SIZE, img_h - pr * PATCH_STRIDE)
+                p_w = min(PATCH_SIZE, img_w - pc * PATCH_STRIDE)
                 patch_box = box(*rasterio.windows.bounds(
-                    Window(pc * PATCH_SIZE, pr * PATCH_SIZE, p_w, p_h),
+                    Window(pc * PATCH_STRIDE, pr * PATCH_STRIDE, p_w, p_h),
                     img_transform,
                 ))
                 if not effective_mask.intersects(patch_box):
                     continue
 
-            col_start = pc * PATCH_SIZE + _PAD_OFFSET
+            col_start = pc * PATCH_STRIDE + _PAD_OFFSET
             ctx = padded[:, row_start:row_start + TILE_SIZE, col_start:col_start + TILE_SIZE]
-            # ctx: (3, 512, 512) view — patch sits at [224:288, 224:288] (the central 64 px)
+            # ctx: (3, 512, 512) — patch always at [224:288, 224:288] regardless of stride
 
             batch_feats.append(extract_features(ctx))
             batch_cols.append(pc)
