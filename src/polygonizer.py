@@ -70,6 +70,7 @@ def detect_rois_rf_segmentation(
 
     Returns flood_rois: [(polygon_epsg3067, confidence, area_m2), ...]
     """
+    import time
     from spectral import extract_features
 
     effective_mask = _resolve_mask(jp2_path, stream_mask)
@@ -79,23 +80,26 @@ def detect_rois_rf_segmentation(
         img_transform = src.transform
         # prob_map pixels correspond to PATCH_STRIDE × PATCH_STRIDE ground areas
         patch_transform = src.transform * Affine.scale(PATCH_STRIDE)
-        print("  Loading image into memory ...")
-        full_img = src.read()  # (3, img_h, img_w) uint8 — ~300 MB for a 10 000×10 000 tile
+        n_bands = src.count
+        bands = []
+        for b in range(1, n_bands + 1):
+            print(f"  Loading band {b}/{n_bands} into memory ...")
+            bands.append(src.read(b))
+        full_img = np.stack(bands)
 
     # Edge-pad so every patch always has a full 512×512 context window.
-    # With PATCH_STRIDE=32, _PAD_OFFSET = 512 - 224 = 288 (unchanged from stride=64):
-    #   padded_row = pr * PATCH_STRIDE + _PAD_OFFSET
-    #   context window: padded[row_start : row_start+512, ...]
-    #   patch in context: rows [224:288] — same as before regardless of stride
     _PAD = TILE_SIZE  # 512 px
     _PAD_OFFSET = _PAD - _CTX_OFFSET  # 288
+    print("  Padding image ...")
     padded = np.pad(full_img, ((0, 0), (_PAD, _PAD), (_PAD, _PAD)), mode="edge")
-    del full_img
+    del full_img, bands
 
     n_patch_rows = (img_h + PATCH_STRIDE - 1) // PATCH_STRIDE
     n_patch_cols = (img_w + PATCH_STRIDE - 1) // PATCH_STRIDE
     prob_map = np.full((n_patch_rows, n_patch_cols), np.nan, dtype=np.float32)
     patches_total = patches_processed = 0
+    t0 = time.time()
+    _REPORT_EVERY = max(1, n_patch_rows // 20)  # progress every ~5%
 
     for pr in range(n_patch_rows):
         batch_feats: list[np.ndarray] = []
@@ -117,7 +121,6 @@ def detect_rois_rf_segmentation(
 
             col_start = pc * PATCH_STRIDE + _PAD_OFFSET
             ctx = padded[:, row_start:row_start + TILE_SIZE, col_start:col_start + TILE_SIZE]
-            # ctx: (3, 512, 512) — patch always at [224:288, 224:288] regardless of stride
 
             batch_feats.append(extract_features(ctx))
             batch_cols.append(pc)
@@ -128,6 +131,15 @@ def detect_rois_rf_segmentation(
             for pc_idx, pc in enumerate(batch_cols):
                 prob_map[pr, pc] = proba[pc_idx]
                 patches_processed += 1
+
+        if (pr + 1) % _REPORT_EVERY == 0 or pr == n_patch_rows - 1:
+            pct = (pr + 1) / n_patch_rows * 100
+            elapsed = time.time() - t0
+            rate = (pr + 1) / elapsed if elapsed > 0 else 0
+            eta = (n_patch_rows - pr - 1) / rate if rate > 0 else 0
+            print(f"  Row {pr+1}/{n_patch_rows} ({pct:.0f}%) — "
+                  f"{patches_processed} patches processed — "
+                  f"ETA {eta/60:.1f} min")
 
     print(f"  Patches checked: {patches_total}, processed (in mask): {patches_processed}")
     return _prob_map_to_rois(prob_map, patch_transform, confidence_threshold, min_area_m2)
