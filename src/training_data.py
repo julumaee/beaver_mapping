@@ -112,9 +112,21 @@ def extract_chips(
             data = src.read(window=Window(win_col, win_row, win_w, win_h))
 
             if pad_col > 0 or pad_row > 0 or win_w < TILE_SIZE or win_h < TILE_SIZE:
-                padded = np.zeros((data.shape[0], TILE_SIZE, TILE_SIZE), dtype=data.dtype)
-                padded[:, pad_row:pad_row + win_h, pad_col:pad_col + win_w] = data
-                data = padded
+                # Use edge-replication to match the padding mode used during detection.
+                full = np.zeros((data.shape[0], TILE_SIZE, TILE_SIZE), dtype=data.dtype)
+                full[:, pad_row:pad_row + win_h, pad_col:pad_col + win_w] = data
+                # Replicate filled border rows/cols outward.
+                if pad_row > 0:
+                    full[:, :pad_row, :] = full[:, pad_row:pad_row + 1, :]
+                if pad_col > 0:
+                    full[:, :, :pad_col] = full[:, :, pad_col:pad_col + 1]
+                bottom = pad_row + win_h
+                right = pad_col + win_w
+                if bottom < TILE_SIZE:
+                    full[:, bottom:, :] = full[:, bottom - 1:bottom, :]
+                if right < TILE_SIZE:
+                    full[:, :, right:] = full[:, :, right - 1:right]
+                data = full
 
             stem = Path(jp2_path).stem
             fname = f"{stem}_{_TAG.get(label, 'pos')}_{i:04d}.npy"

@@ -92,7 +92,9 @@ def _glcm_features(region: np.ndarray) -> np.ndarray:
     )
     feats = []
     for prop in ("contrast", "homogeneity", "energy", "correlation"):
-        feats.append(float(graycoprops(glcm, prop).mean()))
+        val = graycoprops(glcm, prop).mean()
+        # correlation is NaN when std=0 (uniform patch); replace with 0.
+        feats.append(float(np.nan_to_num(val, nan=0.0)))
     return np.array(feats, dtype=np.float32)
 
 
@@ -153,10 +155,20 @@ def _connected_wet_features(ndwi: np.ndarray) -> np.ndarray:
 
         # Perimeter/sqrt(area) of the largest blob — low = compact circular pond,
         # high = irregular wet forest edges.
+        # Set to 0 when the blob touches the image boundary (perimeter is
+        # undercounted there, making any shape appear artificially compact).
         largest = max(props, key=lambda p: p.area)
         largest_mask = labeled == largest.label
-        perim = float(skimage_perimeter(largest_mask))
-        shape_index = perim / max(1.0, largest.area ** 0.5)
+        h, w = largest_mask.shape
+        touches_edge = (
+            largest_mask[0, :].any() or largest_mask[-1, :].any() or
+            largest_mask[:, 0].any() or largest_mask[:, -1].any()
+        )
+        if touches_edge:
+            shape_index = 0.0
+        else:
+            perim = float(skimage_perimeter(largest_mask))
+            shape_index = perim / max(1.0, largest.area ** 0.5)
 
         feats += [wet_frac, float(n_components), float(max_area_frac), shape_index]
     return np.array(feats, dtype=np.float32)
