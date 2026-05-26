@@ -26,20 +26,23 @@ def compute_ndwi(chip: np.ndarray) -> np.ndarray:
     return (grn - nir) / (grn + nir + _EPS)
 
 
-# Size of the central sub-region used for feature extraction.
-# Features are computed over this inner window rather than the full chip so that
-# the spectral signal from the labeled feature (dam, pond, ghost forest) is not
-# diluted by the surrounding 256×256m landscape context.
-FEATURE_REGION = 64  # pixels — 32×32m at 0.5m/px
+# Three crop sizes for multi-scale feature extraction.
+# Small (32px = 16m): tight crop for small features — less dilution by surroundings.
+# Medium (64px = 32m): standard crop matching the detection patch size.
+# Full chip (512px = 256m): landscape context.
+FEATURE_REGION_SM = 32   # pixels — 16×16m at 0.5m/px
+FEATURE_REGION_MD = 64   # pixels — 32×32m at 0.5m/px
+FEATURE_REGION    = FEATURE_REGION_MD  # kept for backwards compatibility
 
 
 def extract_features(chip: np.ndarray) -> np.ndarray:
     """
-    Return a 70-element float32 feature vector from a (bands, H, W) chip.
+    Return a 105-element float32 feature vector from a (bands, H, W) chip.
 
-    Features are computed separately on two spatial scales:
-      - Central 64×64px (32m) — captures the feature itself
-      - Full chip 512×512px (256m) — captures surrounding landscape context
+    Features are computed at three spatial scales:
+      - Central 32×32px  (16m)  — small features without surrounding dilution
+      - Central 64×64px  (32m)  — matches detection patch size
+      - Full chip 512×512px (256m) — landscape context
     Each scale contributes 35 values:
       - Per-band mean, std, 25th and 75th percentile  (3 × 4 = 12)
       - NDVI mean, std, fraction of pixels > 0.2      (3)
@@ -51,7 +54,8 @@ def extract_features(chip: np.ndarray) -> np.ndarray:
         (3 × 4 = 12)
     """
     return np.concatenate([
-        _features_for_region(_center_crop(chip, FEATURE_REGION)),
+        _features_for_region(_center_crop(chip, FEATURE_REGION_SM)),
+        _features_for_region(_center_crop(chip, FEATURE_REGION_MD)),
         _features_for_region(chip),
     ])
 
