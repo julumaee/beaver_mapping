@@ -6,6 +6,7 @@ shapely
 opencv-python
 scikit-learn
 scikit-image
+gradio
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch
 torchvision
