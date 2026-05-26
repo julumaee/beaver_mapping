@@ -194,6 +194,104 @@ def handle_train_cnn(
 
 
 # --------------------------------------------------------------------------- #
+# Detect backend
+# --------------------------------------------------------------------------- #
+
+def _do_detect(
+    imagery_dir: str,
+    method: str,
+    rf_model_path: str,
+    cnn_model_path: str,
+    norm_stats_path: str,
+    hydro_dir: str,
+    threshold: float,
+    output_path: str,
+) -> None:
+    from polygonizer import detect_rois_rf_segmentation, detect_rois_cnn
+    from export import export_kml
+
+    jp2_files = _find_files(imagery_dir, ".jp2")
+    if not jp2_files:
+        raise ValueError(f"No .jp2 files found in {imagery_dir!r}")
+
+    stream_mask = None
+    if hydro_dir:
+        from masking import build_stream_mask
+        print(f"Building stream mask from {hydro_dir} ...")
+        stream_mask = build_stream_mask(hydro_dir)
+
+    rf_clf = cnn_model = norm_stats = None
+
+    if method in ("rf", "both"):
+        from models.random_forest import load_model as load_rf
+        print(f"Loading RF model from {rf_model_path} ...")
+        rf_clf = load_rf(rf_model_path)
+
+    if method in ("cnn", "both"):
+        import json
+        from models.cnn_handler import load_cnn
+        cnn_model = load_cnn(cnn_model_path)
+        with open(norm_stats_path) as f:
+            norm_stats = json.load(f)
+
+    all_rois: list = []
+
+    for jp2_path in jp2_files:
+        print(f"Processing {jp2_path} ...")
+        if method == "rf":
+            rois = detect_rois_rf_segmentation(jp2_path, rf_clf, stream_mask, threshold)
+            print(f"  RF detections: {len(rois)}")
+            all_rois.extend(rois)
+        elif method == "cnn":
+            rois = detect_rois_cnn(jp2_path, cnn_model, norm_stats, stream_mask, threshold)
+            print(f"  CNN detections: {len(rois)}")
+            all_rois.extend(rois)
+        elif method == "both":
+            rf_rois  = detect_rois_rf_segmentation(jp2_path, rf_clf, stream_mask, threshold)
+            cnn_rois = detect_rois_cnn(jp2_path, cnn_model, norm_stats, stream_mask, threshold)
+            print(f"  RF: {len(rf_rois)}  CNN: {len(cnn_rois)}")
+            tagged: list = []
+            matched: set[int] = set()
+            for rf_p, rf_c, rf_a in rf_rois:
+                found = False
+                for j, (cnn_p, cnn_c, cnn_a) in enumerate(cnn_rois):
+                    if rf_p.intersects(cnn_p):
+                        merged = rf_p.union(cnn_p)
+                        tagged.append((merged, max(rf_c, cnn_c), merged.area, "both"))
+                        matched.add(j)
+                        found = True
+                        break
+                if not found:
+                    tagged.append((rf_p, rf_c, rf_a, "rf"))
+            for j, (cnn_p, cnn_c, cnn_a) in enumerate(cnn_rois):
+                if j not in matched:
+                    tagged.append((cnn_p, cnn_c, cnn_a, "cnn"))
+            all_rois.extend(tagged)
+
+    print(f"Exporting {len(all_rois)} detection(s) to {output_path} ...")
+    export_kml(all_rois, output_path)
+    print("Done.")
+
+
+def handle_detect(
+    imagery_dir: str,
+    method: str,
+    rf_model_path: str,
+    cnn_model_path: str,
+    norm_stats_path: str,
+    hydro_dir: str,
+    threshold: float,
+    output_path: str,
+) -> str:
+    return _capture(
+        _do_detect,
+        imagery_dir.strip(), method,
+        rf_model_path.strip(), cnn_model_path.strip(), norm_stats_path.strip(),
+        hydro_dir.strip(), float(threshold), output_path.strip(),
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Gradio layout
 # --------------------------------------------------------------------------- #
 
@@ -278,6 +376,12 @@ with gr.Blocks(title="CastorDetector") as demo:
                                            label="Confidence threshold")
             det_btn = gr.Button("Detect & Export KML", variant="primary")
             det_log = gr.Textbox(label="Log", lines=15, interactive=False, show_copy_button=True)
+            det_btn.click(
+                fn=handle_detect,
+                inputs=[det_imagery, det_method, det_rf_model, det_cnn_model,
+                        det_norm_stats, det_hydro, det_threshold, det_output],
+                outputs=det_log,
+            )
 
 
 demo.queue()
