@@ -391,7 +391,7 @@ with gr.Blocks(title="CastorDetector") as demo:
                 rf_augment = gr.Slider(minimum=0, maximum=12, value=6, step=1,
                                        label="Augment positives (extra offset chips per label)")
             rf_btn = gr.Button("Train RF", variant="primary")
-            rf_log = gr.Textbox(label="Log", lines=15, interactive=False, show_copy_button=True)
+            rf_log = gr.Textbox(label="Log", lines=15, interactive=False)
             rf_btn.click(
                 fn=handle_train_rf,
                 inputs=[rf_imagery, rf_labels, rf_model, rf_hydro, rf_chips, rf_augment],
@@ -419,7 +419,7 @@ with gr.Blocks(title="CastorDetector") as demo:
                 cnn_epochs = gr.Number(value=30,    label="Epochs",        precision=0)
                 cnn_lr     = gr.Number(value=0.001, label="Learning rate")
             cnn_btn = gr.Button("Train CNN", variant="primary")
-            cnn_log = gr.Textbox(label="Log", lines=15, interactive=False, show_copy_button=True)
+            cnn_log = gr.Textbox(label="Log", lines=15, interactive=False)
             cnn_btn.click(
                 fn=handle_train_cnn,
                 inputs=[cnn_imagery, cnn_labels, cnn_model, cnn_norm_stats, cnn_hydro, cnn_epochs, cnn_lr],
@@ -448,7 +448,7 @@ with gr.Blocks(title="CastorDetector") as demo:
                 det_threshold  = gr.Slider(minimum=0.0, maximum=1.0, value=0.5, step=0.05,
                                            label="Confidence threshold")
             det_btn  = gr.Button("Detect & Export KML", variant="primary")
-            det_log  = gr.Textbox(label="Log", lines=15, interactive=False, show_copy_button=True)
+            det_log  = gr.Textbox(label="Log", lines=15, interactive=False)
             det_file = gr.File(label="Download KML", interactive=False)
             det_btn.click(
                 fn=handle_detect,
