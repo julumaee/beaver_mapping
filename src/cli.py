@@ -67,6 +67,7 @@ def cmd_train(args: argparse.Namespace) -> None:
             kml_paths=kml_files,
             stream_mask=stream_mask,
             out_dir=chip_dir,
+            augment_positives=args.augment_positives,
         )
 
         import csv
@@ -289,6 +290,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--chip-dir",  default=None, dest="chip_dir",
                          help="Persist extracted chips to this directory (enables evaluate-rf later). "
                               "Default: temp directory deleted after training.")
+    p_train.add_argument("--augment-positives", type=int, default=6, dest="augment_positives",
+                         help="Extra offset chips per positive label point (default 6). "
+                              "Set to 0 to disable augmentation.")
 
     # -- cnn-train --
     p_cnn = sub.add_parser("cnn-train", help="Train the CNN classifier (Prithvi head)")

@@ -70,78 +70,100 @@ def extract_chips(
     labeled_points: list[tuple[Point, str]],
     out_dir: str,
     manifest_rows: list[dict] | None = None,
+    augment_positives: int = 6,
+    augment_max_offset: int = 24,
+    rng_seed: int = 42,
 ) -> list[str]:
     """
     For each (point, feature_type) extract a TILE_SIZE×TILE_SIZE chip centred
-    on that point and save as a .npy file.  The class label (0/1/2) is derived
+    on that point and save as a .npy file.  The class label (0/1) is derived
     from FEATURE_TO_LABEL[feature_type].
+
+    Positive chips (label > 0) are augmented with augment_positives additional
+    chips extracted at random pixel offsets (±augment_max_offset). This simulates
+    the detection grid misalignment and multiplies positive training samples without
+    requiring new labels. x/y in the manifest stays at the original label point so
+    spatial CV groups augmented chips with their source territory.
 
     Returns a list of written file paths.
     """
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
-    _TAG = {0: "neg", 1: "dam", 2: "flood"}
+    _TAG = {0: "neg", 1: "pos"}
     written: list[str] = []
     half = TILE_SIZE // 2
+    rng = random.Random(rng_seed)
 
     with rasterio.open(jp2_path) as src:
         for i, (pt, feature_type) in enumerate(labeled_points):
-            label = FEATURE_TO_LABEL.get(feature_type, 2)
+            label = FEATURE_TO_LABEL.get(feature_type, 1)
 
             col, row = ~src.transform * (pt.x, pt.y)
             col, row = int(col), int(row)
-            col_off = col - half
-            row_off = row - half
 
-            if (
-                col_off + TILE_SIZE <= 0
-                or row_off + TILE_SIZE <= 0
-                or col_off >= src.width
-                or row_off >= src.height
-            ):
-                continue
+            # Build list of (col_offset, row_offset, aug_index) to extract.
+            # Index -1 = original (no offset); 0..N-1 = augmented.
+            offsets: list[tuple[int, int, int]] = [(0, 0, -1)]
+            if label > 0 and augment_positives > 0:
+                for aug_i in range(augment_positives):
+                    dc = rng.randint(-augment_max_offset, augment_max_offset)
+                    dr = rng.randint(-augment_max_offset, augment_max_offset)
+                    offsets.append((dc, dr, aug_i))
 
-            pad_col = max(-col_off, 0)
-            pad_row = max(-row_off, 0)
-            win_col = max(col_off, 0)
-            win_row = max(row_off, 0)
-            win_w = min(TILE_SIZE - pad_col, src.width - win_col)
-            win_h = min(TILE_SIZE - pad_row, src.height - win_row)
+            for dc, dr, aug_idx in offsets:
+                col_off = col + dc - half
+                row_off = row + dr - half
 
-            data = src.read(window=Window(win_col, win_row, win_w, win_h))
+                if (
+                    col_off + TILE_SIZE <= 0
+                    or row_off + TILE_SIZE <= 0
+                    or col_off >= src.width
+                    or row_off >= src.height
+                ):
+                    continue
 
-            if pad_col > 0 or pad_row > 0 or win_w < TILE_SIZE or win_h < TILE_SIZE:
-                # Use edge-replication to match the padding mode used during detection.
-                full = np.zeros((data.shape[0], TILE_SIZE, TILE_SIZE), dtype=data.dtype)
-                full[:, pad_row:pad_row + win_h, pad_col:pad_col + win_w] = data
-                # Replicate filled border rows/cols outward.
-                if pad_row > 0:
-                    full[:, :pad_row, :] = full[:, pad_row:pad_row + 1, :]
-                if pad_col > 0:
-                    full[:, :, :pad_col] = full[:, :, pad_col:pad_col + 1]
-                bottom = pad_row + win_h
-                right = pad_col + win_w
-                if bottom < TILE_SIZE:
-                    full[:, bottom:, :] = full[:, bottom - 1:bottom, :]
-                if right < TILE_SIZE:
-                    full[:, :, right:] = full[:, :, right - 1:right]
-                data = full
+                pad_col = max(-col_off, 0)
+                pad_row = max(-row_off, 0)
+                win_col = max(col_off, 0)
+                win_row = max(row_off, 0)
+                win_w = min(TILE_SIZE - pad_col, src.width - win_col)
+                win_h = min(TILE_SIZE - pad_row, src.height - win_row)
 
-            stem = Path(jp2_path).stem
-            fname = f"{stem}_{_TAG.get(label, 'pos')}_{i:04d}.npy"
-            fpath = out_path / fname
-            np.save(str(fpath), data)
-            written.append(str(fpath))
+                data = src.read(window=Window(win_col, win_row, win_w, win_h))
 
-            if manifest_rows is not None:
-                manifest_rows.append({
-                    "path": str(fpath),
-                    "label": label,
-                    "feature_type": feature_type,
-                    "x": pt.x,
-                    "y": pt.y,
-                })
+                if pad_col > 0 or pad_row > 0 or win_w < TILE_SIZE or win_h < TILE_SIZE:
+                    full = np.zeros((data.shape[0], TILE_SIZE, TILE_SIZE), dtype=data.dtype)
+                    full[:, pad_row:pad_row + win_h, pad_col:pad_col + win_w] = data
+                    if pad_row > 0:
+                        full[:, :pad_row, :] = full[:, pad_row:pad_row + 1, :]
+                    if pad_col > 0:
+                        full[:, :, :pad_col] = full[:, :, pad_col:pad_col + 1]
+                    bottom = pad_row + win_h
+                    right = pad_col + win_w
+                    if bottom < TILE_SIZE:
+                        full[:, bottom:, :] = full[:, bottom - 1:bottom, :]
+                    if right < TILE_SIZE:
+                        full[:, :, right:] = full[:, :, right - 1:right]
+                    data = full
+
+                stem = Path(jp2_path).stem
+                aug_suffix = "" if aug_idx < 0 else f"_aug{aug_idx}"
+                fname = f"{stem}_{_TAG.get(label, 'pos')}_{i:04d}{aug_suffix}.npy"
+                fpath = out_path / fname
+                np.save(str(fpath), data)
+                written.append(str(fpath))
+
+                if manifest_rows is not None:
+                    manifest_rows.append({
+                        "path": str(fpath),
+                        "label": label,
+                        "feature_type": feature_type,
+                        # Always store original label coordinates so spatial CV
+                        # groups augmented chips with their source territory.
+                        "x": pt.x,
+                        "y": pt.y,
+                    })
 
     return written
 
@@ -201,11 +223,14 @@ def build_training_dataset(
     n_negatives: int | None = None,
     rng_seed: int = 42,
     exclude_features: frozenset[str] = DEFAULT_EXCLUDE,
+    augment_positives: int = 6,
+    augment_max_offset: int = 24,
 ) -> str:
     """
     Orchestrate the full training data pipeline and write a manifest CSV.
 
-    Labels: 0 = negative, 1 = dam, 2 = flooded area (wet_forest / beaver_flood).
+    augment_positives: number of extra offset chips per positive label point.
+    augment_max_offset: maximum pixel shift in each direction for augmentation.
     """
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
@@ -228,8 +253,18 @@ def build_training_dataset(
 
     manifest_rows: list[dict] = []
     for jp2_path in jp2_paths:
-        extract_chips(jp2_path, positive_labeled, out_dir, manifest_rows=manifest_rows)
-        extract_chips(jp2_path, negative_labeled, out_dir, manifest_rows=manifest_rows)
+        extract_chips(
+            jp2_path, positive_labeled, out_dir,
+            manifest_rows=manifest_rows,
+            augment_positives=augment_positives,
+            augment_max_offset=augment_max_offset,
+            rng_seed=rng_seed,
+        )
+        extract_chips(
+            jp2_path, negative_labeled, out_dir,
+            manifest_rows=manifest_rows,
+            augment_positives=0,  # negatives are already spatially varied
+        )
 
     manifest_path = out_path / "manifest.csv"
     with open(manifest_path, "w", newline="") as f:
