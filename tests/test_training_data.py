@@ -129,7 +129,8 @@ class TestExtractChips:
         jp2 = _write_raster(tmp_path, cx, cy, size=2048)
         rows: list[dict] = []
         extract_chips(jp2, [(Point(cx, cy), "wet_forest")],
-                      str(tmp_path / "chips"), manifest_rows=rows)
+                      str(tmp_path / "chips"), manifest_rows=rows,
+                      augment_positives=0)
         assert len(rows) == 1
         assert rows[0]["label"] == FEATURE_TO_LABEL["wet_forest"]   # == 1
         assert rows[0]["feature_type"] == "wet_forest"

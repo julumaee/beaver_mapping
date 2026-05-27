@@ -218,17 +218,23 @@ def sample_negatives(
 def build_training_dataset(
     jp2_paths: list[str],
     kml_paths: list[str],
-    stream_mask,
-    out_dir: str,
+    stream_mask=None,
+    out_dir: str = "chips",
     n_negatives: int | None = None,
     rng_seed: int = 42,
     exclude_features: frozenset[str] = DEFAULT_EXCLUDE,
     augment_positives: int = 6,
     augment_max_offset: int = 24,
+    hydro_path: str | None = None,
 ) -> str:
     """
     Orchestrate the full training data pipeline and write a manifest CSV.
 
+    hydro_path: when given, negative samples are drawn using a per-tile stream
+                mask (same bbox-scoped loading as detect).  Avoids loading
+                millions of features globally when imagery spans many tiles.
+    stream_mask: legacy — passed directly to sample_negatives.  Ignored when
+                 hydro_path is set.
     augment_positives: number of extra offset chips per positive label point.
     augment_max_offset: maximum pixel shift in each direction for augmentation.
     """
@@ -244,11 +250,16 @@ def build_training_dataset(
     positive_points = [pt for pt, _ in positive_labeled]
     n_neg = n_negatives if n_negatives is not None else len(positive_labeled)
 
-    imagery_extent = _imagery_union(jp2_paths)
-    negative_points = sample_negatives(
-        stream_mask, positive_points, n_neg, rng_seed,
-        imagery_extent=imagery_extent,
-    )
+    if hydro_path is not None:
+        negative_points = _sample_negatives_per_tile(
+            hydro_path, jp2_paths, positive_points, n_neg, rng_seed,
+        )
+    else:
+        imagery_extent = _imagery_union(jp2_paths)
+        negative_points = sample_negatives(
+            stream_mask, positive_points, n_neg, rng_seed,
+            imagery_extent=imagery_extent,
+        )
     negative_labeled = [(pt, "negative") for pt in negative_points]
 
     manifest_rows: list[dict] = []
@@ -278,6 +289,40 @@ def build_training_dataset(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _sample_negatives_per_tile(
+    hydro_path: str,
+    jp2_paths: list[str],
+    positive_points: list[Point],
+    n_total: int,
+    rng_seed: int,
+) -> list[Point]:
+    """Sample negatives per JP2 tile using a bbox-scoped stream mask each time."""
+    from shapely.geometry import box as _box
+    from masking import build_stream_mask, BUFFER_METERS
+
+    n_tiles = len(jp2_paths)
+    n_per_tile = max(1, (n_total + n_tiles - 1) // n_tiles)
+
+    all_negatives: list[Point] = []
+    for i, jp2_path in enumerate(jp2_paths):
+        with rasterio.open(jp2_path) as src:
+            b = src.bounds
+        bbox = (b.left - BUFFER_METERS, b.bottom - BUFFER_METERS,
+                b.right + BUFFER_METERS, b.top + BUFFER_METERS)
+        tile_mask = build_stream_mask(hydro_path, bbox=bbox)
+        if tile_mask.is_empty:
+            continue
+        tile_extent = _box(b.left, b.bottom, b.right, b.top)
+        negs = sample_negatives(
+            tile_mask, positive_points, n_per_tile,
+            rng_seed=rng_seed + i,
+            imagery_extent=tile_extent,
+        )
+        all_negatives.extend(negs)
+
+    return all_negatives[:n_total]
+
 
 def _imagery_union(jp2_paths: list[str]):
     from shapely.geometry import box as _box

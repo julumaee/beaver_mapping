@@ -79,10 +79,6 @@ def cmd_train(args: argparse.Namespace) -> None:
     if not kml_files:
         sys.exit(f"No KML/KMZ files found in {args.labels}")
 
-    # Scope mask to the union bounding box of all imagery tiles.
-    train_bbox = _union_bbox(jp2_files) if args.hydro else None
-    stream_mask = _load_mask(args.hydro, bbox=train_bbox)
-
     chip_dir_ctx = (
         tempfile.TemporaryDirectory()
         if args.chip_dir is None
@@ -93,8 +89,8 @@ def cmd_train(args: argparse.Namespace) -> None:
         manifest = build_training_dataset(
             jp2_paths=jp2_files,
             kml_paths=kml_files,
-            stream_mask=stream_mask,
             out_dir=chip_dir,
+            hydro_path=args.hydro,
             augment_positives=args.augment_positives,
         )
 
@@ -148,15 +144,13 @@ def cmd_cnn_train(args: argparse.Namespace) -> None:
     if not kml_files:
         sys.exit(f"No KML/KMZ files found in {args.labels}")
 
-    stream_mask = _load_mask(args.hydro)
-
     with tempfile.TemporaryDirectory() as chip_dir:
         print("Extracting training chips ...")
         manifest = build_training_dataset(
             jp2_paths=jp2_files,
             kml_paths=kml_files,
-            stream_mask=stream_mask,
             out_dir=chip_dir,
+            hydro_path=args.hydro,
         )
         print(f"Training CNN (epochs={args.epochs}, lr={args.lr}) ...")
         train_cnn(
