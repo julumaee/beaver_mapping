@@ -27,12 +27,40 @@ def _find_files(path: str, suffix: str) -> list[str]:
     return sorted(str(f) for f in p.rglob(f"*{suffix}"))
 
 
-def _load_mask(hydro_path: str | None):
+def _load_mask(hydro_path: str | None, bbox=None):
     if hydro_path is None:
         return None
-    from masking import build_stream_mask
-    print(f"Building stream mask from {hydro_path} ...")
-    return build_stream_mask(hydro_path)
+    from masking import build_stream_mask, BUFFER_METERS
+    if bbox is not None:
+        # Expand bbox by buffer so streams just outside the tile edge are included.
+        minx, miny, maxx, maxy = bbox
+        bbox = (minx - BUFFER_METERS, miny - BUFFER_METERS,
+                maxx + BUFFER_METERS, maxy + BUFFER_METERS)
+        print(f"Building stream mask from {hydro_path} (tile bbox only) ...")
+    else:
+        print(f"Building stream mask from {hydro_path} ...")
+    return build_stream_mask(hydro_path, bbox=bbox)
+
+
+def _tile_bbox(jp2_path: str):
+    """Return (minx, miny, maxx, maxy) bounds of a JP2 file in its native CRS."""
+    import rasterio
+    with rasterio.open(jp2_path) as src:
+        b = src.bounds
+    return (b.left, b.bottom, b.right, b.top)
+
+
+def _union_bbox(jp2_paths: list[str]):
+    """Return the union bounding box of all JP2 files."""
+    import rasterio
+    minx = miny = float("inf")
+    maxx = maxy = float("-inf")
+    for p in jp2_paths:
+        with rasterio.open(p) as src:
+            b = src.bounds
+        minx, miny = min(minx, b.left), min(miny, b.bottom)
+        maxx, maxy = max(maxx, b.right), max(maxy, b.top)
+    return (minx, miny, maxx, maxy)
 
 
 # ---------------------------------------------------------------------------
@@ -51,7 +79,9 @@ def cmd_train(args: argparse.Namespace) -> None:
     if not kml_files:
         sys.exit(f"No KML/KMZ files found in {args.labels}")
 
-    stream_mask = _load_mask(args.hydro)
+    # Scope mask to the union bounding box of all imagery tiles.
+    train_bbox = _union_bbox(jp2_files) if args.hydro else None
+    stream_mask = _load_mask(args.hydro, bbox=train_bbox)
 
     chip_dir_ctx = (
         tempfile.TemporaryDirectory()
@@ -153,7 +183,6 @@ def cmd_detect(args: argparse.Namespace) -> None:
     if not jp2_files:
         sys.exit(f"No .jp2 files found in {args.imagery}")
 
-    stream_mask = _load_mask(args.hydro)
     method = args.method
 
     # Load models as needed
@@ -175,6 +204,8 @@ def cmd_detect(args: argparse.Namespace) -> None:
 
     for jp2_path in jp2_files:
         print(f"Processing {jp2_path} ...")
+        # Build mask scoped to this tile — avoids loading millions of features globally.
+        stream_mask = _load_mask(args.hydro, bbox=_tile_bbox(jp2_path) if args.hydro else None)
 
         if method == "rf":
             rois = detect_rois_rf_segmentation(jp2_path, rf_clf, stream_mask, args.threshold)

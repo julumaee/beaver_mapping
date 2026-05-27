@@ -1,11 +1,11 @@
 """Stream buffer mask from MML hydrography vector data."""
 
 from pathlib import Path
+from typing import Optional, Tuple
 
 import fiona
 import geopandas as gpd
 import pandas as pd
-from shapely.ops import unary_union
 
 BUFFER_METERS = 50
 _VECTOR_SUFFIXES = {".gpkg", ".shp", ".geojson", ".json", ".fgb"}
@@ -13,14 +13,16 @@ _VECTOR_SUFFIXES = {".gpkg", ".shp", ".geojson", ".json", ".fgb"}
 _MML_AREA_LAYERS = ("virtavesialue",)  # polygon water bodies
 _MML_LINE_LAYERS = ("virtavesikapea",) # narrow waterway lines (all included)
 
+# tasosijainti == -1 means underground culvert — not visible from aerial imagery.
+_SURFACE_ONLY = 0
+
 
 class StreamMask:
     """
     Buffered stream GeoDataFrame with a spatial index for fast per-patch queries.
 
-    Replaces the old unary_union approach: no upfront merge is required, so
-    startup is instant.  intersects() uses the R-tree sindex to find candidates
-    then does exact geometry tests only on those.
+    intersects() uses the R-tree sindex to find candidates then does exact
+    geometry tests only on those.
     """
 
     def __init__(self, gdf: gpd.GeoDataFrame) -> None:
@@ -48,26 +50,42 @@ class StreamMask:
         return int(self._gdf.iloc[candidates].intersects(geom).sum())
 
 
-def build_stream_mask(hydro_path: str) -> StreamMask:
+def build_stream_mask(
+    hydro_path: str,
+    bbox: Optional[Tuple[float, float, float, float]] = None,
+) -> StreamMask:
     """
     Load MML hydrography vectors and return a StreamMask backed by a spatial index.
 
     Both virtavesialue (polygon water bodies) and virtavesikapea (narrow waterway
-    lines) are included without filtering — beavers can colonise any watercourse.
+    lines) are included — beavers can colonise any watercourse. Underground culverts
+    (tasosijainti == -1) are excluded as they are not visible in aerial imagery.
+
+    bbox: optional (minx, miny, maxx, maxy) in EPSG:3067 to spatially pre-filter
+          features at load time.  Pass the JP2 tile bounds (+ BUFFER_METERS margin)
+          to load only the features relevant to a single tile — reduces load from
+          millions of features down to thousands for a 6×6 km tile.
     """
     files = _resolve_files(hydro_path)
     if not files:
         raise ValueError(f"No vector files found at {hydro_path}")
 
     gdfs: list[gpd.GeoDataFrame] = []
+    total_raw = 0
 
     for f in files:
         print(f"  Reading {f.name} ...")
-        for _layer_name, gdf in _load_stream_layers(f):
+        for _layer_name, gdf in _load_stream_layers(f, bbox=bbox):
+            if len(gdf) == 0:
+                continue
             if gdf.crs is None:
                 raise ValueError(f"No CRS found in {f}")
             if gdf.crs.to_epsg() != 3067:
                 gdf = gdf.to_crs(epsg=3067)
+            # Drop underground culverts — not visible from aerial imagery.
+            if "tasosijainti" in gdf.columns:
+                gdf = gdf[gdf["tasosijainti"] == _SURFACE_ONLY]
+            total_raw += len(gdf)
             gdfs.append(gdf[["geometry"]])
 
     if not gdfs:
@@ -86,19 +104,23 @@ def build_stream_mask(hydro_path: str) -> StreamMask:
     return StreamMask(combined)
 
 
-def _load_stream_layers(path: Path) -> list[tuple[str, gpd.GeoDataFrame]]:
+def _load_stream_layers(
+    path: Path,
+    bbox: Optional[Tuple[float, float, float, float]] = None,
+) -> list[tuple[str, gpd.GeoDataFrame]]:
     """Return [(layer_name, GeoDataFrame), ...] for relevant stream layers."""
     all_layers = _MML_AREA_LAYERS + _MML_LINE_LAYERS
+    kwargs = {"bbox": bbox} if bbox is not None else {}
     try:
         available = fiona.listlayers(str(path))
     except Exception:
-        return [("unknown", gpd.read_file(path))]
+        return [("unknown", gpd.read_file(path, **kwargs))]
 
     layers = [l for l in all_layers if l in available]
     if not layers:
-        return [("unknown", gpd.read_file(path))]
+        return [("unknown", gpd.read_file(path, **kwargs))]
 
-    return [(l, gpd.read_file(path, layer=l)) for l in layers]
+    return [(l, gpd.read_file(path, layer=l, **kwargs)) for l in layers]
 
 
 def load_stream_lines(hydro_path: str):
