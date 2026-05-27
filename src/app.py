@@ -78,6 +78,11 @@ _s = _load_settings()
 
 def _find_files(path: str, suffix: str) -> list[str]:
     p = Path(path)
+    if p.suffix.lower() == suffix.lower():
+        # User passed a single file path — give a clear error if it doesn't exist
+        if not p.exists():
+            raise FileNotFoundError(f"File not found: {path!r}")
+        return [str(p)]
     if not p.exists():
         return []
     if p.is_file():
