@@ -16,6 +16,7 @@ import queue
 import tempfile
 import threading
 import xml.etree.ElementTree as ET
+import zipfile
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -377,6 +378,15 @@ _DETECTION_COLORS = {
     "model_both": "#a030a0",
 }
 
+_LABEL_COLORS = {
+    "wet_forest":   "#ff7700",
+    "beaver_flood": "#00aaff",
+    "negative":     "#888888",
+    "dam":          "#8b4513",
+    "lodge":        "#654321",
+}
+_LABEL_DEFAULT_COLOR = "#ffcc00"
+
 
 def _add_detections_layer(m, kml_path: str) -> list[tuple[float, float]]:
     import folium
@@ -413,6 +423,52 @@ def _add_detections_layer(m, kml_path: str) -> list[tuple[float, float]]:
     return bounds
 
 
+def _add_labels_layer(m, labels_dir: str) -> list[tuple[float, float]]:
+    import folium
+    group = folium.FeatureGroup(name="Training labels", show=True)
+    bounds: list[tuple[float, float]] = []
+    kml_files = _find_files(labels_dir, ".kml") + _find_files(labels_dir, ".kmz")
+    for kml_path in kml_files:
+        try:
+            if kml_path.endswith(".kmz"):
+                with zipfile.ZipFile(kml_path) as z:
+                    inner = next(n for n in z.namelist() if n.endswith(".kml"))
+                    with z.open(inner) as f:
+                        root = ET.parse(f).getroot()
+            else:
+                root = ET.parse(kml_path).getroot()
+            for pm in root.iter(f"{{{_MAP_NS}}}Placemark"):
+                label = (pm.findtext(f"{{{_MAP_NS}}}name") or "").strip().lower()
+                point_el = pm.find(f".//{{{_MAP_NS}}}Point")
+                if point_el is None:
+                    continue
+                coords_raw = (point_el.findtext(f"{{{_MAP_NS}}}coordinates") or "").strip()
+                if not coords_raw:
+                    continue
+                parts = coords_raw.split(",")
+                if len(parts) < 2:
+                    continue
+                lon = float(parts[0].split()[0])
+                lat = float(parts[1])
+                pt = (lat, lon)
+                bounds.append(pt)
+                color = _LABEL_COLORS.get(label, _LABEL_DEFAULT_COLOR)
+                folium.CircleMarker(
+                    location=pt,
+                    radius=6,
+                    color=color,
+                    fill=True,
+                    fill_color=color,
+                    fill_opacity=0.85,
+                    weight=1.5,
+                    tooltip=label or "unknown",
+                ).add_to(group)
+        except Exception as exc:
+            print(f"Warning: could not parse {kml_path}: {exc}")
+    group.add_to(m)
+    return bounds
+
+
 def _build_map(
     kml_path: str,
     labels_dir: str = "",
@@ -438,6 +494,9 @@ def _build_map(
 
     if show_detections and kml_path and Path(kml_path).exists():
         bounds.extend(_add_detections_layer(m, kml_path))
+
+    if show_labels and labels_dir:
+        bounds.extend(_add_labels_layer(m, labels_dir))
 
     folium.LayerControl(collapsed=False).add_to(m)
 
