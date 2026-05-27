@@ -519,11 +519,15 @@ def _add_labels_layer(m, labels_dir: str) -> list[tuple[float, float]]:
     return bounds
 
 
+_HYDRO_SIMPLIFY_M = 5.0   # metres; invisible at map zoom but cuts vertex count significantly
+_HYDRO_MAX_FEATURES = 5000  # cap to avoid overwhelming the browser with huge national datasets
+
+
 def _add_hydro_layer(m, hydro_dir: str) -> list[tuple[float, float]]:
     import folium
     import geopandas as gpd
     import pandas as pd
-    from masking import _load_stream_layers, _resolve_files, BUFFER_METERS
+    from masking import _load_stream_layers, _resolve_files
 
     files = _resolve_files(hydro_dir)
     if not files:
@@ -544,6 +548,16 @@ def _add_hydro_layer(m, hydro_dir: str) -> list[tuple[float, float]]:
         pd.concat(gdfs, ignore_index=True) if len(gdfs) > 1 else gdfs[0].reset_index(drop=True),
         crs="EPSG:3067",
     )
+
+    if len(combined) > _HYDRO_MAX_FEATURES:
+        print(f"  Hydrography: {len(combined)} features — sampling {_HYDRO_MAX_FEATURES} for map display.")
+        combined = combined.sample(_HYDRO_MAX_FEATURES, random_state=0).reset_index(drop=True)
+
+    # Simplify in the projected CRS (metres) before reprojection — much smaller GeoJSON
+    combined = combined.copy()
+    combined["geometry"] = combined.geometry.simplify(_HYDRO_SIMPLIFY_M, preserve_topology=True)
+    combined = combined[~combined.geometry.is_empty & combined.geometry.notna()]
+
     combined_wgs84 = combined.to_crs(epsg=4326)
 
     vectors_group = folium.FeatureGroup(name="Hydrography", show=True)
@@ -558,27 +572,8 @@ def _add_hydro_layer(m, hydro_dir: str) -> list[tuple[float, float]]:
     ).add_to(vectors_group)
     vectors_group.add_to(m)
 
-    buffered = combined.copy()
-    buffered["geometry"] = buffered.geometry.buffer(BUFFER_METERS)
-    buffered = buffered[~buffered.geometry.is_empty].to_crs(epsg=4326)
-    buffer_group = folium.FeatureGroup(name=f"Stream buffer ({BUFFER_METERS} m)", show=False)
-    folium.GeoJson(
-        buffered.__geo_interface__,
-        style_function=lambda _: {
-            "color": "#1a6aa8",
-            "fillColor": "#4da6ff",
-            "fillOpacity": 0.12,
-            "weight": 0,
-        },
-    ).add_to(buffer_group)
-    buffer_group.add_to(m)
-
-    bounds: list[tuple[float, float]] = []
-    for geom in combined_wgs84.geometry:
-        if geom is not None and not geom.is_empty:
-            minx, miny, maxx, maxy = geom.bounds
-            bounds.extend([(miny, minx), (maxy, maxx)])
-    return bounds
+    minx, miny, maxx, maxy = combined_wgs84.total_bounds
+    return [(miny, minx), (maxy, maxx)]
 
 
 def _build_map(
