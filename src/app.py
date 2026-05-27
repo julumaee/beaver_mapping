@@ -520,14 +520,43 @@ def _add_labels_layer(m, labels_dir: str) -> list[tuple[float, float]]:
 
 
 _HYDRO_SIMPLIFY_M = 5.0   # metres; invisible at map zoom but cuts vertex count significantly
-_HYDRO_MAX_FEATURES = 5000  # cap to avoid overwhelming the browser with huge national datasets
+_HYDRO_LAYERS = ("virtavesialue", "virtavesikapea")
 
 
-def _add_hydro_layer(m, hydro_dir: str) -> list[tuple[float, float]]:
+def _kml_bbox_3067(kml_path: str):
+    """Return (minx, miny, maxx, maxy) in EPSG:3067 from a detections KML, or None."""
+    if not kml_path or not Path(kml_path).exists():
+        return None
+    lons: list[float] = []
+    lats: list[float] = []
+    try:
+        root = ET.parse(kml_path).getroot()
+        for coords_el in root.iter(f"{{{_MAP_NS}}}coordinates"):
+            for part in (coords_el.text or "").strip().split():
+                vals = part.split(",")
+                if len(vals) >= 2:
+                    lons.append(float(vals[0]))
+                    lats.append(float(vals[1]))
+    except Exception:
+        return None
+    if not lons:
+        return None
+    from pyproj import Transformer
+    t = Transformer.from_crs(4326, 3067, always_xy=True)
+    xs, ys = t.transform(lons, lats)
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _add_hydro_layer(
+    m,
+    hydro_dir: str,
+    bbox_3067: tuple,
+) -> list[tuple[float, float]]:
+    import fiona
     import folium
     import geopandas as gpd
     import pandas as pd
-    from masking import _load_stream_layers, _resolve_files
+    from masking import _resolve_files
 
     files = _resolve_files(hydro_dir)
     if not files:
@@ -535,12 +564,25 @@ def _add_hydro_layer(m, hydro_dir: str) -> list[tuple[float, float]]:
 
     gdfs: list[gpd.GeoDataFrame] = []
     for f in files:
-        for _, gdf in _load_stream_layers(f):
-            if gdf.crs is None:
-                continue
-            if gdf.crs.to_epsg() != 3067:
-                gdf = gdf.to_crs(epsg=3067)
-            gdfs.append(gdf[["geometry"]])
+        try:
+            available = fiona.listlayers(str(f))
+            layers = [l for l in _HYDRO_LAYERS if l in available] or available[:1]
+        except Exception:
+            layers = [None]
+        for layer in layers:
+            try:
+                kw: dict = {"bbox": bbox_3067}
+                gdf = (
+                    gpd.read_file(str(f), layer=layer, **kw)
+                    if layer else
+                    gpd.read_file(str(f), **kw)
+                )
+                if gdf.crs is not None and gdf.crs.to_epsg() != 3067:
+                    gdf = gdf.to_crs(epsg=3067)
+                gdfs.append(gdf[["geometry"]])
+            except Exception as exc:
+                print(f"  Warning: could not read hydro layer from {f}: {exc}")
+
     if not gdfs:
         return []
 
@@ -549,14 +591,12 @@ def _add_hydro_layer(m, hydro_dir: str) -> list[tuple[float, float]]:
         crs="EPSG:3067",
     )
 
-    if len(combined) > _HYDRO_MAX_FEATURES:
-        print(f"  Hydrography: {len(combined)} features — sampling {_HYDRO_MAX_FEATURES} for map display.")
-        combined = combined.sample(_HYDRO_MAX_FEATURES, random_state=0).reset_index(drop=True)
-
-    # Simplify in the projected CRS (metres) before reprojection — much smaller GeoJSON
+    # Simplify in projected CRS (metres) before reprojection — much smaller GeoJSON
     combined = combined.copy()
     combined["geometry"] = combined.geometry.simplify(_HYDRO_SIMPLIFY_M, preserve_topology=True)
     combined = combined[~combined.geometry.is_empty & combined.geometry.notna()]
+    if combined.empty:
+        return []
 
     combined_wgs84 = combined.to_crs(epsg=4326)
 
@@ -602,7 +642,18 @@ def _build_map(
     bounds: list[tuple[float, float]] = []
 
     if show_hydro and hydro_dir:
-        bounds.extend(_add_hydro_layer(m, hydro_dir))
+        hydro_bbox = _kml_bbox_3067(kml_path)
+        if hydro_bbox is not None:
+            bounds.extend(_add_hydro_layer(m, hydro_dir, hydro_bbox))
+        else:
+            import folium as _folium
+            m.get_root().html.add_child(_folium.Element(
+                '<div style="position:fixed;top:10px;right:10px;z-index:9999;'
+                'background:#fff3cd;padding:8px 12px;border-radius:4px;'
+                'border:1px solid #ffc107;font-size:12px">'
+                'Hydrography skipped — a Detections KML is required to define the load area.'
+                '</div>'
+            ))
 
     if show_detections and kml_path and Path(kml_path).exists():
         bounds.extend(_add_detections_layer(m, kml_path))
