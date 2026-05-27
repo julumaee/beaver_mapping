@@ -37,13 +37,14 @@ FEATURE_REGION    = FEATURE_REGION_MD  # kept for backwards compatibility
 
 def extract_features(chip: np.ndarray) -> np.ndarray:
     """
-    Return a 105-element float32 feature vector from a (bands, H, W) chip.
+    Return a 111-element float32 feature vector from a (bands, H, W) chip.
 
-    Features are computed at three spatial scales:
+    Features are computed at three spatial scales (35 values each):
       - Central 32×32px  (16m)  — small features without surrounding dilution
       - Central 64×64px  (32m)  — matches detection patch size
       - Full chip 512×512px (256m) — landscape context
-    Each scale contributes 35 values:
+
+    Per scale (35 values):
       - Per-band mean, std, 25th and 75th percentile  (3 × 4 = 12)
       - NDVI mean, std, fraction of pixels > 0.2      (3)
       - NDWI mean, std, fraction of pixels > 0.0      (3)
@@ -52,12 +53,34 @@ def extract_features(chip: np.ndarray) -> np.ndarray:
       - Connected wet-region stats at 3 NDWI thresholds: wet fraction,
         component count, largest area fraction, largest blob shape index
         (3 × 4 = 12)
+
+    Plus 6 cross-scale contrast features (32px−512px and 64px−512px):
+      - NDWI mean contrast           (2)
+      - NDWI wet-pixel fraction contrast  (2)
+      - Largest wet-blob area fraction contrast (2)
+
+    A beaver flood is wet at all scales (small contrast); a ditch or small
+    water body is wet only at fine scales (large positive contrast).
     """
-    return np.concatenate([
-        _features_for_region(_center_crop(chip, FEATURE_REGION_SM)),
-        _features_for_region(_center_crop(chip, FEATURE_REGION_MD)),
-        _features_for_region(chip),
-    ])
+    # Per-scale feature indices (within each 35-element block):
+    _NDWI_MEAN  = 15   # NDWI mean
+    _NDWI_FRAC  = 17   # fraction of pixels with NDWI > 0.0
+    _MAX_AREA   = 25   # largest connected wet blob as fraction of region area (threshold 0.0)
+
+    feats_sm   = _features_for_region(_center_crop(chip, FEATURE_REGION_SM))
+    feats_md   = _features_for_region(_center_crop(chip, FEATURE_REGION_MD))
+    feats_full = _features_for_region(chip)
+
+    cross = np.array([
+        feats_sm[_NDWI_MEAN] - feats_full[_NDWI_MEAN],
+        feats_sm[_NDWI_FRAC] - feats_full[_NDWI_FRAC],
+        feats_sm[_MAX_AREA]  - feats_full[_MAX_AREA],
+        feats_md[_NDWI_MEAN] - feats_full[_NDWI_MEAN],
+        feats_md[_NDWI_FRAC] - feats_full[_NDWI_FRAC],
+        feats_md[_MAX_AREA]  - feats_full[_MAX_AREA],
+    ], dtype=np.float32)
+
+    return np.concatenate([feats_sm, feats_md, feats_full, cross])
 
 
 def _center_crop(chip: np.ndarray, size: int) -> np.ndarray:
