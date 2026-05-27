@@ -505,6 +505,23 @@ def _build_map(
         lons = [b[1] for b in bounds]
         m.fit_bounds([[min(lats), min(lons)], [max(lats), max(lons)]])
 
+    legend_html = """
+    <div style="
+        position:fixed;bottom:30px;left:30px;z-index:9999;
+        background:rgba(255,255,255,0.9);padding:10px 14px;
+        border-radius:6px;border:1px solid #ccc;font-size:12px;line-height:1.8">
+      <b>Detections</b><br>
+      <span style="color:#e03030">&#9632;</span> RF &nbsp;
+      <span style="color:#3030e0">&#9632;</span> CNN &nbsp;
+      <span style="color:#a030a0">&#9632;</span> Both<br>
+      <b>Labels</b><br>
+      <span style="color:#ff7700">&#9679;</span> wet_forest &nbsp;
+      <span style="color:#00aaff">&#9679;</span> beaver_flood<br>
+      <span style="color:#888888">&#9679;</span> negative &nbsp;
+      <span style="color:#8b4513">&#9679;</span> dam
+    </div>"""
+    m.get_root().html.add_child(folium.Element(legend_html))
+
     return f'<div style="height:580px">{m._repr_html_()}</div>'
 
 
