@@ -646,6 +646,150 @@ def _do_evaluate_rf(
         )
 
 
+def _do_overview(
+    imagery_dir: str,
+    labels_dir: str,
+    models_dir: str,
+    chips_dir: str,
+) -> str:
+    import datetime
+    lines: list[str] = []
+    warnings: list[str] = []
+
+    def _fmt_size(path: str) -> str:
+        try:
+            s = Path(path).stat().st_size
+            if s > 1e9: return f"{s/1e9:.1f} GB"
+            if s > 1e6: return f"{s/1e6:.1f} MB"
+            return f"{s/1e3:.0f} KB"
+        except Exception:
+            return "?"
+
+    def _fmt_mtime(path: str) -> str:
+        try:
+            ts = Path(path).stat().st_mtime
+            return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            return "?"
+
+    # ---- Imagery ----
+    lines.append("=== Imagery ===")
+    if imagery_dir:
+        jp2s = _find_files(imagery_dir, ".jp2")
+        if jp2s:
+            total_mb = sum(Path(f).stat().st_size for f in jp2s) / 1e6
+            lines.append(f"  {len(jp2s)} .jp2 file(s)  ({total_mb:.0f} MB total)")
+            for f in jp2s[:5]:
+                lines.append(f"    {Path(f).name}  ({_fmt_size(f)})")
+            if len(jp2s) > 5:
+                lines.append(f"    ... and {len(jp2s) - 5} more")
+        else:
+            lines.append(f"  No .jp2 files found in {imagery_dir!r}")
+            warnings.append(f"No imagery found in {imagery_dir!r}")
+    else:
+        lines.append("  (not specified)")
+
+    # ---- Labels ----
+    lines.append("\n=== Labels ===")
+    if labels_dir:
+        kml_files = _find_files(labels_dir, ".kml") + _find_files(labels_dir, ".kmz")
+        if kml_files:
+            lines.append(f"  {len(kml_files)} KML/KMZ file(s)")
+            counts: dict[str, int] = {}
+            for kp in kml_files:
+                try:
+                    if kp.endswith(".kmz"):
+                        with zipfile.ZipFile(kp) as z:
+                            inner = next(n for n in z.namelist() if n.endswith(".kml"))
+                            with z.open(inner) as f:
+                                root = ET.parse(f).getroot()
+                    else:
+                        root = ET.parse(kp).getroot()
+                    for pm in root.iter(f"{{{_MAP_NS}}}Placemark"):
+                        if pm.find(f".//{{{_MAP_NS}}}Point") is not None:
+                            lbl = (pm.findtext(f"{{{_MAP_NS}}}name") or "unknown").strip().lower()
+                            counts[lbl] = counts.get(lbl, 0) + 1
+                except Exception:
+                    pass
+            for k, v in sorted(counts.items()):
+                lines.append(f"    {k}: {v}")
+            if not counts:
+                warnings.append("No placemark points found in KML files")
+        else:
+            lines.append(f"  No KML/KMZ files found in {labels_dir!r}")
+            warnings.append(f"No labels found in {labels_dir!r}")
+    else:
+        lines.append("  (not specified)")
+
+    # ---- Models ----
+    lines.append("\n=== Models ===")
+    if models_dir:
+        p = Path(models_dir)
+        if p.exists():
+            model_files = sorted(
+                f for f in p.iterdir()
+                if f.is_file() and f.suffix in (".pkl", ".pth", ".json")
+            )
+            if model_files:
+                for f in model_files:
+                    lines.append(f"  {f.name}  ({_fmt_size(str(f))}  modified {_fmt_mtime(str(f))})")
+            else:
+                lines.append(f"  No model files (.pkl/.pth/.json) found in {models_dir!r}")
+        else:
+            lines.append(f"  Directory not found: {models_dir!r}")
+    else:
+        lines.append("  (not specified)")
+
+    # ---- Training chips ----
+    lines.append("\n=== Training Chips ===")
+    if chips_dir:
+        manifest_path = Path(chips_dir) / "manifest.csv"
+        if manifest_path.exists():
+            try:
+                with open(manifest_path) as f:
+                    rows = list(csv.DictReader(f))
+                positive = [r for r in rows if int(r["label"]) == 1]
+                negative = [r for r in rows if int(r["label"]) == 0]
+                by_type: dict[str, int] = {}
+                for r in positive:
+                    ft = r.get("feature_type", "unknown")
+                    by_type[ft] = by_type.get(ft, 0) + 1
+                type_str = "  ".join(f"{k}: {v}" for k, v in sorted(by_type.items()))
+                lines.append(f"  {len(rows)} chips total")
+                lines.append(f"  Positive: {len(positive)}  ({type_str})")
+                lines.append(f"  Negative: {len(negative)}")
+            except Exception as exc:
+                lines.append(f"  Error reading manifest: {exc}")
+        else:
+            lines.append(f"  No manifest.csv found in {chips_dir!r}")
+    else:
+        lines.append("  (not specified)")
+
+    if warnings:
+        lines.append("\n=== Warnings ===")
+        for w in warnings:
+            lines.append(f"  ⚠ {w}")
+
+    return "\n".join(lines)
+
+
+def handle_overview(
+    imagery_dir: str,
+    labels_dir: str,
+    models_dir: str,
+    chips_dir: str,
+) -> str:
+    try:
+        return _do_overview(
+            (imagery_dir or "").strip(),
+            (labels_dir  or "").strip(),
+            (models_dir  or "").strip(),
+            (chips_dir   or "").strip(),
+        )
+    except Exception as exc:
+        return f"ERROR: {exc}"
+
+
 def _do_evaluate_compare(
     manifest_path: str,
     rf_model_path: str,
@@ -840,6 +984,28 @@ with gr.Blocks(title="CastorDetector") as demo:
                 fn=handle_evaluate_compare,
                 inputs=[cmp_manifest, cmp_rf_model, cmp_cnn_model, cmp_norm_stats, cmp_test_frac],
                 outputs=cmp_log,
+            )
+
+        # ------------------------------------------------------------------ #
+        # Overview
+        # ------------------------------------------------------------------ #
+        with gr.Tab("Overview"):
+            gr.Markdown(
+                "## Data Overview\n"
+                "Scan your data directories to verify what is available before training or detection."
+            )
+            with gr.Row():
+                ov_imagery    = gr.Textbox(label="Imagery directory",         placeholder="data/imagery/")
+                ov_labels     = gr.Textbox(label="Labels directory",          placeholder="data/labels/")
+            with gr.Row():
+                ov_models_dir = gr.Textbox(label="Models directory",          placeholder="data/models/")
+                ov_chips      = gr.Textbox(label="Chip directory (optional)", placeholder="data/chips/")
+            ov_btn = gr.Button("Scan", variant="primary")
+            ov_out = gr.Textbox(label="Summary", lines=22, interactive=False)
+            ov_btn.click(
+                fn=handle_overview,
+                inputs=[ov_imagery, ov_labels, ov_models_dir, ov_chips],
+                outputs=ov_out,
             )
 
         # ------------------------------------------------------------------ #
