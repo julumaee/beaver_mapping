@@ -15,6 +15,7 @@ import csv
 import queue
 import tempfile
 import threading
+import xml.etree.ElementTree as ET
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -365,6 +366,111 @@ def handle_detect(
 
 
 # --------------------------------------------------------------------------- #
+# Map view
+# --------------------------------------------------------------------------- #
+
+_MAP_NS = "http://www.opengis.net/kml/2.2"
+
+_DETECTION_COLORS = {
+    "model_rf":   "#e03030",
+    "model_cnn":  "#3030e0",
+    "model_both": "#a030a0",
+}
+
+
+def _add_detections_layer(m, kml_path: str) -> list[tuple[float, float]]:
+    import folium
+    group = folium.FeatureGroup(name="Detections", show=True)
+    bounds: list[tuple[float, float]] = []
+    try:
+        root = ET.parse(kml_path).getroot()
+        for pm in root.iter(f"{{{_MAP_NS}}}Placemark"):
+            style_id = (pm.findtext(f"{{{_MAP_NS}}}styleUrl") or "").lstrip("#")
+            color = _DETECTION_COLORS.get(style_id, "#e07030")
+            name  = pm.findtext(f"{{{_MAP_NS}}}name") or "Detection"
+            desc  = (pm.findtext(f"{{{_MAP_NS}}}description") or "").replace("\n", "<br>")
+            coords_raw = pm.findtext(f".//{{{_MAP_NS}}}coordinates") or ""
+            points: list[tuple[float, float]] = []
+            for part in coords_raw.strip().split():
+                vals = part.split(",")
+                if len(vals) >= 2:
+                    pt = (float(vals[1]), float(vals[0]))  # (lat, lon)
+                    points.append(pt)
+                    bounds.append(pt)
+            if len(points) >= 3:
+                folium.Polygon(
+                    locations=points,
+                    color=color,
+                    fill=True,
+                    fill_color=color,
+                    fill_opacity=0.30,
+                    weight=2,
+                    tooltip=folium.Tooltip(f"<b>{name}</b><br>{desc}"),
+                ).add_to(group)
+    except Exception as exc:
+        print(f"Warning: could not parse detections KML: {exc}")
+    group.add_to(m)
+    return bounds
+
+
+def _build_map(
+    kml_path: str,
+    labels_dir: str = "",
+    basemap: str = "Satellite",
+    show_detections: bool = True,
+    show_labels: bool = True,
+) -> str:
+    import folium
+    satellite_url = (
+        "https://server.arcgisonline.com/ArcGIS/rest/services"
+        "/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+    )
+    m = folium.Map(location=[65.0, 26.0], zoom_start=6, tiles=None)
+
+    if basemap == "Satellite":
+        folium.TileLayer(satellite_url, attr="Esri", name="Satellite").add_to(m)
+        folium.TileLayer("OpenStreetMap", name="OpenStreetMap").add_to(m)
+    else:
+        folium.TileLayer("OpenStreetMap", name="OpenStreetMap").add_to(m)
+        folium.TileLayer(satellite_url, attr="Esri", name="Satellite").add_to(m)
+
+    bounds: list[tuple[float, float]] = []
+
+    if show_detections and kml_path and Path(kml_path).exists():
+        bounds.extend(_add_detections_layer(m, kml_path))
+
+    folium.LayerControl(collapsed=False).add_to(m)
+
+    if bounds:
+        lats = [b[0] for b in bounds]
+        lons = [b[1] for b in bounds]
+        m.fit_bounds([[min(lats), min(lons)], [max(lats), max(lons)]])
+
+    return f'<div style="height:580px">{m._repr_html_()}</div>'
+
+
+def handle_load_map(
+    kml_path: str,
+    labels_dir: str,
+    basemap: str,
+    show_detections: bool,
+    show_labels: bool,
+) -> str:
+    kml_path   = (kml_path   or "").strip()
+    labels_dir = (labels_dir or "").strip()
+    if not kml_path and not labels_dir:
+        return (
+            "<p style='color:#888;padding:1em'>"
+            "Specify a detections KML path and/or a labels directory, then click Load Map."
+            "</p>"
+        )
+    try:
+        return _build_map(kml_path, labels_dir, basemap, show_detections, show_labels)
+    except Exception as exc:
+        return f"<p style='color:red'><b>ERROR:</b> {exc}</p>"
+
+
+# --------------------------------------------------------------------------- #
 # Evaluate RF backend
 # --------------------------------------------------------------------------- #
 
@@ -523,6 +629,30 @@ with gr.Blocks(title="CastorDetector") as demo:
                 fn=handle_evaluate_rf,
                 inputs=[ev_manifest, ev_rf_model, ev_radius, ev_per_class],
                 outputs=ev_log,
+            )
+
+        # ------------------------------------------------------------------ #
+        # Map
+        # ------------------------------------------------------------------ #
+        with gr.Tab("Map"):
+            gr.Markdown(
+                "## Results Map\n"
+                "View detection polygons and training label points on an interactive map."
+            )
+            with gr.Row():
+                map_kml    = gr.Textbox(label="Detections KML path", placeholder="data/output/detections.kml")
+                map_labels = gr.Textbox(label="Labels directory",    placeholder="data/labels/")
+            with gr.Row():
+                map_basemap     = gr.Dropdown(choices=["Satellite", "OpenStreetMap"], value="Satellite",
+                                              label="Base map")
+                map_show_det    = gr.Checkbox(label="Show detections",      value=True)
+                map_show_labels = gr.Checkbox(label="Show training labels", value=True)
+            map_btn  = gr.Button("Load Map", variant="primary")
+            map_html = gr.HTML()
+            map_btn.click(
+                fn=handle_load_map,
+                inputs=[map_kml, map_labels, map_basemap, map_show_det, map_show_labels],
+                outputs=map_html,
             )
 
 
