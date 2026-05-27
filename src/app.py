@@ -18,6 +18,8 @@ import threading
 import xml.etree.ElementTree as ET
 import zipfile
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).parent))
 
 import gradio as gr
@@ -646,6 +648,101 @@ def _do_evaluate_rf(
         )
 
 
+def _chip_to_image(chip: np.ndarray) -> np.ndarray:
+    """CIR chip (bands, H, W) → false-colour RGB uint8 (H, W, 3): NIR→R, Red→G, Green→B."""
+    rgb = np.stack([chip[0], chip[1], chip[2]], axis=-1).astype(np.float32)
+    lo, hi = rgb.min(), rgb.max()
+    rgb = ((rgb - lo) / (hi - lo + 1e-6) * 255).astype(np.uint8)
+    return rgb
+
+
+def _colormap_image(data: np.ndarray, cmap: str, vmin: float, vmax: float) -> np.ndarray:
+    """2-D float array → RGB uint8 using a matplotlib colormap."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import Normalize
+    norm = Normalize(vmin=vmin, vmax=vmax, clip=True)
+    rgba = plt.get_cmap(cmap)(norm(data))
+    return (rgba[:, :, :3] * 255).astype(np.uint8)
+
+
+def _do_diagnose(
+    lon: float,
+    lat: float,
+    imagery_dir: str,
+    rf_model_path: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    from pyproj import Transformer
+    from diagnose_point import find_covering_jp2, extract_chip_at
+    from spectral import compute_ndwi, compute_ndvi, extract_features
+    from models.random_forest import load_model, predict
+
+    transformer = Transformer.from_crs(4326, 3067, always_xy=True)
+    x, y = transformer.transform(lon, lat)
+    print(f"WGS84    : {lat:.6f}°N  {lon:.6f}°E")
+    print(f"EPSG:3067: x={x:.1f}  y={y:.1f}")
+
+    jp2s = find_covering_jp2(imagery_dir, x, y)
+    if not jp2s:
+        raise ValueError("No .jp2 tile covers this point. Check the imagery directory and coordinates.")
+    print(f"Tile: {Path(jp2s[0]).name}")
+
+    chip = extract_chip_at(jp2s[0], x, y)
+    print(f"Chip: {chip.shape}  dtype={chip.dtype}")
+    for i, name in enumerate(["NIR", "Red", "Green"]):
+        b = chip[i]
+        print(f"  {name}: min={b.min()}  max={b.max()}  mean={b.mean():.1f}")
+
+    clf = load_model(rf_model_path)
+    label, confidence = predict(clf, chip)
+    label_name = {0: "negative", 1: "flood"}.get(label, "unknown")
+    print(f"\nPrediction : {label_name} (class {label})  confidence={confidence:.3f}")
+
+    feats = extract_features(chip).reshape(1, -1)
+    probs = clf.predict_proba(feats)[0]
+    print("Per-class probabilities:")
+    for cls, prob in zip(clf.classes_, probs):
+        cls_name = {0: "negative", 1: "flood"}.get(int(cls), str(cls))
+        print(f"  {cls_name}: {prob:.3f}")
+
+    chip_img = _chip_to_image(chip)
+    ndwi_img = _colormap_image(compute_ndwi(chip), "RdBu",    vmin=-1, vmax=1)
+    ndvi_img = _colormap_image(compute_ndvi(chip), "RdYlGn",  vmin=-1, vmax=1)
+    return chip_img, ndwi_img, ndvi_img
+
+
+def handle_diagnose(
+    lon: float,
+    lat: float,
+    imagery_dir: str,
+    rf_model_path: str,
+):
+    import io as _io
+    if not imagery_dir or not imagery_dir.strip():
+        return None, None, None, "ERROR: Imagery directory is required."
+    if not rf_model_path or not rf_model_path.strip():
+        return None, None, None, "ERROR: RF model path is required."
+    buf = _io.StringIO()
+    old = sys.stdout
+    sys.stdout = buf
+    chip_img = ndwi_img = ndvi_img = None
+    error: str = ""
+    try:
+        chip_img, ndwi_img, ndvi_img = _do_diagnose(
+            float(lon), float(lat),
+            imagery_dir.strip(), rf_model_path.strip(),
+        )
+    except Exception as exc:
+        error = str(exc)
+    finally:
+        sys.stdout = old
+    log = buf.getvalue() or ""
+    if error:
+        log += f"\nERROR: {error}"
+    return chip_img, ndwi_img, ndvi_img, log or "No output."
+
+
 def _do_overview(
     imagery_dir: str,
     labels_dir: str,
@@ -984,6 +1081,34 @@ with gr.Blocks(title="CastorDetector") as demo:
                 fn=handle_evaluate_compare,
                 inputs=[cmp_manifest, cmp_rf_model, cmp_cnn_model, cmp_norm_stats, cmp_test_frac],
                 outputs=cmp_log,
+            )
+
+        # ------------------------------------------------------------------ #
+        # Diagnose Point
+        # ------------------------------------------------------------------ #
+        with gr.Tab("Diagnose Point"):
+            gr.Markdown(
+                "## Diagnose Point\n"
+                "Extract the chip at a known WGS84 location, run the RF classifier, "
+                "and visualise the spectral signature. Useful for understanding false "
+                "positives and missed detections."
+            )
+            with gr.Row():
+                diag_lon       = gr.Number(value=25.0,  label="Longitude (WGS84)")
+                diag_lat       = gr.Number(value=62.0,  label="Latitude (WGS84)")
+            with gr.Row():
+                diag_imagery   = gr.Textbox(label="Imagery directory",  placeholder="data/imagery/")
+                diag_rf_model  = gr.Textbox(label="RF model path (.pkl)", placeholder="data/models/model.pkl")
+            diag_btn = gr.Button("Diagnose", variant="primary")
+            with gr.Row():
+                diag_chip = gr.Image(label="CIR chip (NIR=R, Red=G, Green=B)", type="numpy")
+                diag_ndwi = gr.Image(label="NDWI  (blue=water, red=dry)",       type="numpy")
+                diag_ndvi = gr.Image(label="NDVI  (green=veg, red=bare)",        type="numpy")
+            diag_log = gr.Textbox(label="Prediction & band stats", lines=12, interactive=False)
+            diag_btn.click(
+                fn=handle_diagnose,
+                inputs=[diag_lon, diag_lat, diag_imagery, diag_rf_model],
+                outputs=[diag_chip, diag_ndwi, diag_ndvi, diag_log],
             )
 
         # ------------------------------------------------------------------ #
