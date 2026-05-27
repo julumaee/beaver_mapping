@@ -362,8 +362,9 @@ def handle_detect(
         hydro_dir.strip(), float(threshold), out,
     ):
         last_log = log
-        yield log, None
-    yield last_log, (out if out and Path(out).exists() else None)
+        yield log, None, gr.update()
+    kml_exists = out and Path(out).exists()
+    yield last_log, (out if kml_exists else None), (out if kml_exists else gr.update())
 
 
 # --------------------------------------------------------------------------- #
@@ -675,12 +676,7 @@ with gr.Blocks(title="CastorDetector") as demo:
             det_btn  = gr.Button("Detect & Export KML", variant="primary")
             det_log  = gr.Textbox(label="Log", lines=15, interactive=False)
             det_file = gr.File(label="Download KML", interactive=False)
-            det_btn.click(
-                fn=handle_detect,
-                inputs=[det_imagery, det_method, det_rf_model, det_cnn_model,
-                        det_norm_stats, det_hydro, det_threshold, det_output],
-                outputs=[det_log, det_file],
-            )
+            # det_btn.click() is wired after the Map tab so map_kml is in scope
 
         # ------------------------------------------------------------------ #
         # Evaluate RF
@@ -730,6 +726,14 @@ with gr.Blocks(title="CastorDetector") as demo:
                 inputs=[map_kml, map_labels, map_basemap, map_show_det, map_show_labels],
                 outputs=map_html,
             )
+
+    # Wire detect button here so map_kml is in scope
+    det_btn.click(
+        fn=handle_detect,
+        inputs=[det_imagery, det_method, det_rf_model, det_cnn_model,
+                det_norm_stats, det_hydro, det_threshold, det_output],
+        outputs=[det_log, det_file, map_kml],
+    )
 
 
 demo.queue()
