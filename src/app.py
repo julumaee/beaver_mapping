@@ -427,12 +427,6 @@ def handle_detect(
 
 _MAP_NS = "http://www.opengis.net/kml/2.2"
 
-_DETECTION_COLORS = {
-    "model_rf":   "#e03030",
-    "model_cnn":  "#3030e0",
-    "model_both": "#a030a0",
-}
-
 _LABEL_COLORS = {
     "wet_forest":   "#ff7700",
     "beaver_flood": "#00aaff",
@@ -443,17 +437,31 @@ _LABEL_COLORS = {
 _LABEL_DEFAULT_COLOR = "#ffcc00"
 
 
+def _confidence_color(conf: float | None) -> str:
+    if conf is None:
+        return "#888888"
+    if conf >= 0.85:
+        return "#00cc44"  # green
+    if conf >= 0.75:
+        return "#ffcc00"  # yellow
+    if conf >= 0.65:
+        return "#ff4400"  # red-orange
+    return "#888888"      # grey — below typical useful threshold
+
+
 def _add_detections_layer(m, kml_path: str) -> list[tuple[float, float]]:
+    import re
     import folium
     group = folium.FeatureGroup(name="Detections", show=True)
     bounds: list[tuple[float, float]] = []
     try:
         root = ET.parse(kml_path).getroot()
         for pm in root.iter(f"{{{_MAP_NS}}}Placemark"):
-            style_id = (pm.findtext(f"{{{_MAP_NS}}}styleUrl") or "").lstrip("#")
-            color = _DETECTION_COLORS.get(style_id, "#e07030")
-            name  = pm.findtext(f"{{{_MAP_NS}}}name") or "Detection"
-            desc  = (pm.findtext(f"{{{_MAP_NS}}}description") or "").replace("\n", "<br>")
+            name = pm.findtext(f"{{{_MAP_NS}}}name") or "Detection"
+            desc = (pm.findtext(f"{{{_MAP_NS}}}description") or "").replace("\n", "<br>")
+            match = re.search(r"Confidence:\s*([\d.]+)", desc)
+            conf  = float(match.group(1)) if match else None
+            color = _confidence_color(conf)
             coords_raw = pm.findtext(f".//{{{_MAP_NS}}}coordinates") or ""
             points: list[tuple[float, float]] = []
             for part in coords_raw.strip().split():
@@ -468,7 +476,7 @@ def _add_detections_layer(m, kml_path: str) -> list[tuple[float, float]]:
                     color=color,
                     fill=True,
                     fill_color=color,
-                    fill_opacity=0.30,
+                    fill_opacity=0.35,
                     weight=2,
                     tooltip=folium.Tooltip(f"<b>{name}</b><br>{desc}"),
                 ).add_to(group)
@@ -678,10 +686,11 @@ def _build_map(
         position:fixed;bottom:30px;left:30px;z-index:9999;
         background:rgba(255,255,255,0.9);padding:10px 14px;
         border-radius:6px;border:1px solid #ccc;font-size:12px;line-height:1.8">
-      <b>Detections</b><br>
-      <span style="color:#e03030">&#9632;</span> RF &nbsp;
-      <span style="color:#3030e0">&#9632;</span> CNN &nbsp;
-      <span style="color:#a030a0">&#9632;</span> Both<br>
+      <b>Detections (confidence)</b><br>
+      <span style="color:#00cc44">&#9632;</span> ≥ 0.85 &nbsp;
+      <span style="color:#ffcc00">&#9632;</span> 0.75–0.85 &nbsp;
+      <span style="color:#ff4400">&#9632;</span> 0.65–0.75 &nbsp;
+      <span style="color:#888888">&#9632;</span> &lt; 0.65<br>
       <b>Labels</b><br>
       <span style="color:#ff7700">&#9679;</span> wet_forest &nbsp;
       <span style="color:#00aaff">&#9679;</span> beaver_flood<br>
