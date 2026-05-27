@@ -37,47 +37,49 @@ FEATURE_REGION    = FEATURE_REGION_MD  # kept for backwards compatibility
 
 def extract_features(chip: np.ndarray) -> np.ndarray:
     """
-    Return a 111-element float32 feature vector from a (bands, H, W) chip.
+    Return a 99-element float32 feature vector from a (bands, H, W) chip.
 
-    Features are computed at three spatial scales (35 values each):
-      - Central 32×32px  (16m)  — small features without surrounding dilution
-      - Central 64×64px  (32m)  — matches detection patch size
-      - Full chip 512×512px (256m) — landscape context
+    32px and 64px center crops — 35 features each (full set):
+      - Per-band mean, std, p25, p75                  (3 × 4 = 12)
+      - NDVI mean, std, fraction > 0.2                (3)
+      - NDWI mean, std, fraction > 0.0                (3)
+      - NDWI gradient std                             (1)
+      - GLCM on NIR                                   (4)
+      - Connected wet-region stats at 3 NDWI thresholds
+        (wet_frac, n_components, max_area_frac, shape_index × 3) (12)
 
-    Per scale (35 values):
-      - Per-band mean, std, 25th and 75th percentile  (3 × 4 = 12)
-      - NDVI mean, std, fraction of pixels > 0.2      (3)
-      - NDWI mean, std, fraction of pixels > 0.0      (3)
-      - NDWI gradient magnitude std                   (1)
-      - GLCM on NIR: contrast, homogeneity, energy, correlation (4)
-      - Connected wet-region stats at 3 NDWI thresholds: wet fraction,
-        component count, largest area fraction, largest blob shape index
-        (3 × 4 = 12)
+    512px chip — 23 features (topology omitted):
+      - Per-band mean, std, p25, p75                  (12)
+      - NDVI mean, std, fraction > 0.2                (3)
+      - NDWI mean, std, fraction > 0.0                (3)
+      - NDWI gradient std                             (1)
+      - GLCM on NIR                                   (4)
+      Connected-component analysis on a 512×512 image costs ~480 ms per patch
+      (~93% of total feature time) and those 12 features had near-zero importance.
 
-    Plus 6 cross-scale contrast features (32px−512px and 64px−512px):
-      - NDWI mean contrast           (2)
-      - NDWI wet-pixel fraction contrast  (2)
-      - Largest wet-blob area fraction contrast (2)
+    6 cross-scale contrast features (32px−512px and 64px−512px):
+      - NDWI mean contrast                            (2)
+      - NDWI wet-fraction contrast                    (2)
+      - Fine-scale max-blob-area vs landscape wet-frac (2)
 
-    A beaver flood is wet at all scales (small contrast); a ditch or small
-    water body is wet only at fine scales (large positive contrast).
+    Total: 35 + 35 + 23 + 6 = 99
     """
-    # Per-scale feature indices (within each 35-element block):
-    _NDWI_MEAN  = 15   # NDWI mean
-    _NDWI_FRAC  = 17   # fraction of pixels with NDWI > 0.0
-    _MAX_AREA   = 25   # largest connected wet blob as fraction of region area (threshold 0.0)
+    _NDWI_MEAN = 15
+    _NDWI_FRAC = 17
+    _MAX_AREA  = 25  # index within the 35-element per-scale block (sm/md only)
 
     feats_sm   = _features_for_region(_center_crop(chip, FEATURE_REGION_SM))
     feats_md   = _features_for_region(_center_crop(chip, FEATURE_REGION_MD))
-    feats_full = _features_for_region(chip)
+    feats_full = _features_for_region(chip, topology=False)  # 23 features
 
+    # feats_full has no _MAX_AREA; use _NDWI_FRAC as the landscape reference.
     cross = np.array([
         feats_sm[_NDWI_MEAN] - feats_full[_NDWI_MEAN],
         feats_sm[_NDWI_FRAC] - feats_full[_NDWI_FRAC],
-        feats_sm[_MAX_AREA]  - feats_full[_MAX_AREA],
+        feats_sm[_MAX_AREA]  - feats_full[_NDWI_FRAC],
         feats_md[_NDWI_MEAN] - feats_full[_NDWI_MEAN],
         feats_md[_NDWI_FRAC] - feats_full[_NDWI_FRAC],
-        feats_md[_MAX_AREA]  - feats_full[_MAX_AREA],
+        feats_md[_MAX_AREA]  - feats_full[_NDWI_FRAC],
     ], dtype=np.float32)
 
     return np.concatenate([feats_sm, feats_md, feats_full, cross])
@@ -125,17 +127,14 @@ def _glcm_features(region: np.ndarray) -> np.ndarray:
     return np.array(feats, dtype=np.float32)
 
 
-def _features_for_region(region: np.ndarray) -> np.ndarray:
+def _features_for_region(region: np.ndarray, topology: bool = True) -> np.ndarray:
     feats: list[float] = []
 
-    for b in range(region.shape[0]):
-        band = region[b].astype(np.float32)
-        feats += [
-            float(band.mean()),
-            float(band.std()),
-            float(np.percentile(band, 25)),
-            float(np.percentile(band, 75)),
-        ]
+    region_f = region.astype(np.float32)
+    for b in range(region_f.shape[0]):
+        band = region_f[b]
+        p25, p75 = np.percentile(band, [25, 75])  # one sort instead of two
+        feats += [float(band.mean()), float(band.std()), float(p25), float(p75)]
 
     ndvi = compute_ndvi(region)
     feats += [float(ndvi.mean()), float(ndvi.std()), float(np.mean(ndvi > 0.2))]
@@ -143,14 +142,14 @@ def _features_for_region(region: np.ndarray) -> np.ndarray:
     ndwi = compute_ndwi(region)
     feats += [float(ndwi.mean()), float(ndwi.std()), float(np.mean(ndwi > 0.0))]
 
-    # Gradient std: high at water/vegetation boundaries (pond perimeter),
-    # low for uniform open water or uniform dry forest.
     dy, dx = np.gradient(ndwi)
     grad_mag = np.sqrt(dx ** 2 + dy ** 2)
     feats.append(float(grad_mag.std()))
 
     feats += _glcm_features(region).tolist()
-    feats += _connected_wet_features(ndwi).tolist()
+
+    if topology:
+        feats += _connected_wet_features(ndwi).tolist()
 
     return np.array(feats, dtype=np.float32)
 

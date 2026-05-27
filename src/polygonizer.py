@@ -16,8 +16,7 @@ DETECTION_STRIDE = TILE_SIZE // 2  # 50% overlap — used by the legacy detect_r
 
 # Dense patch-level RF segmentation constants
 PATCH_SIZE = 64   # pixels — 32 m at 0.5 m/px; matches FEATURE_REGION_MD in spectral.py
-PATCH_STRIDE = PATCH_SIZE // 2  # 32 px — 50% overlap ensures small features always
-                                 # fall within the center crop of at least one patch
+PATCH_STRIDE = PATCH_SIZE  # 64 px — no overlap; 4× fewer patches than 50% overlap.
 _CTX_OFFSET = (TILE_SIZE - PATCH_SIZE) // 2  # 224 — patch position in 512px context
 
 
@@ -71,6 +70,8 @@ def detect_rois_rf_segmentation(
     Returns flood_rois: [(polygon_epsg3067, confidence, area_m2), ...]
     """
     import time
+    import os
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     from spectral import extract_features
 
     effective_mask = _resolve_mask(jp2_path, stream_mask)
@@ -78,7 +79,6 @@ def detect_rois_rf_segmentation(
     with rasterio.open(jp2_path) as src:
         img_h, img_w = src.height, src.width
         img_transform = src.transform
-        # prob_map pixels correspond to PATCH_STRIDE × PATCH_STRIDE ground areas
         patch_transform = src.transform * Affine.scale(PATCH_STRIDE)
         n_bands = src.count
         bands = []
@@ -87,7 +87,6 @@ def detect_rois_rf_segmentation(
             bands.append(src.read(b))
         full_img = np.stack(bands)
 
-    # Edge-pad so every patch always has a full 512×512 context window.
     _PAD = TILE_SIZE  # 512 px
     _PAD_OFFSET = _PAD - _CTX_OFFSET  # 288
     print("  Padding image ...")
@@ -97,18 +96,12 @@ def detect_rois_rf_segmentation(
     n_patch_rows = (img_h + PATCH_STRIDE - 1) // PATCH_STRIDE
     n_patch_cols = (img_w + PATCH_STRIDE - 1) // PATCH_STRIDE
     prob_map = np.full((n_patch_rows, n_patch_cols), np.nan, dtype=np.float32)
-    patches_total = patches_processed = 0
-    t0 = time.time()
-    _REPORT_EVERY = max(1, n_patch_rows // 20)  # progress every ~5%
 
+    # Precompute which patches pass the mask check (fast, serial).
+    print("  Building patch list ...")
+    patches_in_mask: list[tuple[int, int]] = []
     for pr in range(n_patch_rows):
-        batch_feats: list[np.ndarray] = []
-        batch_cols: list[int] = []
-        row_start = pr * PATCH_STRIDE + _PAD_OFFSET
-
         for pc in range(n_patch_cols):
-            patches_total += 1
-
             if effective_mask is not None:
                 p_h = min(PATCH_SIZE, img_h - pr * PATCH_STRIDE)
                 p_w = min(PATCH_SIZE, img_w - pc * PATCH_STRIDE)
@@ -118,30 +111,56 @@ def detect_rois_rf_segmentation(
                 ))
                 if not effective_mask.intersects(patch_box):
                     continue
+            patches_in_mask.append((pr, pc))
 
-            col_start = pc * PATCH_STRIDE + _PAD_OFFSET
-            ctx = padded[:, row_start:row_start + TILE_SIZE, col_start:col_start + TILE_SIZE]
+    patches_total = n_patch_rows * n_patch_cols
+    patches_in = len(patches_in_mask)
+    n_workers = min(os.cpu_count() or 4, 8)
+    print(f"  Patches checked: {patches_total}, in mask: {patches_in} "
+          f"— processing with {n_workers} threads ...")
 
-            batch_feats.append(extract_features(ctx))
-            batch_cols.append(pc)
+    def _extract(pr_pc: tuple[int, int]) -> tuple[int, int, np.ndarray]:
+        pr, pc = pr_pc
+        row_start = pr * PATCH_STRIDE + _PAD_OFFSET
+        col_start = pc * PATCH_STRIDE + _PAD_OFFSET
+        ctx = padded[:, row_start:row_start + TILE_SIZE, col_start:col_start + TILE_SIZE]
+        return pr, pc, extract_features(ctx)
 
-        if batch_feats:
-            X = np.array(batch_feats, dtype=np.float32)
-            proba = clf.predict_proba(X)[:, 1]
-            for pc_idx, pc in enumerate(batch_cols):
-                prob_map[pr, pc] = proba[pc_idx]
-                patches_processed += 1
+    t0 = time.time()
+    _REPORT_EVERY = max(1, patches_in // 20)
+    done = 0
 
-        if (pr + 1) % _REPORT_EVERY == 0 or pr == n_patch_rows - 1:
-            pct = (pr + 1) / n_patch_rows * 100
-            elapsed = time.time() - t0
-            rate = (pr + 1) / elapsed if elapsed > 0 else 0
-            eta = (n_patch_rows - pr - 1) / rate if rate > 0 else 0
-            print(f"  Row {pr+1}/{n_patch_rows} ({pct:.0f}%) — "
-                  f"{patches_processed} patches processed — "
-                  f"ETA {eta/60:.1f} min")
+    # numpy/skimage/sklearn all release the GIL → real parallelism via threads.
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        # Submit in row-major order so RF batching stays cache-friendly.
+        future_to_coord = {pool.submit(_extract, rc): rc for rc in patches_in_mask}
+        pending_by_row: dict[int, list[tuple[int, np.ndarray]]] = {}
 
-    print(f"  Patches checked: {patches_total}, processed (in mask): {patches_processed}")
+        for fut in as_completed(future_to_coord):
+            pr, pc, feats = fut.result()
+            pending_by_row.setdefault(pr, []).append((pc, feats))
+            done += 1
+            if done % _REPORT_EVERY == 0 or done == patches_in:
+                elapsed = time.time() - t0
+                eta = (patches_in - done) / (done / elapsed) if done else 0
+                print(f"  {done}/{patches_in} patches extracted — ETA {eta/60:.1f} min")
+
+    # Batch RF prediction per row (keeps predictions in spatial order).
+    print("  Running RF classifier ...")
+    patches_processed = 0
+    for pr in range(n_patch_rows):
+        row_patches = pending_by_row.get(pr)
+        if not row_patches:
+            continue
+        row_patches.sort(key=lambda x: x[0])
+        cols = [pc for pc, _ in row_patches]
+        X = np.array([f for _, f in row_patches], dtype=np.float32)
+        proba = clf.predict_proba(X)[:, 1]
+        for pc_idx, pc in enumerate(cols):
+            prob_map[pr, pc] = proba[pc_idx]
+            patches_processed += 1
+
+    print(f"  Done — {patches_processed} patches classified in {(time.time()-t0)/60:.1f} min")
     return _prob_map_to_rois(prob_map, patch_transform, confidence_threshold, min_area_m2)
 
 
