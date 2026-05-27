@@ -470,12 +470,76 @@ def _add_labels_layer(m, labels_dir: str) -> list[tuple[float, float]]:
     return bounds
 
 
+def _add_hydro_layer(m, hydro_dir: str) -> list[tuple[float, float]]:
+    import folium
+    import geopandas as gpd
+    import pandas as pd
+    from masking import _load_stream_layers, _resolve_files, BUFFER_METERS
+
+    files = _resolve_files(hydro_dir)
+    if not files:
+        return []
+
+    gdfs: list[gpd.GeoDataFrame] = []
+    for f in files:
+        for _, gdf in _load_stream_layers(f):
+            if gdf.crs is None:
+                continue
+            if gdf.crs.to_epsg() != 3067:
+                gdf = gdf.to_crs(epsg=3067)
+            gdfs.append(gdf[["geometry"]])
+    if not gdfs:
+        return []
+
+    combined = gpd.GeoDataFrame(
+        pd.concat(gdfs, ignore_index=True) if len(gdfs) > 1 else gdfs[0].reset_index(drop=True),
+        crs="EPSG:3067",
+    )
+    combined_wgs84 = combined.to_crs(epsg=4326)
+
+    vectors_group = folium.FeatureGroup(name="Hydrography", show=True)
+    folium.GeoJson(
+        combined_wgs84.__geo_interface__,
+        style_function=lambda _: {
+            "color": "#1a6aa8",
+            "fillColor": "#4da6ff",
+            "fillOpacity": 0.30,
+            "weight": 1.5,
+        },
+    ).add_to(vectors_group)
+    vectors_group.add_to(m)
+
+    buffered = combined.copy()
+    buffered["geometry"] = buffered.geometry.buffer(BUFFER_METERS)
+    buffered = buffered[~buffered.geometry.is_empty].to_crs(epsg=4326)
+    buffer_group = folium.FeatureGroup(name=f"Stream buffer ({BUFFER_METERS} m)", show=False)
+    folium.GeoJson(
+        buffered.__geo_interface__,
+        style_function=lambda _: {
+            "color": "#1a6aa8",
+            "fillColor": "#4da6ff",
+            "fillOpacity": 0.12,
+            "weight": 0,
+        },
+    ).add_to(buffer_group)
+    buffer_group.add_to(m)
+
+    bounds: list[tuple[float, float]] = []
+    for geom in combined_wgs84.geometry:
+        if geom is not None and not geom.is_empty:
+            minx, miny, maxx, maxy = geom.bounds
+            bounds.extend([(miny, minx), (maxy, maxx)])
+    return bounds
+
+
 def _build_map(
     kml_path: str,
     labels_dir: str = "",
+    hydro_dir: str = "",
     basemap: str = "Satellite",
     show_detections: bool = True,
     show_labels: bool = True,
+    show_hydro: bool = True,
 ) -> str:
     import folium
     satellite_url = (
@@ -492,6 +556,9 @@ def _build_map(
         folium.TileLayer(satellite_url, attr="Esri", name="Satellite").add_to(m)
 
     bounds: list[tuple[float, float]] = []
+
+    if show_hydro and hydro_dir:
+        bounds.extend(_add_hydro_layer(m, hydro_dir))
 
     if show_detections and kml_path and Path(kml_path).exists():
         bounds.extend(_add_detections_layer(m, kml_path))
@@ -519,7 +586,9 @@ def _build_map(
       <span style="color:#ff7700">&#9679;</span> wet_forest &nbsp;
       <span style="color:#00aaff">&#9679;</span> beaver_flood<br>
       <span style="color:#888888">&#9679;</span> negative &nbsp;
-      <span style="color:#8b4513">&#9679;</span> dam
+      <span style="color:#8b4513">&#9679;</span> dam<br>
+      <b>Hydrography</b><br>
+      <span style="color:#1a6aa8">&#9644;</span> streams / water bodies
     </div>"""
     m.get_root().html.add_child(folium.Element(legend_html))
 
@@ -529,20 +598,24 @@ def _build_map(
 def handle_load_map(
     kml_path: str,
     labels_dir: str,
+    hydro_dir: str,
     basemap: str,
     show_detections: bool,
     show_labels: bool,
+    show_hydro: bool,
 ) -> str:
     kml_path   = (kml_path   or "").strip()
     labels_dir = (labels_dir or "").strip()
-    if not kml_path and not labels_dir:
+    hydro_dir  = (hydro_dir  or "").strip()
+    if not kml_path and not labels_dir and not hydro_dir:
         return (
             "<p style='color:#888;padding:1em'>"
-            "Specify a detections KML path and/or a labels directory, then click Load Map."
+            "Specify at least one data source, then click Load Map."
             "</p>"
         )
     try:
-        return _build_map(kml_path, labels_dir, basemap, show_detections, show_labels)
+        return _build_map(kml_path, labels_dir, hydro_dir, basemap,
+                          show_detections, show_labels, show_hydro)
     except Exception as exc:
         return f"<p style='color:red'><b>ERROR:</b> {exc}</p>"
 
@@ -715,15 +788,19 @@ with gr.Blocks(title="CastorDetector") as demo:
                 map_kml    = gr.Textbox(label="Detections KML path", placeholder="data/output/detections.kml")
                 map_labels = gr.Textbox(label="Labels directory",    placeholder="data/labels/")
             with gr.Row():
-                map_basemap     = gr.Dropdown(choices=["Satellite", "OpenStreetMap"], value="Satellite",
-                                              label="Base map")
+                map_hydro  = gr.Textbox(label="Hydrography directory (optional)", placeholder="data/hydrography/")
+                map_basemap = gr.Dropdown(choices=["Satellite", "OpenStreetMap"], value="Satellite",
+                                          label="Base map")
+            with gr.Row():
                 map_show_det    = gr.Checkbox(label="Show detections",      value=True)
                 map_show_labels = gr.Checkbox(label="Show training labels", value=True)
+                map_show_hydro  = gr.Checkbox(label="Show hydrography",     value=True)
             map_btn  = gr.Button("Load Map", variant="primary")
             map_html = gr.HTML()
             map_btn.click(
                 fn=handle_load_map,
-                inputs=[map_kml, map_labels, map_basemap, map_show_det, map_show_labels],
+                inputs=[map_kml, map_labels, map_hydro, map_basemap,
+                        map_show_det, map_show_labels, map_show_hydro],
                 outputs=map_html,
             )
 
