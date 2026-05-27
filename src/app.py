@@ -12,6 +12,7 @@ def _ensure_dependencies() -> None:
 _ensure_dependencies()
 
 import csv
+import json
 import queue
 import tempfile
 import threading
@@ -23,6 +24,52 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent))
 
 import gradio as gr
+
+# --------------------------------------------------------------------------- #
+# Persistent settings
+# --------------------------------------------------------------------------- #
+
+_SETTINGS_PATH = Path(__file__).parent.parent / "data" / "settings.json"
+
+_SETTINGS_KEYS = [
+    "rf_imagery", "rf_labels", "rf_model", "rf_hydro", "rf_chips",
+    "cnn_imagery", "cnn_labels", "cnn_model", "cnn_norm_stats", "cnn_hydro",
+    "det_imagery", "det_output", "det_rf_model", "det_cnn_model",
+    "det_norm_stats", "det_hydro",
+    "ev_manifest", "ev_rf_model",
+    "cmp_manifest", "cmp_rf_model", "cmp_cnn_model", "cmp_norm_stats",
+    "diag_imagery", "diag_rf_model",
+    "ov_imagery", "ov_labels", "ov_models_dir", "ov_chips",
+    "map_kml", "map_labels", "map_hydro",
+]
+
+
+def _load_settings() -> dict:
+    try:
+        if _SETTINGS_PATH.exists():
+            with open(_SETTINGS_PATH) as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def _save_settings(settings: dict) -> None:
+    _SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(_SETTINGS_PATH, "w") as f:
+        json.dump(settings, f, indent=2)
+
+
+def handle_save_settings(*values) -> str:
+    settings = dict(zip(_SETTINGS_KEYS, values))
+    try:
+        _save_settings(settings)
+        return f"Defaults saved to {_SETTINGS_PATH}"
+    except Exception as exc:
+        return f"ERROR saving settings: {exc}"
+
+
+_s = _load_settings()
 
 
 # --------------------------------------------------------------------------- #
@@ -950,6 +997,10 @@ def handle_evaluate_rf(
 
 with gr.Blocks(title="CastorDetector") as demo:
     gr.Markdown("# CastorDetector\nBeaver activity detection in MML aerial imagery.")
+    with gr.Row():
+        save_btn    = gr.Button("Save as defaults", variant="secondary", scale=0)
+        save_status = gr.Textbox(label="", interactive=False, scale=1, max_lines=1,
+                                 show_label=False, placeholder="")
     with gr.Tabs():
 
         # ------------------------------------------------------------------ #
@@ -961,13 +1012,13 @@ with gr.Blocks(title="CastorDetector") as demo:
                 "Extract chips from labelled imagery and train a Random Forest classifier."
             )
             with gr.Row():
-                rf_imagery = gr.Textbox(label="Imagery directory", placeholder="data/imagery/")
-                rf_labels  = gr.Textbox(label="Labels directory",  placeholder="data/labels/")
+                rf_imagery = gr.Textbox(label="Imagery directory", placeholder="data/imagery/",   value=_s.get("rf_imagery", ""))
+                rf_labels  = gr.Textbox(label="Labels directory",  placeholder="data/labels/",    value=_s.get("rf_labels",  ""))
             with gr.Row():
-                rf_model  = gr.Textbox(label="Model output path (.pkl)", placeholder="data/models/model.pkl")
-                rf_hydro  = gr.Textbox(label="Hydrography directory (optional)", placeholder="data/hydrography/")
+                rf_model  = gr.Textbox(label="Model output path (.pkl)", placeholder="data/models/model.pkl",   value=_s.get("rf_model", ""))
+                rf_hydro  = gr.Textbox(label="Hydrography directory (optional)", placeholder="data/hydrography/", value=_s.get("rf_hydro", ""))
             with gr.Row():
-                rf_chips   = gr.Textbox(label="Chip directory (optional, enables evaluate-rf)", placeholder="data/chips/")
+                rf_chips   = gr.Textbox(label="Chip directory (optional, enables evaluate-rf)", placeholder="data/chips/", value=_s.get("rf_chips", ""))
                 rf_augment = gr.Slider(minimum=0, maximum=12, value=6, step=1,
                                        label="Augment positives (extra offset chips per label)")
             rf_btn = gr.Button("Train RF", variant="primary")
@@ -988,13 +1039,13 @@ with gr.Blocks(title="CastorDetector") as demo:
                 "> **Note:** Downloads ~454 MB of pretrained weights from HuggingFace on first run."
             )
             with gr.Row():
-                cnn_imagery    = gr.Textbox(label="Imagery directory",        placeholder="data/imagery/")
-                cnn_labels     = gr.Textbox(label="Labels directory",         placeholder="data/labels/")
+                cnn_imagery    = gr.Textbox(label="Imagery directory",        placeholder="data/imagery/",                value=_s.get("cnn_imagery",    ""))
+                cnn_labels     = gr.Textbox(label="Labels directory",         placeholder="data/labels/",                 value=_s.get("cnn_labels",     ""))
             with gr.Row():
-                cnn_model      = gr.Textbox(label="Model output path (.pth)", placeholder="data/models/beaver_cnn_v1.pth")
-                cnn_norm_stats = gr.Textbox(label="Norm stats path (.json)",  placeholder="data/models/norm_stats.json")
+                cnn_model      = gr.Textbox(label="Model output path (.pth)", placeholder="data/models/beaver_cnn_v1.pth", value=_s.get("cnn_model",      ""))
+                cnn_norm_stats = gr.Textbox(label="Norm stats path (.json)",  placeholder="data/models/norm_stats.json",   value=_s.get("cnn_norm_stats", ""))
             with gr.Row():
-                cnn_hydro = gr.Textbox(label="Hydrography directory (optional)", placeholder="data/hydrography/")
+                cnn_hydro = gr.Textbox(label="Hydrography directory (optional)", placeholder="data/hydrography/",         value=_s.get("cnn_hydro",      ""))
             with gr.Row():
                 cnn_epochs = gr.Number(value=30,    label="Epochs",        precision=0)
                 cnn_lr     = gr.Number(value=0.001, label="Learning rate")
@@ -1015,16 +1066,16 @@ with gr.Blocks(title="CastorDetector") as demo:
                 "Run the trained model on imagery and export detections as a KML file."
             )
             with gr.Row():
-                det_imagery = gr.Textbox(label="Imagery directory", placeholder="data/imagery/")
-                det_output  = gr.Textbox(label="Output KML path",   placeholder="data/output/detections.kml")
+                det_imagery = gr.Textbox(label="Imagery directory", placeholder="data/imagery/",             value=_s.get("det_imagery",    ""))
+                det_output  = gr.Textbox(label="Output KML path",   placeholder="data/output/detections.kml", value=_s.get("det_output",     ""))
             with gr.Row():
                 det_method = gr.Dropdown(choices=["rf", "cnn", "both"], value="rf", label="Method")
-                det_hydro  = gr.Textbox(label="Hydrography directory (optional)", placeholder="data/hydrography/")
+                det_hydro  = gr.Textbox(label="Hydrography directory (optional)", placeholder="data/hydrography/", value=_s.get("det_hydro", ""))
             with gr.Row():
-                det_rf_model  = gr.Textbox(label="RF model path (.pkl)",  placeholder="data/models/model.pkl")
-                det_cnn_model = gr.Textbox(label="CNN model path (.pth)", placeholder="data/models/beaver_cnn_v1.pth")
+                det_rf_model  = gr.Textbox(label="RF model path (.pkl)",  placeholder="data/models/model.pkl",         value=_s.get("det_rf_model",  ""))
+                det_cnn_model = gr.Textbox(label="CNN model path (.pth)", placeholder="data/models/beaver_cnn_v1.pth", value=_s.get("det_cnn_model", ""))
             with gr.Row():
-                det_norm_stats = gr.Textbox(label="Norm stats path (.json)", placeholder="data/models/norm_stats.json")
+                det_norm_stats = gr.Textbox(label="Norm stats path (.json)", placeholder="data/models/norm_stats.json", value=_s.get("det_norm_stats", ""))
                 det_threshold  = gr.Slider(minimum=0.0, maximum=1.0, value=0.5, step=0.05,
                                            label="Confidence threshold")
             det_btn  = gr.Button("Detect & Export KML", variant="primary")
@@ -1043,8 +1094,8 @@ with gr.Blocks(title="CastorDetector") as demo:
                 "avoiding the spatial autocorrelation leak that a random split introduces."
             )
             with gr.Row():
-                ev_manifest  = gr.Textbox(label="Manifest CSV path", placeholder="data/chips/manifest.csv")
-                ev_rf_model  = gr.Textbox(label="RF model path (.pkl)", placeholder="data/models/model.pkl")
+                ev_manifest  = gr.Textbox(label="Manifest CSV path",   placeholder="data/chips/manifest.csv",  value=_s.get("ev_manifest", ""))
+                ev_rf_model  = gr.Textbox(label="RF model path (.pkl)", placeholder="data/models/model.pkl",   value=_s.get("ev_rf_model", ""))
             with gr.Row():
                 ev_radius    = gr.Slider(minimum=100, maximum=2000, value=500, step=50,
                                          label="Cluster radius (metres)")
@@ -1068,11 +1119,11 @@ with gr.Blocks(title="CastorDetector") as demo:
                 "Use the **Evaluate RF** tab for spatially rigorous cross-validation."
             )
             with gr.Row():
-                cmp_manifest   = gr.Textbox(label="Manifest CSV path",      placeholder="data/chips/manifest.csv")
-                cmp_rf_model   = gr.Textbox(label="RF model path (.pkl)",   placeholder="data/models/model.pkl")
+                cmp_manifest   = gr.Textbox(label="Manifest CSV path",       placeholder="data/chips/manifest.csv",       value=_s.get("cmp_manifest",   ""))
+                cmp_rf_model   = gr.Textbox(label="RF model path (.pkl)",    placeholder="data/models/model.pkl",         value=_s.get("cmp_rf_model",   ""))
             with gr.Row():
-                cmp_cnn_model  = gr.Textbox(label="CNN model path (.pth)",  placeholder="data/models/beaver_cnn_v1.pth")
-                cmp_norm_stats = gr.Textbox(label="Norm stats path (.json)", placeholder="data/models/norm_stats.json")
+                cmp_cnn_model  = gr.Textbox(label="CNN model path (.pth)",   placeholder="data/models/beaver_cnn_v1.pth", value=_s.get("cmp_cnn_model",  ""))
+                cmp_norm_stats = gr.Textbox(label="Norm stats path (.json)", placeholder="data/models/norm_stats.json",   value=_s.get("cmp_norm_stats", ""))
             cmp_test_frac = gr.Slider(minimum=0.1, maximum=0.5, value=0.2, step=0.05,
                                       label="Test fraction")
             cmp_btn = gr.Button("Evaluate", variant="primary")
@@ -1097,8 +1148,8 @@ with gr.Blocks(title="CastorDetector") as demo:
                 diag_lon       = gr.Number(value=25.0,  label="Longitude (WGS84)")
                 diag_lat       = gr.Number(value=62.0,  label="Latitude (WGS84)")
             with gr.Row():
-                diag_imagery   = gr.Textbox(label="Imagery directory",  placeholder="data/imagery/")
-                diag_rf_model  = gr.Textbox(label="RF model path (.pkl)", placeholder="data/models/model.pkl")
+                diag_imagery   = gr.Textbox(label="Imagery directory",    placeholder="data/imagery/",           value=_s.get("diag_imagery",  ""))
+                diag_rf_model  = gr.Textbox(label="RF model path (.pkl)", placeholder="data/models/model.pkl",  value=_s.get("diag_rf_model", ""))
             diag_btn = gr.Button("Diagnose", variant="primary")
             with gr.Row():
                 diag_chip = gr.Image(label="CIR chip (NIR=R, Red=G, Green=B)", type="numpy")
@@ -1120,11 +1171,11 @@ with gr.Blocks(title="CastorDetector") as demo:
                 "Scan your data directories to verify what is available before training or detection."
             )
             with gr.Row():
-                ov_imagery    = gr.Textbox(label="Imagery directory",         placeholder="data/imagery/")
-                ov_labels     = gr.Textbox(label="Labels directory",          placeholder="data/labels/")
+                ov_imagery    = gr.Textbox(label="Imagery directory",         placeholder="data/imagery/", value=_s.get("ov_imagery",    ""))
+                ov_labels     = gr.Textbox(label="Labels directory",          placeholder="data/labels/",  value=_s.get("ov_labels",     ""))
             with gr.Row():
-                ov_models_dir = gr.Textbox(label="Models directory",          placeholder="data/models/")
-                ov_chips      = gr.Textbox(label="Chip directory (optional)", placeholder="data/chips/")
+                ov_models_dir = gr.Textbox(label="Models directory",          placeholder="data/models/",  value=_s.get("ov_models_dir", ""))
+                ov_chips      = gr.Textbox(label="Chip directory (optional)", placeholder="data/chips/",   value=_s.get("ov_chips",      ""))
             ov_btn = gr.Button("Scan", variant="primary")
             ov_out = gr.Textbox(label="Summary", lines=22, interactive=False)
             ov_btn.click(
@@ -1142,10 +1193,10 @@ with gr.Blocks(title="CastorDetector") as demo:
                 "View detection polygons and training label points on an interactive map."
             )
             with gr.Row():
-                map_kml    = gr.Textbox(label="Detections KML path", placeholder="data/output/detections.kml")
-                map_labels = gr.Textbox(label="Labels directory",    placeholder="data/labels/")
+                map_kml    = gr.Textbox(label="Detections KML path", placeholder="data/output/detections.kml", value=_s.get("map_kml",    ""))
+                map_labels = gr.Textbox(label="Labels directory",    placeholder="data/labels/",               value=_s.get("map_labels", ""))
             with gr.Row():
-                map_hydro  = gr.Textbox(label="Hydrography directory (optional)", placeholder="data/hydrography/")
+                map_hydro  = gr.Textbox(label="Hydrography directory (optional)", placeholder="data/hydrography/", value=_s.get("map_hydro", ""))
                 map_basemap = gr.Dropdown(choices=["Satellite", "OpenStreetMap"], value="Satellite",
                                           label="Base map")
             with gr.Row():
@@ -1167,6 +1218,22 @@ with gr.Blocks(title="CastorDetector") as demo:
         inputs=[det_imagery, det_method, det_rf_model, det_cnn_model,
                 det_norm_stats, det_hydro, det_threshold, det_output],
         outputs=[det_log, det_file, map_kml],
+    )
+
+    save_btn.click(
+        fn=handle_save_settings,
+        inputs=[
+            rf_imagery, rf_labels, rf_model, rf_hydro, rf_chips,
+            cnn_imagery, cnn_labels, cnn_model, cnn_norm_stats, cnn_hydro,
+            det_imagery, det_output, det_rf_model, det_cnn_model,
+            det_norm_stats, det_hydro,
+            ev_manifest, ev_rf_model,
+            cmp_manifest, cmp_rf_model, cmp_cnn_model, cmp_norm_stats,
+            diag_imagery, diag_rf_model,
+            ov_imagery, ov_labels, ov_models_dir, ov_chips,
+            map_kml, map_labels, map_hydro,
+        ],
+        outputs=save_status,
     )
 
 
