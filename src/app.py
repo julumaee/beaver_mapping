@@ -211,7 +211,7 @@ def handle_train_rf(
     augment: float,
 ):
     if not imagery_dir or not imagery_dir.strip():
-        yield "ERROR: Imagery directory is required."; return
+        yield "ERROR: Imagery directory or .jp2 file is required."; return
     if not labels_dir or not labels_dir.strip():
         yield "ERROR: Labels directory is required."; return
     if not model_path or not model_path.strip():
@@ -286,7 +286,7 @@ def handle_train_cnn(
     lr: float,
 ):
     if not imagery_dir or not imagery_dir.strip():
-        yield "ERROR: Imagery directory is required."; return
+        yield "ERROR: Imagery directory or .jp2 file is required."; return
     if not labels_dir or not labels_dir.strip():
         yield "ERROR: Labels directory is required."; return
     if not model_path or not model_path.strip():
@@ -393,7 +393,7 @@ def handle_detect(
     output_path: str,
 ):
     if not imagery_dir or not imagery_dir.strip():
-        yield "ERROR: Imagery directory is required.", None; return
+        yield "ERROR: Imagery directory or .jp2 file is required.", None; return
     if not output_path or not output_path.strip():
         yield "ERROR: Output KML path is required.", None; return
     if method in ("rf", "both") and (not rf_model_path or not rf_model_path.strip()):
@@ -813,7 +813,7 @@ def handle_diagnose(
 ):
     import io as _io
     if not imagery_dir or not imagery_dir.strip():
-        return None, None, None, "ERROR: Imagery directory is required."
+        return None, None, None, "ERROR: Imagery directory or .jp2 file is required."
     if not rf_model_path or not rf_model_path.strip():
         return None, None, None, "ERROR: RF model path is required."
     buf = _io.StringIO()
@@ -1058,7 +1058,7 @@ with gr.Blocks(title="CastorDetector") as demo:
                 "Extract chips from labelled imagery and train a Random Forest classifier."
             )
             with gr.Row():
-                rf_imagery = gr.Textbox(label="Imagery directory", placeholder="data/imagery/",   value=_s.get("rf_imagery", ""))
+                rf_imagery = gr.Textbox(label="Imagery directory or .jp2 file", placeholder="data/imagery/",   value=_s.get("rf_imagery", ""))
                 rf_labels  = gr.Textbox(label="Labels directory",  placeholder="data/labels/",    value=_s.get("rf_labels",  ""))
             with gr.Row():
                 rf_model  = gr.Textbox(label="Model output path (.pkl)", placeholder="data/models/model.pkl",   value=_s.get("rf_model", ""))
@@ -1085,7 +1085,7 @@ with gr.Blocks(title="CastorDetector") as demo:
                 "> **Note:** Downloads ~454 MB of pretrained weights from HuggingFace on first run."
             )
             with gr.Row():
-                cnn_imagery    = gr.Textbox(label="Imagery directory",        placeholder="data/imagery/",                value=_s.get("cnn_imagery",    ""))
+                cnn_imagery    = gr.Textbox(label="Imagery directory or .jp2 file", placeholder="data/imagery/",                value=_s.get("cnn_imagery",    ""))
                 cnn_labels     = gr.Textbox(label="Labels directory",         placeholder="data/labels/",                 value=_s.get("cnn_labels",     ""))
             with gr.Row():
                 cnn_model      = gr.Textbox(label="Model output path (.pth)", placeholder="data/models/beaver_cnn_v1.pth", value=_s.get("cnn_model",      ""))
@@ -1112,7 +1112,7 @@ with gr.Blocks(title="CastorDetector") as demo:
                 "Run the trained model on imagery and export detections as a KML file."
             )
             with gr.Row():
-                det_imagery = gr.Textbox(label="Imagery directory", placeholder="data/imagery/",             value=_s.get("det_imagery",    ""))
+                det_imagery = gr.Textbox(label="Imagery directory or .jp2 file", placeholder="data/imagery/",             value=_s.get("det_imagery",    ""))
                 det_output  = gr.Textbox(label="Output KML path",   placeholder="data/output/detections.kml", value=_s.get("det_output",     ""))
             with gr.Row():
                 det_method = gr.Dropdown(choices=["rf", "cnn", "both"], value="rf", label="Method")
@@ -1194,7 +1194,7 @@ with gr.Blocks(title="CastorDetector") as demo:
                 diag_lon       = gr.Number(value=25.0,  label="Longitude (WGS84)")
                 diag_lat       = gr.Number(value=62.0,  label="Latitude (WGS84)")
             with gr.Row():
-                diag_imagery   = gr.Textbox(label="Imagery directory",    placeholder="data/imagery/",           value=_s.get("diag_imagery",  ""))
+                diag_imagery   = gr.Textbox(label="Imagery directory or .jp2 file", placeholder="data/imagery/",           value=_s.get("diag_imagery",  ""))
                 diag_rf_model  = gr.Textbox(label="RF model path (.pkl)", placeholder="data/models/model.pkl",  value=_s.get("diag_rf_model", ""))
             diag_btn = gr.Button("Diagnose", variant="primary")
             with gr.Row():
@@ -1217,7 +1217,7 @@ with gr.Blocks(title="CastorDetector") as demo:
                 "Scan your data directories to verify what is available before training or detection."
             )
             with gr.Row():
-                ov_imagery    = gr.Textbox(label="Imagery directory",         placeholder="data/imagery/", value=_s.get("ov_imagery",    ""))
+                ov_imagery    = gr.Textbox(label="Imagery directory or .jp2 file", placeholder="data/imagery/", value=_s.get("ov_imagery",    ""))
                 ov_labels     = gr.Textbox(label="Labels directory",          placeholder="data/labels/",  value=_s.get("ov_labels",     ""))
             with gr.Row():
                 ov_models_dir = gr.Textbox(label="Models directory",          placeholder="data/models/",  value=_s.get("ov_models_dir", ""))
