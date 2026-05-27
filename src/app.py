@@ -646,6 +646,46 @@ def _do_evaluate_rf(
         )
 
 
+def _do_evaluate_compare(
+    manifest_path: str,
+    rf_model_path: str,
+    cnn_model_path: str,
+    norm_stats_path: str,
+    test_fraction: float,
+) -> None:
+    from models.evaluate import evaluate_models
+    evaluate_models(
+        manifest_path=manifest_path,
+        rf_model_path=rf_model_path,
+        cnn_model_path=cnn_model_path,
+        norm_stats_path=norm_stats_path,
+        test_fraction=test_fraction,
+    )
+
+
+def handle_evaluate_compare(
+    manifest_path: str,
+    rf_model_path: str,
+    cnn_model_path: str,
+    norm_stats_path: str,
+    test_fraction: float,
+):
+    if not manifest_path or not manifest_path.strip():
+        yield "ERROR: Manifest CSV path is required."; return
+    if not rf_model_path or not rf_model_path.strip():
+        yield "ERROR: RF model path is required."; return
+    if not cnn_model_path or not cnn_model_path.strip():
+        yield "ERROR: CNN model path is required."; return
+    if not norm_stats_path or not norm_stats_path.strip():
+        yield "ERROR: Norm stats path is required."; return
+    yield from _stream(
+        _do_evaluate_compare,
+        manifest_path.strip(), rf_model_path.strip(),
+        cnn_model_path.strip(), norm_stats_path.strip(),
+        float(test_fraction),
+    )
+
+
 def handle_evaluate_rf(
     manifest_path: str,
     rf_model_path: str,
@@ -774,6 +814,32 @@ with gr.Blocks(title="CastorDetector") as demo:
                 fn=handle_evaluate_rf,
                 inputs=[ev_manifest, ev_rf_model, ev_radius, ev_per_class],
                 outputs=ev_log,
+            )
+
+        # ------------------------------------------------------------------ #
+        # Evaluate RF vs CNN
+        # ------------------------------------------------------------------ #
+        with gr.Tab("Evaluate RF vs CNN"):
+            gr.Markdown(
+                "## Evaluate RF vs CNN\n"
+                "Compare both models on a random held-out split of the training manifest.\n"
+                "> **Note:** Uses a random split — results are indicative. "
+                "Use the **Evaluate RF** tab for spatially rigorous cross-validation."
+            )
+            with gr.Row():
+                cmp_manifest   = gr.Textbox(label="Manifest CSV path",      placeholder="data/chips/manifest.csv")
+                cmp_rf_model   = gr.Textbox(label="RF model path (.pkl)",   placeholder="data/models/model.pkl")
+            with gr.Row():
+                cmp_cnn_model  = gr.Textbox(label="CNN model path (.pth)",  placeholder="data/models/beaver_cnn_v1.pth")
+                cmp_norm_stats = gr.Textbox(label="Norm stats path (.json)", placeholder="data/models/norm_stats.json")
+            cmp_test_frac = gr.Slider(minimum=0.1, maximum=0.5, value=0.2, step=0.05,
+                                      label="Test fraction")
+            cmp_btn = gr.Button("Evaluate", variant="primary")
+            cmp_log = gr.Textbox(label="Results", lines=12, interactive=False)
+            cmp_btn.click(
+                fn=handle_evaluate_compare,
+                inputs=[cmp_manifest, cmp_rf_model, cmp_cnn_model, cmp_norm_stats, cmp_test_frac],
+                outputs=cmp_log,
             )
 
         # ------------------------------------------------------------------ #
