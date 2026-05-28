@@ -396,6 +396,7 @@ def handle_detect(
     hydro_dir: str,
     threshold: float,
     output_path: str,
+    progress: gr.Progress = gr.Progress(),
 ):
     if not imagery_dir or not imagery_dir.strip():
         yield "ERROR: Imagery directory or .jp2 file is required.", None; return
@@ -408,6 +409,12 @@ def handle_detect(
     if method in ("cnn", "both") and (not norm_stats_path or not norm_stats_path.strip()):
         yield "ERROR: Norm stats path is required for this method.", None; return
     out = output_path.strip()
+    try:
+        total_tiles = len(_find_files(imagery_dir.strip(), ".jp2"))
+    except Exception:
+        total_tiles = 0
+    tiles_done = 0
+    progress(0, desc=f"0 / {total_tiles} tiles")
     last_log = ""
     for log in _stream(
         _do_detect,
@@ -415,8 +422,13 @@ def handle_detect(
         rf_model_path.strip(), cnn_model_path.strip(), norm_stats_path.strip(),
         hydro_dir.strip(), float(threshold), out,
     ):
+        new = log[len(last_log):]
+        tiles_done += new.count("Processing ")
+        if total_tiles > 0:
+            progress(min(tiles_done / total_tiles, 0.99), desc=f"{tiles_done} / {total_tiles} tiles")
         last_log = log
         yield log, None, gr.update()
+    progress(1.0, desc="Done")
     kml_exists = out and Path(out).exists()
     yield last_log, (out if kml_exists else None), (out if kml_exists else gr.update())
 
