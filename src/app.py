@@ -1046,6 +1046,41 @@ def handle_overview(
         return f"ERROR: {exc}"
 
 
+def _load_chip_gallery(chips_dir: str, n_per_class: int = 12) -> list:
+    """Return [(image_array, caption), ...] for a sample of chips from manifest.csv."""
+    import random
+    manifest = Path(chips_dir) / "manifest.csv"
+    if not manifest.exists():
+        return []
+    with open(manifest) as f:
+        rows = list(csv.DictReader(f))
+    positives = [r for r in rows if int(r["label"]) == 1]
+    negatives = [r for r in rows if int(r["label"]) == 0]
+    sample = (
+        random.sample(positives, min(n_per_class, len(positives))) +
+        random.sample(negatives, min(n_per_class, len(negatives)))
+    )
+    gallery = []
+    for r in sample:
+        try:
+            chip = np.load(r["path"])
+            img  = _chip_to_image(chip)
+            ft   = r.get("feature_type", "negative") if int(r["label"]) == 1 else "negative"
+            gallery.append((img, ft))
+        except Exception:
+            pass
+    return gallery
+
+
+def handle_chip_gallery(chips_dir: str) -> list:
+    if not chips_dir or not chips_dir.strip():
+        return []
+    try:
+        return _load_chip_gallery(chips_dir.strip())
+    except Exception:
+        return []
+
+
 def _do_evaluate_compare(
     manifest_path: str,
     rf_model_path: str,
@@ -1301,10 +1336,20 @@ with gr.Blocks(title="CastorDetector") as demo:
                 ov_chips      = gr.Textbox(label="Chip directory (optional)", placeholder="data/chips/",   value=_s.get("ov_chips",      ""))
             ov_btn = gr.Button("Scan", variant="primary")
             ov_out = gr.Textbox(label="Summary", lines=22, interactive=False)
-            ov_btn.click(
+            gr.Markdown("### Chip sample (CIR false-colour)")
+            ov_gallery = gr.Gallery(
+                label="Training chips — positives then negatives (up to 12 each)",
+                columns=6, height=320, object_fit="contain",
+            )
+            ov_event = ov_btn.click(
                 fn=handle_overview,
                 inputs=[ov_imagery, ov_labels, ov_models_dir, ov_chips],
                 outputs=ov_out,
+            )
+            ov_event.then(
+                fn=handle_chip_gallery,
+                inputs=[ov_chips],
+                outputs=[ov_gallery],
             )
 
         # ------------------------------------------------------------------ #
