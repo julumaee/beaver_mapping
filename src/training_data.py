@@ -241,14 +241,17 @@ def build_training_dataset(
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
-    positive_labeled: list[tuple[Point, str]] = []
+    all_labeled: list[tuple[Point, str]] = []
     for kml_path in kml_paths:
         for pt, ftype in parse_kml_labels(kml_path):
             if ftype not in exclude_features:
-                positive_labeled.append((pt, ftype))
+                all_labeled.append((pt, ftype))
 
-    positive_points = [pt for pt, _ in positive_labeled]
-    n_neg = n_negatives if n_negatives is not None else len(positive_labeled)
+    # Count only true positives for auto-negative balance — hard negatives
+    # already in all_labeled must not inflate the auto-sample count.
+    n_true_pos = sum(1 for _, ftype in all_labeled if FEATURE_TO_LABEL.get(ftype, 1) == 1)
+    positive_points = [pt for pt, _ in all_labeled]
+    n_neg = n_negatives if n_negatives is not None else n_true_pos
 
     if hydro_path is not None:
         negative_points = _sample_negatives_per_tile(
@@ -265,7 +268,7 @@ def build_training_dataset(
     manifest_rows: list[dict] = []
     for jp2_path in jp2_paths:
         extract_chips(
-            jp2_path, positive_labeled, out_dir,
+            jp2_path, all_labeled, out_dir,
             manifest_rows=manifest_rows,
             augment_positives=augment_positives,
             augment_max_offset=augment_max_offset,
@@ -277,7 +280,7 @@ def build_training_dataset(
             augment_positives=0,  # negatives are already spatially varied
         )
 
-    _warn_skipped(positive_labeled + negative_labeled, manifest_rows)
+    _warn_skipped(all_labeled + negative_labeled, manifest_rows)
 
     manifest_path = out_path / "manifest.csv"
     with open(manifest_path, "w", newline="") as f:
