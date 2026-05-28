@@ -100,9 +100,9 @@ def _add_placemark(
 
 
 def _confidence_tier(confidence: float) -> str:
-    if confidence >= 0.8:
+    if confidence >= 0.85:
         return "high"
-    if confidence >= 0.6:
+    if confidence >= 0.75:
         return "medium"
     return "low"
 

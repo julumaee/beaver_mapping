@@ -277,6 +277,8 @@ def build_training_dataset(
             augment_positives=0,  # negatives are already spatially varied
         )
 
+    _warn_skipped(positive_labeled + negative_labeled, manifest_rows)
+
     manifest_path = out_path / "manifest.csv"
     with open(manifest_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["path", "label", "feature_type", "x", "y"])
@@ -289,6 +291,22 @@ def build_training_dataset(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _warn_skipped(
+    all_labeled: list[tuple[Point, str]],
+    manifest_rows: list[dict],
+) -> None:
+    """Print a warning for any labeled point that produced no chips in any tile."""
+    extracted_xy = {(float(r["x"]), float(r["y"])) for r in manifest_rows}
+    skipped = [(pt, ftype) for pt, ftype in all_labeled
+               if (pt.x, pt.y) not in extracted_xy]
+    for pt, ftype in skipped:
+        print(f"  WARNING: '{ftype}' label at EPSG:3067 ({pt.x:.0f}, {pt.y:.0f}) "
+              f"falls outside all imagery tiles — skipped")
+    if skipped:
+        print(f"  {len(skipped)} label(s) skipped. "
+              f"Add imagery tiles that cover these locations, or remove the labels.")
+
 
 def _sample_negatives_per_tile(
     hydro_path: str,
