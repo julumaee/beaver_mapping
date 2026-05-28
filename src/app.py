@@ -753,6 +753,30 @@ def _build_map(
     </div>"""
     m.get_root().html.add_child(folium.Element(legend_html))
 
+    # Click handler: store lat/lon in window globals so the Diagnose button can read them
+    map_var = m.get_name()
+    click_js = f"""
+    <div id="map-click-coords" style="text-align:center;font-size:12px;color:#555;padding:4px 0">
+      Click on the map to select a point for diagnosis
+    </div>
+    <script>
+    (function() {{
+      var poll = setInterval(function() {{
+        if (typeof {map_var} !== 'undefined') {{
+          clearInterval(poll);
+          {map_var}.on('click', function(e) {{
+            window._mapClickLat = e.latlng.lat;
+            window._mapClickLon = e.latlng.lng;
+            var el = document.getElementById('map-click-coords');
+            if (el) el.textContent = 'Selected: ' + e.latlng.lat.toFixed(6)
+                                     + ', ' + e.latlng.lng.toFixed(6);
+          }});
+        }}
+      }}, 100);
+    }})();
+    </script>"""
+    m.get_root().html.add_child(folium.Element(click_js))
+
     return f'<div style="height:580px">{m._repr_html_()}</div>'
 
 
@@ -1373,11 +1397,21 @@ with gr.Blocks(title="CastorDetector") as demo:
                 map_show_hydro  = gr.Checkbox(label="Show hydrography",     value=True)
             map_btn  = gr.Button("Load Map", variant="primary")
             map_html = gr.HTML()
+            map_diagnose_btn = gr.Button(
+                "Diagnose selected point (click map first)", variant="secondary"
+            )
             map_btn.click(
                 fn=handle_load_map,
                 inputs=[map_kml, map_labels, map_hydro, map_basemap,
                         map_show_det, map_show_labels, map_show_hydro],
                 outputs=map_html,
+            )
+            # Reads JS globals set by the Leaflet click handler; populates Diagnose tab
+            map_diagnose_btn.click(
+                fn=None,
+                inputs=[],
+                outputs=[diag_lon, diag_lat],
+                js="() => [window._mapClickLon ?? 25.0, window._mapClickLat ?? 62.0]",
             )
 
     # Wire detect button here so map_kml is in scope
