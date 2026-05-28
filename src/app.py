@@ -449,6 +449,46 @@ def _confidence_color(conf: float | None) -> str:
     return "#888888"      # grey — below typical useful threshold
 
 
+def _detection_stats(kml_path: str) -> str:
+    """Parse a detections KML and return a confidence/area summary string."""
+    import re
+    if not kml_path or not Path(kml_path).exists():
+        return ""
+    counts = {"≥ 0.85": 0, "0.75–0.85": 0, "0.65–0.75": 0, "< 0.65": 0}
+    total_area = 0.0
+    n = 0
+    try:
+        root = ET.parse(kml_path).getroot()
+        for pm in root.iter(f"{{{_MAP_NS}}}Placemark"):
+            desc = pm.findtext(f"{{{_MAP_NS}}}description") or ""
+            cm = re.search(r"Confidence:\s*([\d.]+)", desc)
+            am = re.search(r"Area:\s*([\d.]+)", desc)
+            if cm:
+                conf = float(cm.group(1))
+                n += 1
+                if conf >= 0.85:   counts["≥ 0.85"]    += 1
+                elif conf >= 0.75: counts["0.75–0.85"] += 1
+                elif conf >= 0.65: counts["0.65–0.75"] += 1
+                else:              counts["< 0.65"]    += 1
+            if am:
+                total_area += float(am.group(1))
+    except Exception as exc:
+        return f"Error reading stats: {exc}"
+    if n == 0:
+        return "No detections in KML."
+    lines = [
+        f"Total detections : {n}",
+        f"Total area       : {total_area / 1e4:.2f} ha  ({total_area:.0f} m²)",
+        "",
+        "Confidence breakdown:",
+        f"  ≥ 0.85   (green)  : {counts['≥ 0.85']}",
+        f"  0.75–0.85 (yellow): {counts['0.75–0.85']}",
+        f"  0.65–0.75 (red)   : {counts['0.65–0.75']}",
+        f"  < 0.65   (grey)   : {counts['< 0.65']}",
+    ]
+    return "\n".join(lines)
+
+
 def _add_detections_layer(m, kml_path: str) -> list[tuple[float, float]]:
     import re
     import folium
@@ -1145,8 +1185,9 @@ with gr.Blocks(title="CastorDetector") as demo:
             with gr.Row():
                 det_btn  = gr.Button("Detect & Export KML", variant="primary")
                 det_stop = gr.Button("Stop", variant="stop")
-            det_log  = gr.Textbox(label="Log", lines=15, interactive=False)
-            det_file = gr.File(label="Download KML", interactive=False)
+            det_log   = gr.Textbox(label="Log", lines=15, interactive=False)
+            det_stats = gr.Textbox(label="Statistics", lines=8, interactive=False)
+            det_file  = gr.File(label="Download KML", interactive=False)
             # det_btn.click() is wired after the Map tab so map_kml is in scope
 
         # ------------------------------------------------------------------ #
@@ -1289,6 +1330,8 @@ with gr.Blocks(title="CastorDetector") as demo:
                 det_norm_stats, det_hydro, det_threshold, det_output],
         outputs=[det_log, det_file, map_kml],
     )
+
+    det_event.then(fn=_detection_stats, inputs=[det_output], outputs=[det_stats])
 
     # Stop buttons
     rf_stop.click(fn=None,  cancels=[rf_event])
