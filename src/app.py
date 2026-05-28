@@ -1081,9 +1081,11 @@ with gr.Blocks(title="CastorDetector") as demo:
                 rf_chips   = gr.Textbox(label="Chip directory (optional, enables evaluate-rf)", placeholder="data/chips/", value=_s.get("rf_chips", ""))
                 rf_augment = gr.Slider(minimum=0, maximum=12, value=6, step=1,
                                        label="Augment positives (extra offset chips per label)")
-            rf_btn = gr.Button("Train RF", variant="primary")
+            with gr.Row():
+                rf_btn  = gr.Button("Train RF", variant="primary")
+                rf_stop = gr.Button("Stop", variant="stop")
             rf_log = gr.Textbox(label="Log", lines=15, interactive=False)
-            rf_btn.click(
+            rf_event = rf_btn.click(
                 fn=handle_train_rf,
                 inputs=[rf_imagery, rf_labels, rf_model, rf_hydro, rf_chips, rf_augment],
                 outputs=rf_log,
@@ -1109,9 +1111,11 @@ with gr.Blocks(title="CastorDetector") as demo:
             with gr.Row():
                 cnn_epochs = gr.Number(value=30,    label="Epochs",        precision=0)
                 cnn_lr     = gr.Number(value=0.001, label="Learning rate")
-            cnn_btn = gr.Button("Train CNN", variant="primary")
+            with gr.Row():
+                cnn_btn  = gr.Button("Train CNN", variant="primary")
+                cnn_stop = gr.Button("Stop", variant="stop")
             cnn_log = gr.Textbox(label="Log", lines=15, interactive=False)
-            cnn_btn.click(
+            cnn_event = cnn_btn.click(
                 fn=handle_train_cnn,
                 inputs=[cnn_imagery, cnn_labels, cnn_model, cnn_norm_stats, cnn_hydro, cnn_epochs, cnn_lr],
                 outputs=cnn_log,
@@ -1138,7 +1142,9 @@ with gr.Blocks(title="CastorDetector") as demo:
                 det_norm_stats = gr.Textbox(label="Norm stats path (.json)", placeholder="data/models/norm_stats.json", value=_s.get("det_norm_stats", ""))
                 det_threshold  = gr.Slider(minimum=0.0, maximum=1.0, value=0.5, step=0.05,
                                            label="Confidence threshold")
-            det_btn  = gr.Button("Detect & Export KML", variant="primary")
+            with gr.Row():
+                det_btn  = gr.Button("Detect & Export KML", variant="primary")
+                det_stop = gr.Button("Stop", variant="stop")
             det_log  = gr.Textbox(label="Log", lines=15, interactive=False)
             det_file = gr.File(label="Download KML", interactive=False)
             # det_btn.click() is wired after the Map tab so map_kml is in scope
@@ -1160,9 +1166,11 @@ with gr.Blocks(title="CastorDetector") as demo:
                 ev_radius    = gr.Slider(minimum=100, maximum=2000, value=500, step=50,
                                          label="Cluster radius (metres)")
                 ev_per_class = gr.Checkbox(label="Per-class breakdown (wet_forest / beaver_flood)", value=False)
-            ev_btn = gr.Button("Evaluate RF", variant="primary")
+            with gr.Row():
+                ev_btn  = gr.Button("Evaluate RF", variant="primary")
+                ev_stop = gr.Button("Stop", variant="stop")
             ev_log = gr.Textbox(label="Results", lines=20, interactive=False)
-            ev_btn.click(
+            ev_event = ev_btn.click(
                 fn=handle_evaluate_rf,
                 inputs=[ev_manifest, ev_rf_model, ev_radius, ev_per_class],
                 outputs=ev_log,
@@ -1186,9 +1194,11 @@ with gr.Blocks(title="CastorDetector") as demo:
                 cmp_norm_stats = gr.Textbox(label="Norm stats path (.json)", placeholder="data/models/norm_stats.json",   value=_s.get("cmp_norm_stats", ""))
             cmp_test_frac = gr.Slider(minimum=0.1, maximum=0.5, value=0.2, step=0.05,
                                       label="Test fraction")
-            cmp_btn = gr.Button("Evaluate", variant="primary")
+            with gr.Row():
+                cmp_btn  = gr.Button("Evaluate", variant="primary")
+                cmp_stop = gr.Button("Stop", variant="stop")
             cmp_log = gr.Textbox(label="Results", lines=12, interactive=False)
-            cmp_btn.click(
+            cmp_event = cmp_btn.click(
                 fn=handle_evaluate_compare,
                 inputs=[cmp_manifest, cmp_rf_model, cmp_cnn_model, cmp_norm_stats, cmp_test_frac],
                 outputs=cmp_log,
@@ -1273,12 +1283,19 @@ with gr.Blocks(title="CastorDetector") as demo:
             )
 
     # Wire detect button here so map_kml is in scope
-    det_btn.click(
+    det_event = det_btn.click(
         fn=handle_detect,
         inputs=[det_imagery, det_method, det_rf_model, det_cnn_model,
                 det_norm_stats, det_hydro, det_threshold, det_output],
         outputs=[det_log, det_file, map_kml],
     )
+
+    # Stop buttons
+    rf_stop.click(fn=None,  cancels=[rf_event])
+    cnn_stop.click(fn=None, cancels=[cnn_event])
+    det_stop.click(fn=None, cancels=[det_event])
+    ev_stop.click(fn=None,  cancels=[ev_event])
+    cmp_stop.click(fn=None, cancels=[cmp_event])
 
     save_btn.click(
         fn=handle_save_settings,
