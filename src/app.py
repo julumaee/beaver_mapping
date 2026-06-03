@@ -76,6 +76,17 @@ def handle_save_settings(*values) -> str:
 _s = _load_settings()
 
 
+def _file_to_path(f) -> str:
+    """Return a file path string from whatever gr.UploadButton hands back."""
+    if f is None:
+        return ""
+    if isinstance(f, list):
+        f = f[0] if f else None
+        if f is None:
+            return ""
+    return f.name if hasattr(f, "name") else str(f)
+
+
 # --------------------------------------------------------------------------- #
 # Shared helpers
 # --------------------------------------------------------------------------- #
@@ -1251,12 +1262,19 @@ with gr.Blocks(title="CastorDetector") as demo:
                 det_method = gr.Dropdown(choices=["rf", "cnn", "both"], value=_s.get("det_method", "rf"), label="Method")
                 det_hydro  = gr.Textbox(label="Hydrography directory (optional)", placeholder="data/hydrography/", value=_s.get("det_hydro", ""))
             with gr.Row():
-                det_rf_model  = gr.Textbox(label="RF model path (.pkl)",  placeholder="data/models/model.pkl",         value=_s.get("det_rf_model",  ""))
-                det_cnn_model = gr.Textbox(label="CNN model path (.pth)", placeholder="data/models/beaver_cnn_v1.pth", value=_s.get("det_cnn_model", ""))
+                with gr.Column():
+                    det_rf_model      = gr.Textbox(label="RF model path (.pkl)",  placeholder="data/models/model.pkl",         value=_s.get("det_rf_model",  ""))
+                    det_rf_model_btn  = gr.UploadButton("📂 Browse", file_types=[".pkl"],  size="sm")
+                with gr.Column():
+                    det_cnn_model     = gr.Textbox(label="CNN model path (.pth)", placeholder="data/models/beaver_cnn_v1.pth", value=_s.get("det_cnn_model", ""))
+                    det_cnn_model_btn = gr.UploadButton("📂 Browse", file_types=[".pth"],  size="sm")
             with gr.Row():
-                det_norm_stats = gr.Textbox(label="Norm stats path (.json)", placeholder="data/models/norm_stats.json", value=_s.get("det_norm_stats", ""))
-                det_threshold  = gr.Slider(minimum=0.0, maximum=1.0, value=float(_s.get("det_threshold", 0.5)), step=0.05,
-                                           label="Confidence threshold")
+                with gr.Column():
+                    det_norm_stats     = gr.Textbox(label="Norm stats path (.json)", placeholder="data/models/norm_stats.json", value=_s.get("det_norm_stats", ""))
+                    det_norm_stats_btn = gr.UploadButton("📂 Browse", file_types=[".json"], size="sm")
+                with gr.Column():
+                    det_threshold = gr.Slider(minimum=0.0, maximum=1.0, value=float(_s.get("det_threshold", 0.5)), step=0.05,
+                                              label="Confidence threshold")
             with gr.Row():
                 det_btn  = gr.Button("Detect & Export KML", variant="primary")
                 det_stop = gr.Button("Stop", variant="stop")
@@ -1276,8 +1294,12 @@ with gr.Blocks(title="CastorDetector") as demo:
                 "avoiding the spatial autocorrelation leak that a random split introduces."
             )
             with gr.Row():
-                ev_manifest  = gr.Textbox(label="Manifest CSV path",   placeholder="data/chips/manifest.csv",  value=_s.get("ev_manifest", ""))
-                ev_rf_model  = gr.Textbox(label="RF model path (.pkl)", placeholder="data/models/model.pkl",   value=_s.get("ev_rf_model", ""))
+                with gr.Column():
+                    ev_manifest     = gr.Textbox(label="Manifest CSV path",    placeholder="data/chips/manifest.csv", value=_s.get("ev_manifest", ""))
+                    ev_manifest_btn = gr.UploadButton("📂 Browse", file_types=[".csv"], size="sm")
+                with gr.Column():
+                    ev_rf_model     = gr.Textbox(label="RF model path (.pkl)", placeholder="data/models/model.pkl",   value=_s.get("ev_rf_model", ""))
+                    ev_rf_model_btn = gr.UploadButton("📂 Browse", file_types=[".pkl"], size="sm")
             with gr.Row():
                 ev_radius    = gr.Slider(minimum=100, maximum=2000, value=float(_s.get("ev_radius", 500)), step=50,
                                          label="Cluster radius (metres)")
@@ -1303,11 +1325,19 @@ with gr.Blocks(title="CastorDetector") as demo:
                 "Use the **Evaluate RF** tab for spatially rigorous cross-validation."
             )
             with gr.Row():
-                cmp_manifest   = gr.Textbox(label="Manifest CSV path",       placeholder="data/chips/manifest.csv",       value=_s.get("cmp_manifest",   ""))
-                cmp_rf_model   = gr.Textbox(label="RF model path (.pkl)",    placeholder="data/models/model.pkl",         value=_s.get("cmp_rf_model",   ""))
+                with gr.Column():
+                    cmp_manifest     = gr.Textbox(label="Manifest CSV path",       placeholder="data/chips/manifest.csv",       value=_s.get("cmp_manifest",   ""))
+                    cmp_manifest_btn = gr.UploadButton("📂 Browse", file_types=[".csv"], size="sm")
+                with gr.Column():
+                    cmp_rf_model     = gr.Textbox(label="RF model path (.pkl)",    placeholder="data/models/model.pkl",         value=_s.get("cmp_rf_model",   ""))
+                    cmp_rf_model_btn = gr.UploadButton("📂 Browse", file_types=[".pkl"], size="sm")
             with gr.Row():
-                cmp_cnn_model  = gr.Textbox(label="CNN model path (.pth)",   placeholder="data/models/beaver_cnn_v1.pth", value=_s.get("cmp_cnn_model",  ""))
-                cmp_norm_stats = gr.Textbox(label="Norm stats path (.json)", placeholder="data/models/norm_stats.json",   value=_s.get("cmp_norm_stats", ""))
+                with gr.Column():
+                    cmp_cnn_model     = gr.Textbox(label="CNN model path (.pth)",   placeholder="data/models/beaver_cnn_v1.pth", value=_s.get("cmp_cnn_model",  ""))
+                    cmp_cnn_model_btn = gr.UploadButton("📂 Browse", file_types=[".pth"],  size="sm")
+                with gr.Column():
+                    cmp_norm_stats     = gr.Textbox(label="Norm stats path (.json)", placeholder="data/models/norm_stats.json",   value=_s.get("cmp_norm_stats", ""))
+                    cmp_norm_stats_btn = gr.UploadButton("📂 Browse", file_types=[".json"], size="sm")
             cmp_test_frac = gr.Slider(minimum=0.1, maximum=0.5, value=float(_s.get("cmp_test_frac", 0.2)), step=0.05,
                                       label="Test fraction")
             with gr.Row():
@@ -1334,8 +1364,10 @@ with gr.Blocks(title="CastorDetector") as demo:
                 diag_lon       = gr.Number(value=25.0,  label="Longitude (WGS84)")
                 diag_lat       = gr.Number(value=62.0,  label="Latitude (WGS84)")
             with gr.Row():
-                diag_imagery   = gr.Textbox(label="Imagery directory or .jp2 file", placeholder="data/imagery/",           value=_s.get("diag_imagery",  ""))
-                diag_rf_model  = gr.Textbox(label="RF model path (.pkl)", placeholder="data/models/model.pkl",  value=_s.get("diag_rf_model", ""))
+                diag_imagery  = gr.Textbox(label="Imagery directory or .jp2 file", placeholder="data/imagery/", value=_s.get("diag_imagery", ""))
+                with gr.Column():
+                    diag_rf_model     = gr.Textbox(label="RF model path (.pkl)", placeholder="data/models/model.pkl", value=_s.get("diag_rf_model", ""))
+                    diag_rf_model_btn = gr.UploadButton("📂 Browse", file_types=[".pkl"], size="sm")
             diag_btn = gr.Button("Diagnose", variant="primary")
             with gr.Row():
                 diag_chip = gr.Image(label="CIR chip (NIR=R, Red=G, Green=B)", type="numpy")
@@ -1455,6 +1487,18 @@ with gr.Blocks(title="CastorDetector") as demo:
         outputs=save_status,
     )
 
+
+    # Browse-button wirings — populate adjacent textbox with selected file path
+    det_rf_model_btn.upload( fn=_file_to_path, inputs=[det_rf_model_btn],  outputs=[det_rf_model])
+    det_cnn_model_btn.upload(fn=_file_to_path, inputs=[det_cnn_model_btn], outputs=[det_cnn_model])
+    det_norm_stats_btn.upload(fn=_file_to_path, inputs=[det_norm_stats_btn], outputs=[det_norm_stats])
+    ev_manifest_btn.upload(  fn=_file_to_path, inputs=[ev_manifest_btn],   outputs=[ev_manifest])
+    ev_rf_model_btn.upload(  fn=_file_to_path, inputs=[ev_rf_model_btn],   outputs=[ev_rf_model])
+    cmp_manifest_btn.upload( fn=_file_to_path, inputs=[cmp_manifest_btn],  outputs=[cmp_manifest])
+    cmp_rf_model_btn.upload( fn=_file_to_path, inputs=[cmp_rf_model_btn],  outputs=[cmp_rf_model])
+    cmp_cnn_model_btn.upload(fn=_file_to_path, inputs=[cmp_cnn_model_btn], outputs=[cmp_cnn_model])
+    cmp_norm_stats_btn.upload(fn=_file_to_path, inputs=[cmp_norm_stats_btn], outputs=[cmp_norm_stats])
+    diag_rf_model_btn.upload(fn=_file_to_path, inputs=[diag_rf_model_btn], outputs=[diag_rf_model])
 
 demo.queue()
 
