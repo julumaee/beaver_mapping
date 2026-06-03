@@ -75,6 +75,22 @@ def _write_raster(tmp_path: Path, cx: float, cy: float, size: int = 2048) -> str
     return str(p)
 
 
+def _write_folder_kml(tmp_path: Path, folder_name: str, lon=_LON, lat=_LAT,
+                      placemark_name: str = "Placemark 1") -> str:
+    text = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<kml xmlns="http://www.opengis.net/kml/2.2"><Document>'
+        f'<Folder><name>{folder_name}</name>'
+        f'<Placemark><name>{placemark_name}</name>'
+        f'<Point><coordinates>{lon},{lat},0</coordinates></Point>'
+        '</Placemark></Folder>'
+        '</Document></kml>'
+    )
+    p = tmp_path / "folder.kml"
+    p.write_text(text, encoding="utf-8")
+    return str(p)
+
+
 def _multi_feature_kml(tmp_path: Path, cx: float, cy: float) -> str:
     lon, lat = _TO_WGS84.transform(cx, cy)
     features = ["dam", "wet_forest", "beaver_flood", "lodge"]
@@ -121,6 +137,28 @@ class TestParseKmlLabels:
         zpt, zft = kmz_res[0]
         assert abs(kpt.x - zpt.x) < 1
         assert kft == zft == "beaver_flood"
+
+    def test_folder_name_used_as_feature_type(self, tmp_path):
+        _, ftype = parse_kml_labels(
+            _write_folder_kml(tmp_path, "Dead Forest")
+        )[0]
+        assert ftype == "dead_forest"
+
+    def test_folder_name_overrides_placemark_name(self, tmp_path):
+        _, ftype = parse_kml_labels(
+            _write_folder_kml(tmp_path, "flood", placemark_name="Placemark 42")
+        )[0]
+        assert ftype == "flood"
+
+    def test_folder_name_normalised_spaces_to_underscores(self, tmp_path):
+        _, ftype = parse_kml_labels(
+            _write_folder_kml(tmp_path, "Flooded Areas")
+        )[0]
+        assert ftype == "flooded_areas"
+
+    def test_root_placemark_without_folder_uses_placemark_name(self, tmp_path):
+        _, ftype = parse_kml_labels(_write_kml(tmp_path, name="negative"))[0]
+        assert ftype == "negative"
 
 
 class TestExtractChips:

@@ -59,32 +59,69 @@ def parse_kml_labels(kml_path: str) -> list[tuple[Point, str]]:
     """
     Parse a KML or KMZ file and return (centroid_epsg3067, feature_type) pairs.
 
-    feature_type is taken from the Placemark <name> tag, lowercased and stripped.
-    Placemarks with no name get type "unknown".
+    Feature type resolution (in priority order):
+    1. Enclosing <Folder> name — Google Earth folder structure is the primary
+       way to categorise placemarks (e.g. a folder named "Dead Forest" gives
+       feature type "dead_forest" to all placemarks inside it).
+    2. Placemark <name> tag — used only for root-level placemarks not inside
+       any named folder.
+    3. "unknown" — fallback when neither is present (treated as class 1).
+
+    Label names are normalised: lowercased, leading/trailing whitespace removed,
+    spaces and hyphens replaced with underscores (so "Dead Forest" → "dead_forest").
     """
     kml_text = _read_kml_text(kml_path)
     root = ET.fromstring(kml_text)
     ns = _KML_NS if root.tag.startswith("{") else ""
 
     results: list[tuple[Point, str]] = []
-    for pm in root.iter(f"{{{ns}}}Placemark" if ns else "Placemark"):
-        raw = _extract_coords(pm, ns)
-        if not raw:
-            continue
-        name_el = pm.find(f"{{{ns}}}name" if ns else "name")
-        feature_type = (
-            name_el.text.strip().lower()
-            if (name_el is not None and name_el.text)
-            else "unknown"
-        )
-        if len(raw) == 1:
-            lon, lat = raw[0]
-        else:
-            mp = MultiPoint(raw)
-            lon, lat = mp.centroid.x, mp.centroid.y
-        x, y = _WGS84_TO_ETRS.transform(lon, lat)
-        results.append((Point(x, y), feature_type))
+    doc = root.find(f"{{{ns}}}Document" if ns else "Document")
+    _parse_kml_element(doc if doc is not None else root, ns, None, results)
     return results
+
+
+def _normalise_label(text: str) -> str:
+    return text.strip().lower().replace(" ", "_").replace("-", "_")
+
+
+def _parse_kml_element(
+    el: ET.Element,
+    ns: str,
+    folder_type: str | None,
+    results: list[tuple[Point, str]],
+) -> None:
+    """Recursively walk KML elements, propagating the enclosing folder name."""
+    tag = lambda name: f"{{{ns}}}{name}" if ns else name  # noqa: E731
+    for child in el:
+        local = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+        if local == "Folder":
+            name_el = child.find(tag("name"))
+            this_folder = (
+                _normalise_label(name_el.text)
+                if (name_el is not None and name_el.text)
+                else folder_type
+            )
+            _parse_kml_element(child, ns, this_folder, results)
+        elif local == "Placemark":
+            if folder_type is not None:
+                ftype = folder_type
+            else:
+                name_el = child.find(tag("name"))
+                ftype = (
+                    _normalise_label(name_el.text)
+                    if (name_el is not None and name_el.text)
+                    else "unknown"
+                )
+            raw = _extract_coords(child, ns)
+            if not raw:
+                continue
+            if len(raw) == 1:
+                lon, lat = raw[0]
+            else:
+                mp = MultiPoint(raw)
+                lon, lat = mp.centroid.x, mp.centroid.y
+            x, y = _WGS84_TO_ETRS.transform(lon, lat)
+            results.append((Point(x, y), ftype))
 
 
 def extract_chips(
