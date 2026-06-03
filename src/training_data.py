@@ -1,4 +1,22 @@
-"""Training data pipeline: KML label parsing, chip extraction, negative sampling."""
+"""Training data pipeline: KML label parsing, chip extraction, negative sampling.
+
+Generic-label training workflow
+--------------------------------
+Labels can be placed anywhere in the imagery — not just confirmed beaver
+territories.  The stream filter (--hydro) is applied at detection time, not
+training time, so the model learns visual patterns and domain knowledge is
+applied separately.
+
+Recommended label types:
+  dead_forest  — standing dead trees (killed by beaver flooding)
+  flood        — open water impoundment (any scale)
+  wet_forest   — saturated/flooded forest (older, kept for compatibility)
+  beaver_flood — confirmed beaver open water (kept for compatibility)
+  negative     — explicit hard negative (stream-adjacent, no beaver activity)
+
+Types excluded from training (point-scale features, not area classifiers):
+  dam, lodge
+"""
 
 import csv
 import random
@@ -23,10 +41,14 @@ DEFAULT_EXCLUDE: frozenset[str] = frozenset({"lodge", "dam"})
 
 # Maps KML feature type names to integer class labels:
 #   0 = negative (no beaver activity)
-#   1 = flooded area / wet forest (beaver-influenced water)
-# Dam points are excluded from training (see DEFAULT_EXCLUDE).
+#   1 = positive (any beaver-associated visual signature)
+# Unrecognised label names default to 1 so new types work without code changes.
 FEATURE_TO_LABEL: dict[str, int] = {
     "negative":     0,
+    # Generic labels — can be placed anywhere in imagery, not just beaver sites:
+    "dead_forest":  1,  # standing dead trees killed by beaver flooding
+    "flood":        1,  # any open water impoundment
+    # Legacy / specific labels kept for backwards compatibility:
     "wet_forest":   1,
     "beaver_flood": 1,
     "unknown":      1,

@@ -167,12 +167,15 @@ class TestExtractChips:
 
 
 class TestFeatureToLabel:
-    def test_wet_forest_and_beaver_flood_are_1(self):
-        assert FEATURE_TO_LABEL["wet_forest"] == 1
-        assert FEATURE_TO_LABEL["beaver_flood"] == 1
+    def test_positive_labels_are_1(self):
+        for label in ("wet_forest", "beaver_flood", "dead_forest", "flood"):
+            assert FEATURE_TO_LABEL[label] == 1, f"{label} should be class 1"
 
     def test_negative_is_0(self):
         assert FEATURE_TO_LABEL["negative"] == 0
+
+    def test_unknown_label_defaults_to_1(self):
+        assert FEATURE_TO_LABEL.get("unrecognised_type", 1) == 1
 
 
 class TestSampleNegatives:
@@ -235,3 +238,39 @@ class TestBuildTrainingDataset:
 
     def test_default_exclude_contains_dam(self):
         assert "dam" in DEFAULT_EXCLUDE
+
+    def test_dead_forest_label_produces_class1_chip(self, tmp_path):
+        cx, cy = 328_000.0, 6_821_000.0
+        jp2 = _write_raster(tmp_path, cx, cy, size=2048)
+        lon, lat = _TO_WGS84.transform(cx, cy)
+        kml = _write_kml(tmp_path, lon=lon, lat=lat, name="dead_forest")
+        manifest = build_training_dataset([jp2], [kml], None,
+                                          str(tmp_path / "ds"), n_negatives=0)
+        with open(manifest) as f:
+            rows = list(csv.DictReader(f))
+        assert any(r["feature_type"] == "dead_forest" and int(r["label"]) == 1
+                   for r in rows)
+
+    def test_flood_label_produces_class1_chip(self, tmp_path):
+        cx, cy = 328_000.0, 6_821_000.0
+        jp2 = _write_raster(tmp_path, cx, cy, size=2048)
+        lon, lat = _TO_WGS84.transform(cx, cy)
+        kml = _write_kml(tmp_path, lon=lon, lat=lat, name="flood")
+        manifest = build_training_dataset([jp2], [kml], None,
+                                          str(tmp_path / "ds"), n_negatives=0)
+        with open(manifest) as f:
+            rows = list(csv.DictReader(f))
+        assert any(r["feature_type"] == "flood" and int(r["label"]) == 1
+                   for r in rows)
+
+    def test_no_hydro_samples_negatives_from_imagery_extent(self, tmp_path):
+        cx, cy = 328_000.0, 6_821_000.0
+        jp2 = _write_raster(tmp_path, cx, cy, size=2048)
+        lon, lat = _TO_WGS84.transform(cx, cy)
+        kml = _write_kml(tmp_path, lon=lon, lat=lat, name="flood")
+        manifest = build_training_dataset([jp2], [kml], None,
+                                          str(tmp_path / "ds"), n_negatives=3)
+        with open(manifest) as f:
+            rows = list(csv.DictReader(f))
+        neg_rows = [r for r in rows if int(r["label"]) == 0]
+        assert len(neg_rows) == 3
