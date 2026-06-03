@@ -76,6 +76,19 @@ def handle_save_settings(*values) -> str:
 _s = _load_settings()
 
 
+_MAX_LOG_HISTORY = 5
+
+
+def _append_log_history(log: str, history: list) -> tuple[list, str]:
+    """Prepend the completed run log to the history list (newest first)."""
+    import datetime
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    entry = f"─── {ts} ───\n{(log or '').rstrip()}"
+    history = list(history or [])[-(_MAX_LOG_HISTORY - 1):]
+    history.append(entry)
+    return history, "\n\n".join(reversed(history))
+
+
 def _file_to_path(f) -> str:
     """Return a file path string from whatever gr.UploadButton hands back."""
     if f is None:
@@ -1211,6 +1224,9 @@ with gr.Blocks(title="CastorDetector") as demo:
                 rf_btn  = gr.Button("Train RF", variant="primary")
                 rf_stop = gr.Button("Stop", variant="stop")
             rf_log = gr.Textbox(label="Log", lines=15, interactive=False)
+            rf_history_state = gr.State([])
+            with gr.Accordion("Previous runs", open=False):
+                rf_history_text = gr.Textbox(label="", lines=10, interactive=False, show_label=False)
             rf_event = rf_btn.click(
                 fn=handle_train_rf,
                 inputs=[rf_imagery, rf_labels, rf_model, rf_hydro, rf_chips, rf_augment],
@@ -1241,6 +1257,9 @@ with gr.Blocks(title="CastorDetector") as demo:
                 cnn_btn  = gr.Button("Train CNN", variant="primary")
                 cnn_stop = gr.Button("Stop", variant="stop")
             cnn_log = gr.Textbox(label="Log", lines=15, interactive=False)
+            cnn_history_state = gr.State([])
+            with gr.Accordion("Previous runs", open=False):
+                cnn_history_text = gr.Textbox(label="", lines=10, interactive=False, show_label=False)
             cnn_event = cnn_btn.click(
                 fn=handle_train_cnn,
                 inputs=[cnn_imagery, cnn_labels, cnn_model, cnn_norm_stats, cnn_hydro, cnn_epochs, cnn_lr],
@@ -1281,6 +1300,9 @@ with gr.Blocks(title="CastorDetector") as demo:
             det_log   = gr.Textbox(label="Log", lines=15, interactive=False)
             det_stats = gr.Textbox(label="Statistics", lines=8, interactive=False)
             det_file  = gr.File(label="Download KML", interactive=False)
+            det_history_state = gr.State([])
+            with gr.Accordion("Previous runs", open=False):
+                det_history_text = gr.Textbox(label="", lines=10, interactive=False, show_label=False)
             # det_btn.click() is wired after the Map tab so map_kml is in scope
 
         # ------------------------------------------------------------------ #
@@ -1308,6 +1330,9 @@ with gr.Blocks(title="CastorDetector") as demo:
                 ev_btn  = gr.Button("Evaluate RF", variant="primary")
                 ev_stop = gr.Button("Stop", variant="stop")
             ev_log = gr.Textbox(label="Results", lines=20, interactive=False)
+            ev_history_state = gr.State([])
+            with gr.Accordion("Previous runs", open=False):
+                ev_history_text = gr.Textbox(label="", lines=10, interactive=False, show_label=False)
             ev_event = ev_btn.click(
                 fn=handle_evaluate_rf,
                 inputs=[ev_manifest, ev_rf_model, ev_radius, ev_per_class],
@@ -1344,6 +1369,9 @@ with gr.Blocks(title="CastorDetector") as demo:
                 cmp_btn  = gr.Button("Evaluate", variant="primary")
                 cmp_stop = gr.Button("Stop", variant="stop")
             cmp_log = gr.Textbox(label="Results", lines=12, interactive=False)
+            cmp_history_state = gr.State([])
+            with gr.Accordion("Previous runs", open=False):
+                cmp_history_text = gr.Textbox(label="", lines=10, interactive=False, show_label=False)
             cmp_event = cmp_btn.click(
                 fn=handle_evaluate_compare,
                 inputs=[cmp_manifest, cmp_rf_model, cmp_cnn_model, cmp_norm_stats, cmp_test_frac],
@@ -1459,6 +1487,23 @@ with gr.Blocks(title="CastorDetector") as demo:
     )
 
     det_event.then(fn=_detection_stats, inputs=[det_output], outputs=[det_stats])
+
+    # Run log history — append completed log to each tab's accordion
+    rf_event.then(fn=_append_log_history,
+                  inputs=[rf_log,  rf_history_state],
+                  outputs=[rf_history_state,  rf_history_text])
+    cnn_event.then(fn=_append_log_history,
+                   inputs=[cnn_log, cnn_history_state],
+                   outputs=[cnn_history_state, cnn_history_text])
+    det_event.then(fn=_append_log_history,
+                   inputs=[det_log, det_history_state],
+                   outputs=[det_history_state, det_history_text])
+    ev_event.then(fn=_append_log_history,
+                  inputs=[ev_log,  ev_history_state],
+                  outputs=[ev_history_state,  ev_history_text])
+    cmp_event.then(fn=_append_log_history,
+                   inputs=[cmp_log, cmp_history_state],
+                   outputs=[cmp_history_state, cmp_history_text])
 
     # Stop buttons
     rf_stop.click(fn=None,  cancels=[rf_event])
