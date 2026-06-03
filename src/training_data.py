@@ -285,6 +285,7 @@ def build_training_dataset(
     augment_positives: int = 6,
     augment_max_offset: int = 24,
     hydro_path: str | None = None,
+    hydro_flood_samples: int = 0,
 ) -> str:
     """
     Orchestrate the full training data pipeline and write a manifest CSV.
@@ -292,6 +293,9 @@ def build_training_dataset(
     hydro_path: when given, negative samples are drawn using a per-tile stream
                 mask (same bbox-scoped loading as detect).  Avoids loading
                 millions of features globally when imagery spans many tiles.
+    hydro_flood_samples: number of extra positive chips to auto-extract from
+                the tulvaalue (flooded area) layer in hydro_path.  Requires
+                hydro_path to be set.
     stream_mask: legacy — passed directly to sample_negatives.  Ignored when
                  hydro_path is set.
     augment_positives: number of extra offset chips per positive label point.
@@ -300,11 +304,21 @@ def build_training_dataset(
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
+    imagery_extent = _imagery_union(jp2_paths)
+
     all_labeled: list[tuple[Point, str]] = []
     for kml_path in kml_paths:
         for pt, ftype in parse_kml_labels(kml_path):
             if ftype not in exclude_features:
                 all_labeled.append((pt, ftype))
+
+    if hydro_path is not None and hydro_flood_samples > 0:
+        flood_pts = _load_tulvaalue_points(
+            hydro_path, imagery_extent, hydro_flood_samples, rng_seed,
+        )
+        all_labeled.extend(flood_pts)
+        print(f"  Auto-extracted {len(flood_pts)} flood chips from tulvaalue "
+              f"(requested {hydro_flood_samples})")
 
     # Count only true positives for auto-negative balance — hard negatives
     # already in all_labeled must not inflate the auto-sample count.
@@ -317,7 +331,6 @@ def build_training_dataset(
             hydro_path, jp2_paths, positive_points, n_neg, rng_seed,
         )
     else:
-        imagery_extent = _imagery_union(jp2_paths)
         negative_points = sample_negatives(
             stream_mask, positive_points, n_neg, rng_seed,
             imagery_extent=imagery_extent,
@@ -353,6 +366,70 @@ def build_training_dataset(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _load_tulvaalue_points(
+    hydro_path: str,
+    imagery_extent,
+    n: int,
+    rng_seed: int = 42,
+) -> list[tuple[Point, str]]:
+    """
+    Sample n chip centres from tulvaalue (flooded area) polygons in the
+    hydrography data that overlap the imagery extent.  Returns
+    [(Point_epsg3067, "flood"), ...].
+    """
+    import fiona
+    import geopandas as gpd
+    import pandas as pd
+    from masking import _resolve_files
+
+    bbox = imagery_extent.bounds
+    gdfs: list[gpd.GeoDataFrame] = []
+    for f in _resolve_files(hydro_path):
+        try:
+            layers = fiona.listlayers(str(f))
+        except Exception:
+            continue
+        if "tulvaalue" not in layers:
+            continue
+        gdf = gpd.read_file(str(f), layer="tulvaalue", bbox=bbox)
+        if len(gdf) == 0:
+            continue
+        if gdf.crs is not None and gdf.crs.to_epsg() != 3067:
+            gdf = gdf.to_crs(epsg=3067)
+        gdfs.append(gdf[["geometry"]])
+
+    if not gdfs:
+        print("  WARNING: No tulvaalue features found in hydrography data "
+              "— no auto-flood chips extracted")
+        return []
+
+    combined = (
+        gpd.GeoDataFrame(pd.concat(gdfs, ignore_index=True), crs=gdfs[0].crs)
+        if len(gdfs) > 1 else gdfs[0]
+    )
+    polys = [g for g in combined.geometry if g is not None and g.is_valid and not g.is_empty]
+    if not polys:
+        return []
+
+    rng = random.Random(rng_seed)
+    areas = [p.area for p in polys]
+    points: list[tuple[Point, str]] = []
+
+    for _ in range(n * 200):
+        if len(points) >= n:
+            break
+        poly = rng.choices(polys, weights=areas)[0]
+        minx, miny, maxx, maxy = poly.bounds
+        candidate = Point(rng.uniform(minx, maxx), rng.uniform(miny, maxy))
+        if not poly.contains(candidate):
+            continue
+        if not imagery_extent.contains(candidate):
+            continue
+        points.append((candidate, "flood"))
+
+    return points
+
 
 def _warn_skipped(
     all_labeled: list[tuple[Point, str]],

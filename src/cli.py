@@ -91,6 +91,7 @@ def cmd_train(args: argparse.Namespace) -> None:
             kml_paths=kml_files,
             out_dir=chip_dir,
             hydro_path=args.hydro,
+            hydro_flood_samples=args.flood_samples,
             augment_positives=args.augment_positives,
         )
 
@@ -316,6 +317,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--augment-positives", type=int, default=6, dest="augment_positives",
                          help="Extra offset chips per positive label point (default 6). "
                               "Set to 0 to disable augmentation.")
+    p_train.add_argument("--flood-samples", type=int, default=0, dest="flood_samples",
+                         help="Auto-extract this many flood chips from the tulvaalue layer "
+                              "in --hydro data (default 0). Requires --hydro.")
 
     # -- cnn-train --
     p_cnn = sub.add_parser("cnn-train", help="Train the CNN classifier (Prithvi head)")
@@ -371,6 +375,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+
+    # Validate train flags
+    if args.command == "train":
+        if getattr(args, "flood_samples", 0) > 0 and not args.hydro:
+            parser.error("--flood-samples requires --hydro")
 
     # Validate model paths for detect command
     if args.command == "detect":

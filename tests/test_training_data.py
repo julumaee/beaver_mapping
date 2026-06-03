@@ -75,6 +75,17 @@ def _write_raster(tmp_path: Path, cx: float, cy: float, size: int = 2048) -> str
     return str(p)
 
 
+def _write_tulvaalue_gpkg(tmp_path: Path, cx: float, cy: float, size: float = 500.0) -> str:
+    """Write a minimal GPKG with one tulvaalue polygon centred at (cx, cy)."""
+    gpd = pytest.importorskip("geopandas")
+    from shapely.geometry import box as _box
+    poly = _box(cx - size, cy - size, cx + size, cy + size)
+    gdf = gpd.GeoDataFrame({"geometry": [poly]}, crs="EPSG:3067")
+    p = tmp_path / "hydro.gpkg"
+    gdf.to_file(str(p), layer="tulvaalue", driver="GPKG")
+    return str(p)
+
+
 def _write_folder_kml(tmp_path: Path, folder_name: str, lon=_LON, lat=_LAT,
                       placemark_name: str = "Placemark 1") -> str:
     text = (
@@ -312,3 +323,32 @@ class TestBuildTrainingDataset:
             rows = list(csv.DictReader(f))
         neg_rows = [r for r in rows if int(r["label"]) == 0]
         assert len(neg_rows) == 3
+
+    def test_tulvaalue_chips_extracted_as_flood(self, tmp_path):
+        cx, cy = 328_000.0, 6_821_000.0
+        jp2 = _write_raster(tmp_path, cx, cy, size=2048)
+        lon, lat = _TO_WGS84.transform(cx, cy)
+        kml = _write_kml(tmp_path, lon=lon, lat=lat, name="dead_forest")
+        gpkg = _write_tulvaalue_gpkg(tmp_path, cx, cy, size=400.0)
+        manifest = build_training_dataset(
+            [jp2], [kml], None, str(tmp_path / "ds"),
+            n_negatives=0, hydro_path=gpkg, hydro_flood_samples=5,
+        )
+        with open(manifest) as f:
+            rows = list(csv.DictReader(f))
+        flood_rows = [r for r in rows if r["feature_type"] == "flood" and int(r["label"]) == 1]
+        assert len(flood_rows) > 0
+
+    def test_tulvaalue_zero_samples_skipped(self, tmp_path):
+        cx, cy = 328_000.0, 6_821_000.0
+        jp2 = _write_raster(tmp_path, cx, cy, size=2048)
+        lon, lat = _TO_WGS84.transform(cx, cy)
+        kml = _write_kml(tmp_path, lon=lon, lat=lat, name="dead_forest")
+        gpkg = _write_tulvaalue_gpkg(tmp_path, cx, cy)
+        manifest = build_training_dataset(
+            [jp2], [kml], None, str(tmp_path / "ds"),
+            n_negatives=0, hydro_path=gpkg, hydro_flood_samples=0,
+        )
+        with open(manifest) as f:
+            rows = list(csv.DictReader(f))
+        assert not any(r["feature_type"] == "flood" for r in rows)
