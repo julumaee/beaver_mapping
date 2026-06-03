@@ -34,10 +34,14 @@ _SETTINGS_PATH = Path(__file__).parent.parent / "data" / "settings.json"
 _SETTINGS_KEYS = [
     "rf_imagery", "rf_labels", "rf_model", "rf_hydro", "rf_chips",
     "cnn_imagery", "cnn_labels", "cnn_model", "cnn_norm_stats", "cnn_hydro",
+    "cnn_epochs", "cnn_lr",
     "det_imagery", "det_output", "det_rf_model", "det_cnn_model",
     "det_norm_stats", "det_hydro",
+    "det_method", "det_threshold",
     "ev_manifest", "ev_rf_model",
+    "ev_radius", "ev_per_class",
     "cmp_manifest", "cmp_rf_model", "cmp_cnn_model", "cmp_norm_stats",
+    "cmp_test_frac",
     "diag_imagery", "diag_rf_model",
     "ov_imagery", "ov_labels", "ov_models_dir", "ov_chips",
     "map_kml", "map_labels", "map_hydro",
@@ -1220,8 +1224,8 @@ with gr.Blocks(title="CastorDetector") as demo:
             with gr.Row():
                 cnn_hydro = gr.Textbox(label="Hydrography directory (optional)", placeholder="data/hydrography/",         value=_s.get("cnn_hydro",      ""))
             with gr.Row():
-                cnn_epochs = gr.Number(value=30,    label="Epochs",        precision=0)
-                cnn_lr     = gr.Number(value=0.001, label="Learning rate")
+                cnn_epochs = gr.Number(value=int(_s.get("cnn_epochs", 30)),       label="Epochs",        precision=0)
+                cnn_lr     = gr.Number(value=float(_s.get("cnn_lr", 0.001)), label="Learning rate")
             with gr.Row():
                 cnn_btn  = gr.Button("Train CNN", variant="primary")
                 cnn_stop = gr.Button("Stop", variant="stop")
@@ -1244,14 +1248,14 @@ with gr.Blocks(title="CastorDetector") as demo:
                 det_imagery = gr.Textbox(label="Imagery directory or .jp2 file", placeholder="data/imagery/",             value=_s.get("det_imagery",    ""))
                 det_output  = gr.Textbox(label="Output KML path",   placeholder="data/output/detections.kml", value=_s.get("det_output",     ""))
             with gr.Row():
-                det_method = gr.Dropdown(choices=["rf", "cnn", "both"], value="rf", label="Method")
+                det_method = gr.Dropdown(choices=["rf", "cnn", "both"], value=_s.get("det_method", "rf"), label="Method")
                 det_hydro  = gr.Textbox(label="Hydrography directory (optional)", placeholder="data/hydrography/", value=_s.get("det_hydro", ""))
             with gr.Row():
                 det_rf_model  = gr.Textbox(label="RF model path (.pkl)",  placeholder="data/models/model.pkl",         value=_s.get("det_rf_model",  ""))
                 det_cnn_model = gr.Textbox(label="CNN model path (.pth)", placeholder="data/models/beaver_cnn_v1.pth", value=_s.get("det_cnn_model", ""))
             with gr.Row():
                 det_norm_stats = gr.Textbox(label="Norm stats path (.json)", placeholder="data/models/norm_stats.json", value=_s.get("det_norm_stats", ""))
-                det_threshold  = gr.Slider(minimum=0.0, maximum=1.0, value=0.5, step=0.05,
+                det_threshold  = gr.Slider(minimum=0.0, maximum=1.0, value=float(_s.get("det_threshold", 0.5)), step=0.05,
                                            label="Confidence threshold")
             with gr.Row():
                 det_btn  = gr.Button("Detect & Export KML", variant="primary")
@@ -1275,9 +1279,9 @@ with gr.Blocks(title="CastorDetector") as demo:
                 ev_manifest  = gr.Textbox(label="Manifest CSV path",   placeholder="data/chips/manifest.csv",  value=_s.get("ev_manifest", ""))
                 ev_rf_model  = gr.Textbox(label="RF model path (.pkl)", placeholder="data/models/model.pkl",   value=_s.get("ev_rf_model", ""))
             with gr.Row():
-                ev_radius    = gr.Slider(minimum=100, maximum=2000, value=500, step=50,
+                ev_radius    = gr.Slider(minimum=100, maximum=2000, value=float(_s.get("ev_radius", 500)), step=50,
                                          label="Cluster radius (metres)")
-                ev_per_class = gr.Checkbox(label="Per-class breakdown (wet_forest / beaver_flood)", value=False)
+                ev_per_class = gr.Checkbox(label="Per-class breakdown (wet_forest / beaver_flood)", value=bool(_s.get("ev_per_class", False)))
             with gr.Row():
                 ev_btn  = gr.Button("Evaluate RF", variant="primary")
                 ev_stop = gr.Button("Stop", variant="stop")
@@ -1304,7 +1308,7 @@ with gr.Blocks(title="CastorDetector") as demo:
             with gr.Row():
                 cmp_cnn_model  = gr.Textbox(label="CNN model path (.pth)",   placeholder="data/models/beaver_cnn_v1.pth", value=_s.get("cmp_cnn_model",  ""))
                 cmp_norm_stats = gr.Textbox(label="Norm stats path (.json)", placeholder="data/models/norm_stats.json",   value=_s.get("cmp_norm_stats", ""))
-            cmp_test_frac = gr.Slider(minimum=0.1, maximum=0.5, value=0.2, step=0.05,
+            cmp_test_frac = gr.Slider(minimum=0.1, maximum=0.5, value=float(_s.get("cmp_test_frac", 0.2)), step=0.05,
                                       label="Test fraction")
             with gr.Row():
                 cmp_btn  = gr.Button("Evaluate", variant="primary")
@@ -1436,10 +1440,14 @@ with gr.Blocks(title="CastorDetector") as demo:
         inputs=[
             rf_imagery, rf_labels, rf_model, rf_hydro, rf_chips,
             cnn_imagery, cnn_labels, cnn_model, cnn_norm_stats, cnn_hydro,
+            cnn_epochs, cnn_lr,
             det_imagery, det_output, det_rf_model, det_cnn_model,
             det_norm_stats, det_hydro,
+            det_method, det_threshold,
             ev_manifest, ev_rf_model,
+            ev_radius, ev_per_class,
             cmp_manifest, cmp_rf_model, cmp_cnn_model, cmp_norm_stats,
+            cmp_test_frac,
             diag_imagery, diag_rf_model,
             ov_imagery, ov_labels, ov_models_dir, ov_chips,
             map_kml, map_labels, map_hydro,
