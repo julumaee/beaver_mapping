@@ -37,7 +37,7 @@ _KML_NS = "http://www.opengis.net/kml/2.2"
 _WGS84_TO_ETRS = Transformer.from_crs(4326, 3067, always_xy=True)
 
 # Feature types excluded from training by default.
-DEFAULT_EXCLUDE: frozenset[str] = frozenset({"lodge", "dam"})
+DEFAULT_EXCLUDE: frozenset[str] = frozenset({"lodge", "dam", "other"})
 
 # Maps KML feature type names to integer class labels:
 #   0 = negative (no beaver activity)
