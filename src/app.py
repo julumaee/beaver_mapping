@@ -808,6 +808,36 @@ def _build_map(
     return f'<div style="height:580px">{m._repr_html_()}</div>'
 
 
+def handle_export_filtered_kml(kml_path: str, threshold: float):
+    """Re-write the detections KML keeping only placemarks above the confidence threshold."""
+    import re
+    kml_path = (kml_path or "").strip()
+    if not kml_path or not Path(kml_path).exists():
+        return None
+    try:
+        tree = ET.parse(kml_path)
+        root = tree.getroot()
+        ns = _MAP_NS
+        for parent in list(root.iter()):
+            to_remove = []
+            for child in parent:
+                if child.tag != f"{{{ns}}}Placemark":
+                    continue
+                desc = child.findtext(f"{{{ns}}}description") or ""
+                m = re.search(r"Confidence:\s*([\d.]+)", desc)
+                if m and float(m.group(1)) < threshold:
+                    to_remove.append(child)
+            for child in to_remove:
+                parent.remove(child)
+        src = Path(kml_path)
+        out_path = src.parent / f"{src.stem}_conf{threshold:.2f}.kml"
+        ET.register_namespace("", ns)
+        tree.write(str(out_path), xml_declaration=True, encoding="utf-8")
+        return str(out_path)
+    except Exception:
+        return None
+
+
 def handle_load_map(
     kml_path: str,
     labels_dir: str,
@@ -1537,6 +1567,14 @@ with gr.Blocks(title="CastorDetector") as demo:
             map_diagnose_btn = gr.Button(
                 "Diagnose selected point (click map first)", variant="secondary"
             )
+            gr.Markdown("### Export filtered detections")
+            with gr.Row():
+                map_filter_threshold = gr.Slider(
+                    minimum=0.0, maximum=1.0, value=0.75, step=0.05,
+                    label="Minimum confidence to keep",
+                )
+                map_export_btn = gr.Button("Export filtered KML", variant="secondary", scale=0)
+            map_export_file = gr.File(label="Filtered KML download", interactive=False)
             map_btn.click(
                 fn=handle_load_map,
                 inputs=[map_kml, map_labels, map_hydro, map_basemap,
@@ -1549,6 +1587,11 @@ with gr.Blocks(title="CastorDetector") as demo:
                 inputs=[],
                 outputs=[diag_lon, diag_lat],
                 js="() => [window._mapClickLon ?? 25.0, window._mapClickLat ?? 62.0]",
+            )
+            map_export_btn.click(
+                fn=handle_export_filtered_kml,
+                inputs=[map_kml, map_filter_threshold],
+                outputs=[map_export_file],
             )
 
     # Wire detect button here so map_kml is in scope
