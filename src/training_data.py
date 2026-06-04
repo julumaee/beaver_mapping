@@ -415,7 +415,12 @@ def _load_tulvaalue_points(
     )
     polys = [g for g in combined.geometry if g is not None and g.is_valid and not g.is_empty]
     if not polys:
+        print("  WARNING: tulvaalue layer found but contains no valid polygons")
         return []
+
+    total_area_ha = sum(p.area for p in polys) / 10_000
+    print(f"  tulvaalue: {len(polys)} flood polygon(s), "
+          f"{total_area_ha:.1f} ha within imagery extent — sampling {n} chip centres ...")
 
     rng = random.Random(rng_seed)
     areas = [p.area for p in polys]
@@ -433,6 +438,9 @@ def _load_tulvaalue_points(
             continue
         points.append((candidate, "flood"))
 
+    if len(points) < n:
+        print(f"  WARNING: Only sampled {len(points)}/{n} tulvaalue points "
+              f"— flood polygons may be small or sparse within imagery")
     return points
 
 
