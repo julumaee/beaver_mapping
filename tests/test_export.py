@@ -77,11 +77,11 @@ class TestExportKML:
 class TestConfidenceTier:
     def test_high(self):
         assert _confidence_tier(0.9) == "high"
-        assert _confidence_tier(0.8) == "high"
+        assert _confidence_tier(0.85) == "high"
 
     def test_medium(self):
-        assert _confidence_tier(0.79) == "medium"
-        assert _confidence_tier(0.6) == "medium"
+        assert _confidence_tier(0.84) == "medium"
+        assert _confidence_tier(0.75) == "medium"
 
     def test_low(self):
-        assert _confidence_tier(0.59) == "low"
+        assert _confidence_tier(0.74) == "low"

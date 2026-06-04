@@ -11,6 +11,7 @@ def _ensure_dependencies() -> None:
 
 _ensure_dependencies()
 
+import argparse
 import csv
 import json
 import queue
@@ -159,6 +160,9 @@ def _stream(fn, *args, **kwargs):
         sys.stdout = _QueueWriter(q)
         try:
             fn(*args, **kwargs)
+        except SystemExit as exc:
+            if exc.code:
+                q.put(f"ERROR: {exc.code}\n")
         except Exception as exc:
             q.put(f"ERROR: {exc}\n")
         finally:
@@ -187,54 +191,16 @@ def _do_train_rf(
     chip_dir: str,
     augment: int,
 ) -> None:
-    from training_data import build_training_dataset
-    from models.random_forest import train
-
-    jp2_files = _find_files(imagery_dir, ".jp2")
-    kml_files = _find_files(labels_dir, ".kml") + _find_files(labels_dir, ".kmz")
-
-    if not jp2_files:
-        raise ValueError(f"No .jp2 files found in {imagery_dir!r}")
-    if not kml_files:
-        raise ValueError(f"No KML/KMZ files found in {labels_dir!r}")
-
-    chip_ctx = _NullContext(chip_dir) if chip_dir else tempfile.TemporaryDirectory()
-    with chip_ctx as cd:
-        print("Extracting training chips ...")
-        manifest = build_training_dataset(
-            jp2_paths=jp2_files,
-            kml_paths=kml_files,
-            out_dir=cd,
-            hydro_path=hydro_dir if hydro_dir else None,
-            augment_positives=augment,
-        )
-        with open(manifest) as f:
-            rows = list(csv.DictReader(f))
-        flood = [r for r in rows if int(r["label"]) == 1]
-        neg   = [r for r in rows if int(r["label"]) == 0]
-        by_type: dict[str, int] = {}
-        for r in flood:
-            ft = r.get("feature_type", "unknown")
-            by_type[ft] = by_type.get(ft, 0) + 1
-        print(f"  Flood chips    : {len(flood)}")
-        for ftype, count in sorted(by_type.items()):
-            print(f"    {ftype}: {count}")
-        print(f"  Negative chips : {len(neg)}")
-
-        if not flood:
-            raise ValueError(
-                "No positive chips extracted. "
-                "Check that your imagery tiles cover the labelled feature locations."
-            )
-        if len(flood) < 20:
-            print(f"\nWARNING: Only {len(flood)} positive chips — model may be unreliable.")
-
-        print("Training Random Forest ...")
-        train(manifest, model_path)
-
-    print(f"Model saved to {model_path}")
-    if chip_dir:
-        print(f"Chips and manifest saved to {chip_dir}/")
+    from cli import cmd_train
+    cmd_train(argparse.Namespace(
+        imagery=imagery_dir,
+        labels=labels_dir,
+        model=model_path,
+        hydro=hydro_dir or None,
+        chip_dir=chip_dir or None,
+        augment_positives=augment,
+        flood_samples=0,
+    ))
 
 
 def handle_train_rf(
@@ -273,42 +239,16 @@ def _do_train_cnn(
     epochs: int,
     lr: float,
 ) -> None:
-    from training_data import build_training_dataset
-    from models.cnn_train import train_cnn
-
-    jp2_files = _find_files(imagery_dir, ".jp2")
-    kml_files = _find_files(labels_dir, ".kml") + _find_files(labels_dir, ".kmz")
-
-    if not jp2_files:
-        raise ValueError(f"No .jp2 files found in {imagery_dir!r}")
-    if not kml_files:
-        raise ValueError(f"No KML/KMZ files found in {labels_dir!r}")
-
-    stream_mask = None
-    if hydro_dir:
-        from masking import build_stream_mask
-        print(f"Building stream mask from {hydro_dir} ...")
-        stream_mask = build_stream_mask(hydro_dir)
-
-    with tempfile.TemporaryDirectory() as cd:
-        print("Extracting training chips ...")
-        manifest = build_training_dataset(
-            jp2_paths=jp2_files,
-            kml_paths=kml_files,
-            stream_mask=stream_mask,
-            out_dir=cd,
-        )
-        print(f"Training CNN (epochs={epochs}, lr={lr}) ...")
-        train_cnn(
-            manifest_path=manifest,
-            model_path=model_path,
-            norm_stats_path=norm_stats_path,
-            epochs=epochs,
-            lr=lr,
-        )
-
-    print(f"CNN model saved to {model_path}")
-    print(f"Norm stats  saved to {norm_stats_path}")
+    from cli import cmd_cnn_train
+    cmd_cnn_train(argparse.Namespace(
+        imagery=imagery_dir,
+        labels=labels_dir,
+        model=model_path,
+        norm_stats=norm_stats_path,
+        hydro=hydro_dir or None,
+        epochs=epochs,
+        lr=lr,
+    ))
 
 
 def handle_train_cnn(
@@ -351,70 +291,17 @@ def _do_detect(
     threshold: float,
     output_path: str,
 ) -> None:
-    from polygonizer import detect_rois_rf_segmentation, detect_rois_cnn
-    from export import export_kml
-
-    jp2_files = _find_files(imagery_dir, ".jp2")
-    if not jp2_files:
-        raise ValueError(f"No .jp2 files found in {imagery_dir!r}")
-
-    stream_mask = None
-    if hydro_dir:
-        from masking import build_stream_mask
-        print(f"Building stream mask from {hydro_dir} ...")
-        stream_mask = build_stream_mask(hydro_dir)
-
-    rf_clf = cnn_model = norm_stats = None
-
-    if method in ("rf", "both"):
-        from models.random_forest import load_model as load_rf
-        print(f"Loading RF model from {rf_model_path} ...")
-        rf_clf = load_rf(rf_model_path)
-
-    if method in ("cnn", "both"):
-        import json
-        from models.cnn_handler import load_cnn
-        cnn_model = load_cnn(cnn_model_path)
-        with open(norm_stats_path) as f:
-            norm_stats = json.load(f)
-
-    all_rois: list = []
-
-    for jp2_path in jp2_files:
-        print(f"Processing {jp2_path} ...")
-        if method == "rf":
-            rois = detect_rois_rf_segmentation(jp2_path, rf_clf, stream_mask, threshold)
-            print(f"  RF detections: {len(rois)}")
-            all_rois.extend(rois)
-        elif method == "cnn":
-            rois = detect_rois_cnn(jp2_path, cnn_model, norm_stats, stream_mask, threshold)
-            print(f"  CNN detections: {len(rois)}")
-            all_rois.extend(rois)
-        elif method == "both":
-            rf_rois  = detect_rois_rf_segmentation(jp2_path, rf_clf, stream_mask, threshold)
-            cnn_rois = detect_rois_cnn(jp2_path, cnn_model, norm_stats, stream_mask, threshold)
-            print(f"  RF: {len(rf_rois)}  CNN: {len(cnn_rois)}")
-            tagged: list = []
-            matched: set[int] = set()
-            for rf_p, rf_c, rf_a in rf_rois:
-                found = False
-                for j, (cnn_p, cnn_c, cnn_a) in enumerate(cnn_rois):
-                    if rf_p.intersects(cnn_p):
-                        merged = rf_p.union(cnn_p)
-                        tagged.append((merged, max(rf_c, cnn_c), merged.area, "both"))
-                        matched.add(j)
-                        found = True
-                        break
-                if not found:
-                    tagged.append((rf_p, rf_c, rf_a, "rf"))
-            for j, (cnn_p, cnn_c, cnn_a) in enumerate(cnn_rois):
-                if j not in matched:
-                    tagged.append((cnn_p, cnn_c, cnn_a, "cnn"))
-            all_rois.extend(tagged)
-
-    print(f"Exporting {len(all_rois)} detection(s) to {output_path} ...")
-    export_kml(all_rois, output_path)
-    print("Done.")
+    from cli import cmd_detect
+    cmd_detect(argparse.Namespace(
+        imagery=imagery_dir,
+        method=method,
+        rf_model=rf_model_path or None,
+        cnn_model=cnn_model_path or None,
+        norm_stats=norm_stats_path or None,
+        hydro=hydro_dir or None,
+        threshold=threshold,
+        output=output_path,
+    ))
 
 
 def handle_detect(
@@ -875,20 +762,13 @@ def _do_evaluate_rf(
     cluster_radius: float,
     per_class: bool,
 ) -> None:
-    if per_class:
-        from models.evaluate import evaluate_rf_per_class
-        evaluate_rf_per_class(
-            manifest_path=manifest_path,
-            rf_model_path=rf_model_path,
-            cluster_radius=cluster_radius,
-        )
-    else:
-        from models.evaluate import evaluate_rf_spatial
-        evaluate_rf_spatial(
-            manifest_path=manifest_path,
-            rf_model_path=rf_model_path,
-            cluster_radius=cluster_radius,
-        )
+    from cli import cmd_evaluate_rf
+    cmd_evaluate_rf(argparse.Namespace(
+        manifest=manifest_path,
+        rf_model=rf_model_path,
+        cluster_radius=cluster_radius,
+        per_class=per_class,
+    ))
 
 
 def _confusion_matrix_image(manifest_path: str, rf_model_path: str):
@@ -1243,14 +1123,14 @@ def _do_evaluate_compare(
     norm_stats_path: str,
     test_fraction: float,
 ) -> None:
-    from models.evaluate import evaluate_models
-    evaluate_models(
-        manifest_path=manifest_path,
-        rf_model_path=rf_model_path,
-        cnn_model_path=cnn_model_path,
-        norm_stats_path=norm_stats_path,
+    from cli import cmd_evaluate
+    cmd_evaluate(argparse.Namespace(
+        manifest=manifest_path,
+        rf_model=rf_model_path,
+        cnn_model=cnn_model_path,
+        norm_stats=norm_stats_path,
         test_fraction=test_fraction,
-    )
+    ))
 
 
 def handle_evaluate_compare(
