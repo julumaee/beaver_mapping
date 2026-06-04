@@ -170,34 +170,36 @@ def _do_train_rf(
     if not kml_files:
         raise ValueError(f"No KML/KMZ files found in {labels_dir!r}")
 
-    stream_mask = None
-    if hydro_dir:
-        from masking import build_stream_mask
-        print(f"Building stream mask from {hydro_dir} ...")
-        stream_mask = build_stream_mask(hydro_dir)
-
     chip_ctx = _NullContext(chip_dir) if chip_dir else tempfile.TemporaryDirectory()
     with chip_ctx as cd:
         print("Extracting training chips ...")
         manifest = build_training_dataset(
             jp2_paths=jp2_files,
             kml_paths=kml_files,
-            stream_mask=stream_mask,
             out_dir=cd,
+            hydro_path=hydro_dir if hydro_dir else None,
             augment_positives=augment,
         )
         with open(manifest) as f:
             rows = list(csv.DictReader(f))
         flood = [r for r in rows if int(r["label"]) == 1]
         neg   = [r for r in rows if int(r["label"]) == 0]
-        print(f"  Flood chips   : {len(flood)}")
-        print(f"  Negative chips: {len(neg)}")
+        by_type: dict[str, int] = {}
+        for r in flood:
+            ft = r.get("feature_type", "unknown")
+            by_type[ft] = by_type.get(ft, 0) + 1
+        print(f"  Flood chips    : {len(flood)}")
+        for ftype, count in sorted(by_type.items()):
+            print(f"    {ftype}: {count}")
+        print(f"  Negative chips : {len(neg)}")
 
         if not flood:
             raise ValueError(
                 "No positive chips extracted. "
                 "Check that your imagery tiles cover the labelled feature locations."
             )
+        if len(flood) < 20:
+            print(f"\nWARNING: Only {len(flood)} positive chips — model may be unreliable.")
 
         print("Training Random Forest ...")
         train(manifest, model_path)
