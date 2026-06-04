@@ -467,25 +467,39 @@ def _sample_negatives_per_tile(
     n_total: int,
     rng_seed: int,
 ) -> list[Point]:
-    """Sample negatives per JP2 tile using a bbox-scoped stream mask each time."""
+    """Sample negatives using one stream mask scoped to the union of all tile bboxes.
+
+    Building one mask (not one per tile) avoids N_tiles × N_files file opens
+    while still avoiding the global 2.3M-feature load — the union bbox is
+    much smaller than the full hydrography extent.
+    """
     from shapely.geometry import box as _box
     from masking import build_stream_mask, BUFFER_METERS
+
+    # Compute union bbox of all tiles in one pass.
+    minx = miny = float("inf")
+    maxx = maxy = float("-inf")
+    tile_extents = []
+    for jp2_path in jp2_paths:
+        with rasterio.open(jp2_path) as src:
+            b = src.bounds
+        minx, miny = min(minx, b.left),  min(miny, b.bottom)
+        maxx, maxy = max(maxx, b.right), max(maxy, b.top)
+        tile_extents.append(_box(b.left, b.bottom, b.right, b.top))
+
+    union_bbox = (minx - BUFFER_METERS, miny - BUFFER_METERS,
+                  maxx + BUFFER_METERS, maxy + BUFFER_METERS)
+    union_mask = build_stream_mask(hydro_path, bbox=union_bbox)
+    if union_mask.is_empty:
+        return []
 
     n_tiles = len(jp2_paths)
     n_per_tile = max(1, (n_total + n_tiles - 1) // n_tiles)
 
     all_negatives: list[Point] = []
-    for i, jp2_path in enumerate(jp2_paths):
-        with rasterio.open(jp2_path) as src:
-            b = src.bounds
-        bbox = (b.left - BUFFER_METERS, b.bottom - BUFFER_METERS,
-                b.right + BUFFER_METERS, b.top + BUFFER_METERS)
-        tile_mask = build_stream_mask(hydro_path, bbox=bbox)
-        if tile_mask.is_empty:
-            continue
-        tile_extent = _box(b.left, b.bottom, b.right, b.top)
+    for i, tile_extent in enumerate(tile_extents):
         negs = sample_negatives(
-            tile_mask, positive_points, n_per_tile,
+            union_mask, positive_points, n_per_tile,
             rng_seed=rng_seed + i,
             imagery_extent=tile_extent,
         )
