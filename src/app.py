@@ -929,12 +929,31 @@ def _colormap_image(data: np.ndarray, cmap: str, vmin: float, vmax: float) -> np
     return (rgba[:, :, :3] * 255).astype(np.uint8)
 
 
+def _probability_heatmap(chip: np.ndarray, clf) -> np.ndarray:
+    """Sliding-window RF probability map: divide chip into 32×32 patches, predict each."""
+    import cv2
+    from spectral import extract_features
+    patch = 32
+    h, w = chip.shape[1], chip.shape[2]
+    rows_n, cols_n = h // patch, w // patch
+    probs = np.zeros((rows_n, cols_n), dtype=np.float32)
+    classes = list(clf.classes_)
+    pos_idx = classes.index(1) if 1 in classes else 0
+    for r in range(rows_n):
+        for c in range(cols_n):
+            sub = chip[:, r * patch:(r + 1) * patch, c * patch:(c + 1) * patch]
+            feats = extract_features(sub).reshape(1, -1)
+            probs[r, c] = clf.predict_proba(feats)[0][pos_idx]
+    prob_map = cv2.resize(probs, (w, h), interpolation=cv2.INTER_LINEAR)
+    return _colormap_image(prob_map, "hot", vmin=0, vmax=1)
+
+
 def _do_diagnose(
     lon: float,
     lat: float,
     imagery_dir: str,
     rf_model_path: str,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     from pyproj import Transformer
     from diagnose_point import find_covering_jp2, extract_chip_at
     from spectral import compute_ndwi, compute_ndvi, extract_features
@@ -969,9 +988,10 @@ def _do_diagnose(
         print(f"  {cls_name}: {prob:.3f}")
 
     chip_img = _chip_to_image(chip)
-    ndwi_img = _colormap_image(compute_ndwi(chip), "RdBu",    vmin=-1, vmax=1)
-    ndvi_img = _colormap_image(compute_ndvi(chip), "RdYlGn",  vmin=-1, vmax=1)
-    return chip_img, ndwi_img, ndvi_img
+    ndwi_img = _colormap_image(compute_ndwi(chip), "RdBu",   vmin=-1, vmax=1)
+    ndvi_img = _colormap_image(compute_ndvi(chip), "RdYlGn", vmin=-1, vmax=1)
+    prob_img = _probability_heatmap(chip, clf)
+    return chip_img, ndwi_img, ndvi_img, prob_img
 
 
 def handle_diagnose(
@@ -982,16 +1002,16 @@ def handle_diagnose(
 ):
     import io as _io
     if not imagery_dir or not imagery_dir.strip():
-        return None, None, None, "ERROR: Imagery directory or .jp2 file is required."
+        return None, None, None, None, "ERROR: Imagery directory or .jp2 file is required."
     if not rf_model_path or not rf_model_path.strip():
-        return None, None, None, "ERROR: RF model path is required."
+        return None, None, None, None, "ERROR: RF model path is required."
     buf = _io.StringIO()
     old = sys.stdout
     sys.stdout = buf
-    chip_img = ndwi_img = ndvi_img = None
+    chip_img = ndwi_img = ndvi_img = prob_img = None
     error: str = ""
     try:
-        chip_img, ndwi_img, ndvi_img = _do_diagnose(
+        chip_img, ndwi_img, ndvi_img, prob_img = _do_diagnose(
             float(lon), float(lat),
             imagery_dir.strip(), rf_model_path.strip(),
         )
@@ -1002,7 +1022,7 @@ def handle_diagnose(
     log = buf.getvalue() or ""
     if error:
         log += f"\nERROR: {error}"
-    return chip_img, ndwi_img, ndvi_img, log or "No output."
+    return chip_img, ndwi_img, ndvi_img, prob_img, log or "No output."
 
 
 def _do_overview(
@@ -1453,11 +1473,12 @@ with gr.Blocks(title="CastorDetector") as demo:
                 diag_chip = gr.Image(label="CIR chip (NIR=R, Red=G, Green=B)", type="numpy")
                 diag_ndwi = gr.Image(label="NDWI  (blue=water, red=dry)",       type="numpy")
                 diag_ndvi = gr.Image(label="NDVI  (green=veg, red=bare)",        type="numpy")
+                diag_prob = gr.Image(label="RF probability map (bright=flood)",  type="numpy")
             diag_log = gr.Textbox(label="Prediction & band stats", lines=12, interactive=False)
             diag_btn.click(
                 fn=handle_diagnose,
                 inputs=[diag_lon, diag_lat, diag_imagery, diag_rf_model],
-                outputs=[diag_chip, diag_ndwi, diag_ndvi, diag_log],
+                outputs=[diag_chip, diag_ndwi, diag_ndvi, diag_prob, diag_log],
             )
 
         # ------------------------------------------------------------------ #
