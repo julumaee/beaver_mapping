@@ -92,6 +92,7 @@ def cmd_train(args: argparse.Namespace) -> None:
             out_dir=chip_dir,
             hydro_path=args.hydro,
             hydro_flood_samples=args.flood_samples,
+            hydro_negatives=not args.no_hydro_negatives,
             augment_positives=args.augment_positives,
         )
 
@@ -320,6 +321,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--flood-samples", type=int, default=0, dest="flood_samples",
                          help="Auto-extract this many flood chips from the tulvaalue layer "
                               "in --hydro data (default 0). Requires --hydro.")
+    p_train.add_argument("--no-hydro-negatives", action="store_true", dest="no_hydro_negatives",
+                         help="Sample auto-negatives from the full imagery extent instead of "
+                              "the stream corridor. Useful when --hydro is only needed for "
+                              "--flood-samples and you do not want stream-mask filtering.")
 
     # -- cnn-train --
     p_cnn = sub.add_parser("cnn-train", help="Train the CNN classifier (Prithvi head)")

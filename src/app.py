@@ -33,7 +33,8 @@ import gradio as gr
 _SETTINGS_PATH = Path(__file__).parent.parent / "data" / "settings.json"
 
 _SETTINGS_KEYS = [
-    "rf_imagery", "rf_labels", "rf_model", "rf_hydro", "rf_chips", "rf_flood_samples",
+    "rf_imagery", "rf_labels", "rf_model", "rf_hydro", "rf_chips",
+    "rf_flood_samples", "rf_hydro_negatives",
     "cnn_imagery", "cnn_labels", "cnn_model", "cnn_norm_stats", "cnn_hydro",
     "cnn_epochs", "cnn_lr",
     "det_imagery", "det_output", "det_rf_model", "det_cnn_model",
@@ -191,6 +192,7 @@ def _do_train_rf(
     chip_dir: str,
     augment: int,
     flood_samples: int,
+    hydro_negatives: bool,
 ) -> None:
     from cli import cmd_train
     cmd_train(argparse.Namespace(
@@ -201,6 +203,7 @@ def _do_train_rf(
         chip_dir=chip_dir or None,
         augment_positives=augment,
         flood_samples=flood_samples,
+        no_hydro_negatives=not hydro_negatives,
     ))
 
 
@@ -212,6 +215,7 @@ def handle_train_rf(
     chip_dir: str,
     augment: float,
     flood_samples: float,
+    hydro_negatives: bool,
 ):
     if not imagery_dir or not imagery_dir.strip():
         yield "ERROR: Imagery directory or .jp2 file is required."; return
@@ -226,7 +230,7 @@ def handle_train_rf(
         imagery_dir.strip(), labels_dir.strip(), model_path.strip(),
         hydro_dir.strip() if hydro_dir else "",
         chip_dir.strip() if chip_dir else "",
-        int(augment), int(flood_samples),
+        int(augment), int(flood_samples), bool(hydro_negatives),
     )
 
 
@@ -1212,6 +1216,10 @@ with gr.Blocks(title="CastorDetector") as demo:
                     label="Flood samples from hydrography (tulvaalue, 0 = disabled)",
                     value=int(_s.get("rf_flood_samples", 0)), precision=0, minimum=0,
                 )
+                rf_hydro_negatives = gr.Checkbox(
+                    label="Restrict auto-negatives to stream corridor (requires hydrography)",
+                    value=bool(_s.get("rf_hydro_negatives", False)),
+                )
             with gr.Row():
                 rf_btn  = gr.Button("Train RF", variant="primary")
                 rf_stop = gr.Button("Stop", variant="stop")
@@ -1221,7 +1229,8 @@ with gr.Blocks(title="CastorDetector") as demo:
                 rf_history_text = gr.Textbox(label="", lines=10, interactive=False, show_label=False)
             rf_event = rf_btn.click(
                 fn=handle_train_rf,
-                inputs=[rf_imagery, rf_labels, rf_model, rf_hydro, rf_chips, rf_augment, rf_flood_samples],
+                inputs=[rf_imagery, rf_labels, rf_model, rf_hydro, rf_chips,
+                        rf_augment, rf_flood_samples, rf_hydro_negatives],
                 outputs=rf_log,
             )
 
@@ -1527,7 +1536,8 @@ with gr.Blocks(title="CastorDetector") as demo:
     save_btn.click(
         fn=handle_save_settings,
         inputs=[
-            rf_imagery, rf_labels, rf_model, rf_hydro, rf_chips, rf_flood_samples,
+            rf_imagery, rf_labels, rf_model, rf_hydro, rf_chips,
+            rf_flood_samples, rf_hydro_negatives,
             cnn_imagery, cnn_labels, cnn_model, cnn_norm_stats, cnn_hydro,
             cnn_epochs, cnn_lr,
             det_imagery, det_output, det_rf_model, det_cnn_model,

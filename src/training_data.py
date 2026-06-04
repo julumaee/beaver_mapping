@@ -291,18 +291,21 @@ def build_training_dataset(
     augment_max_offset: int = 24,
     hydro_path: str | None = None,
     hydro_flood_samples: int = 0,
+    hydro_negatives: bool = True,
 ) -> str:
     """
     Orchestrate the full training data pipeline and write a manifest CSV.
 
-    hydro_path: when given, negative samples are drawn using a per-tile stream
-                mask (same bbox-scoped loading as detect).  Avoids loading
-                millions of features globally when imagery spans many tiles.
-    hydro_flood_samples: number of extra positive chips to auto-extract from
-                the tulvaalue (flooded area) layer in hydro_path.  Requires
-                hydro_path to be set.
-    stream_mask: legacy — passed directly to sample_negatives.  Ignored when
-                 hydro_path is set.
+    hydro_path: path to hydrography data; used for tulvaalue extraction and/or
+                stream-mask negative sampling depending on the flags below.
+    hydro_flood_samples: number of positive chips to auto-extract from the
+                tulvaalue layer in hydro_path (0 = disabled).
+    hydro_negatives: when True (default) and hydro_path is set, auto-sampled
+                negatives are restricted to the stream corridor.  Set to False
+                to sample negatives from the full imagery extent instead —
+                useful when hydro_path is only needed for tulvaalue extraction.
+    stream_mask: legacy — passed directly to sample_negatives when hydro_path
+                 is not set.
     augment_positives: number of extra offset chips per positive label point.
     augment_max_offset: maximum pixel shift in each direction for augmentation.
     """
@@ -331,7 +334,7 @@ def build_training_dataset(
     positive_points = [pt for pt, _ in all_labeled]
     n_neg = n_negatives if n_negatives is not None else n_true_pos
 
-    if hydro_path is not None:
+    if hydro_path is not None and hydro_negatives:
         negative_points = _sample_negatives_per_tile(
             hydro_path, jp2_paths, positive_points, n_neg, rng_seed,
         )
