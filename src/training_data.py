@@ -44,14 +44,19 @@ DEFAULT_EXCLUDE: frozenset[str] = frozenset({"lodge", "dam"})
 #   1 = positive (any beaver-associated visual signature)
 # Unrecognised label names default to 1 so new types work without code changes.
 FEATURE_TO_LABEL: dict[str, int] = {
-    "negative":     0,
-    # Generic labels — can be placed anywhere in imagery, not just beaver sites:
-    "dead_forest":  1,  # standing dead trees killed by beaver flooding
-    "flood":        1,  # any open water impoundment
+    # Negative class — folder/placemark name variants all map to 0:
+    "negative":       0,
+    "negatives":      0,
+    "hard_negative":  0,
+    "hard_negatives": 0,
+    # Generic positive labels — place anywhere in imagery:
+    "dead_forest":    1,  # standing dead trees killed by beaver flooding
+    "flood":          1,  # any open water impoundment
+    "flooded_areas":  1,  # Google Earth folder name variant
     # Legacy / specific labels kept for backwards compatibility:
-    "wet_forest":   1,
-    "beaver_flood": 1,
-    "unknown":      1,
+    "wet_forest":     1,
+    "beaver_flood":   1,
+    "unknown":        1,
 }
 
 
