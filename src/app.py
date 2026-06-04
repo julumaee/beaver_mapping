@@ -34,10 +34,14 @@ _SETTINGS_PATH = Path(__file__).parent.parent / "data" / "settings.json"
 _SETTINGS_KEYS = [
     "rf_imagery", "rf_labels", "rf_model", "rf_hydro", "rf_chips",
     "cnn_imagery", "cnn_labels", "cnn_model", "cnn_norm_stats", "cnn_hydro",
+    "cnn_epochs", "cnn_lr",
     "det_imagery", "det_output", "det_rf_model", "det_cnn_model",
     "det_norm_stats", "det_hydro",
+    "det_method", "det_threshold",
     "ev_manifest", "ev_rf_model",
+    "ev_radius", "ev_per_class",
     "cmp_manifest", "cmp_rf_model", "cmp_cnn_model", "cmp_norm_stats",
+    "cmp_test_frac",
     "diag_imagery", "diag_rf_model",
     "ov_imagery", "ov_labels", "ov_models_dir", "ov_chips",
     "map_kml", "map_labels", "map_hydro",
@@ -70,6 +74,30 @@ def handle_save_settings(*values) -> str:
 
 
 _s = _load_settings()
+
+
+_MAX_LOG_HISTORY = 5
+
+
+def _append_log_history(log: str, history: list) -> tuple[list, str]:
+    """Prepend the completed run log to the history list (newest first)."""
+    import datetime
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    entry = f"─── {ts} ───\n{(log or '').rstrip()}"
+    history = list(history or [])[-(_MAX_LOG_HISTORY - 1):]
+    history.append(entry)
+    return history, "\n\n".join(reversed(history))
+
+
+def _file_to_path(f) -> str:
+    """Return a file path string from whatever gr.UploadButton hands back."""
+    if f is None:
+        return ""
+    if isinstance(f, list):
+        f = f[0] if f else None
+        if f is None:
+            return ""
+    return f.name if hasattr(f, "name") else str(f)
 
 
 # --------------------------------------------------------------------------- #
@@ -398,6 +426,7 @@ def handle_detect(
     hydro_dir: str,
     threshold: float,
     output_path: str,
+    progress: gr.Progress = gr.Progress(),
 ):
     if not imagery_dir or not imagery_dir.strip():
         yield "ERROR: Imagery directory or .jp2 file is required.", None; return
@@ -410,6 +439,12 @@ def handle_detect(
     if method in ("cnn", "both") and (not norm_stats_path or not norm_stats_path.strip()):
         yield "ERROR: Norm stats path is required for this method.", None; return
     out = output_path.strip()
+    try:
+        total_tiles = len(_find_files(imagery_dir.strip(), ".jp2"))
+    except Exception:
+        total_tiles = 0
+    tiles_done = 0
+    progress(0, desc=f"0 / {total_tiles} tiles")
     last_log = ""
     for log in _stream(
         _do_detect,
@@ -417,8 +452,13 @@ def handle_detect(
         rf_model_path.strip(), cnn_model_path.strip(), norm_stats_path.strip(),
         hydro_dir.strip(), float(threshold), out,
     ):
+        new = log[len(last_log):]
+        tiles_done += new.count("Processing ")
+        if total_tiles > 0:
+            progress(min(tiles_done / total_tiles, 0.99), desc=f"{tiles_done} / {total_tiles} tiles")
         last_log = log
         yield log, None, gr.update()
+    progress(1.0, desc="Done")
     kml_exists = out and Path(out).exists()
     yield last_log, (out if kml_exists else None), (out if kml_exists else gr.update())
 
@@ -449,6 +489,46 @@ def _confidence_color(conf: float | None) -> str:
     if conf >= 0.65:
         return "#ff4400"  # red-orange
     return "#888888"      # grey — below typical useful threshold
+
+
+def _detection_stats(kml_path: str) -> str:
+    """Parse a detections KML and return a confidence/area summary string."""
+    import re
+    if not kml_path or not Path(kml_path).exists():
+        return ""
+    counts = {"≥ 0.85": 0, "0.75–0.85": 0, "0.65–0.75": 0, "< 0.65": 0}
+    total_area = 0.0
+    n = 0
+    try:
+        root = ET.parse(kml_path).getroot()
+        for pm in root.iter(f"{{{_MAP_NS}}}Placemark"):
+            desc = pm.findtext(f"{{{_MAP_NS}}}description") or ""
+            cm = re.search(r"Confidence:\s*([\d.]+)", desc)
+            am = re.search(r"Area:\s*([\d.]+)", desc)
+            if cm:
+                conf = float(cm.group(1))
+                n += 1
+                if conf >= 0.85:   counts["≥ 0.85"]    += 1
+                elif conf >= 0.75: counts["0.75–0.85"] += 1
+                elif conf >= 0.65: counts["0.65–0.75"] += 1
+                else:              counts["< 0.65"]    += 1
+            if am:
+                total_area += float(am.group(1))
+    except Exception as exc:
+        return f"Error reading stats: {exc}"
+    if n == 0:
+        return "No detections in KML."
+    lines = [
+        f"Total detections : {n}",
+        f"Total area       : {total_area / 1e4:.2f} ha  ({total_area:.0f} m²)",
+        "",
+        "Confidence breakdown:",
+        f"  ≥ 0.85   (green)  : {counts['≥ 0.85']}",
+        f"  0.75–0.85 (yellow): {counts['0.75–0.85']}",
+        f"  0.65–0.75 (red)   : {counts['0.65–0.75']}",
+        f"  < 0.65   (grey)   : {counts['< 0.65']}",
+    ]
+    return "\n".join(lines)
 
 
 def _add_detections_layer(m, kml_path: str) -> list[tuple[float, float]]:
@@ -703,7 +783,61 @@ def _build_map(
     </div>"""
     m.get_root().html.add_child(folium.Element(legend_html))
 
+    # Click handler: store lat/lon in window globals so the Diagnose button can read them
+    map_var = m.get_name()
+    click_js = f"""
+    <div id="map-click-coords" style="text-align:center;font-size:12px;color:#555;padding:4px 0">
+      Click on the map to select a point for diagnosis
+    </div>
+    <script>
+    (function() {{
+      var poll = setInterval(function() {{
+        if (typeof {map_var} !== 'undefined') {{
+          clearInterval(poll);
+          {map_var}.on('click', function(e) {{
+            window._mapClickLat = e.latlng.lat;
+            window._mapClickLon = e.latlng.lng;
+            var el = document.getElementById('map-click-coords');
+            if (el) el.textContent = 'Selected: ' + e.latlng.lat.toFixed(6)
+                                     + ', ' + e.latlng.lng.toFixed(6);
+          }});
+        }}
+      }}, 100);
+    }})();
+    </script>"""
+    m.get_root().html.add_child(folium.Element(click_js))
+
     return f'<div style="height:580px">{m._repr_html_()}</div>'
+
+
+def handle_export_filtered_kml(kml_path: str, threshold: float):
+    """Re-write the detections KML keeping only placemarks above the confidence threshold."""
+    import re
+    kml_path = (kml_path or "").strip()
+    if not kml_path or not Path(kml_path).exists():
+        return None
+    try:
+        tree = ET.parse(kml_path)
+        root = tree.getroot()
+        ns = _MAP_NS
+        for parent in list(root.iter()):
+            to_remove = []
+            for child in parent:
+                if child.tag != f"{{{ns}}}Placemark":
+                    continue
+                desc = child.findtext(f"{{{ns}}}description") or ""
+                m = re.search(r"Confidence:\s*([\d.]+)", desc)
+                if m and float(m.group(1)) < threshold:
+                    to_remove.append(child)
+            for child in to_remove:
+                parent.remove(child)
+        src = Path(kml_path)
+        out_path = src.parent / f"{src.stem}_conf{threshold:.2f}.kml"
+        ET.register_namespace("", ns)
+        tree.write(str(out_path), xml_declaration=True, encoding="utf-8")
+        return str(out_path)
+    except Exception:
+        return None
 
 
 def handle_load_map(
@@ -757,6 +891,57 @@ def _do_evaluate_rf(
         )
 
 
+def _confusion_matrix_image(manifest_path: str, rf_model_path: str):
+    """Predict on all manifest chips and return a confusion matrix as a numpy RGB image."""
+    if not manifest_path or not Path(manifest_path).exists():
+        return None
+    if not rf_model_path or not Path(rf_model_path).exists():
+        return None
+    try:
+        import io as _io
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+        from spectral import extract_features
+        from models.random_forest import load_model
+
+        with open(manifest_path) as f:
+            rows = list(csv.DictReader(f))
+
+        feats_list, labels = [], []
+        for r in rows:
+            try:
+                chip = np.load(r["path"])
+                feats_list.append(extract_features(chip))
+                labels.append(int(r["label"]))
+            except Exception:
+                pass
+        if not feats_list:
+            return None
+
+        X = np.array(feats_list)
+        y = np.array(labels)
+        clf = load_model(rf_model_path)
+        y_pred = clf.predict(X)
+
+        cm = confusion_matrix(y, y_pred)
+        disp = ConfusionMatrixDisplay(cm, display_labels=["negative", "flood"])
+        fig, ax = plt.subplots(figsize=(4, 4))
+        disp.plot(ax=ax, cmap="Blues", colorbar=False)
+        ax.set_title("Confusion Matrix (full dataset)")
+        fig.tight_layout()
+
+        buf = _io.BytesIO()
+        fig.savefig(buf, format="png", dpi=100)
+        plt.close(fig)
+        buf.seek(0)
+        from PIL import Image
+        return np.array(Image.open(buf))
+    except Exception:
+        return None
+
+
 def _chip_to_image(chip: np.ndarray) -> np.ndarray:
     """CIR chip (bands, H, W) → false-colour RGB uint8 (H, W, 3): NIR→R, Red→G, Green→B."""
     rgb = np.stack([chip[0], chip[1], chip[2]], axis=-1).astype(np.float32)
@@ -776,12 +961,31 @@ def _colormap_image(data: np.ndarray, cmap: str, vmin: float, vmax: float) -> np
     return (rgba[:, :, :3] * 255).astype(np.uint8)
 
 
+def _probability_heatmap(chip: np.ndarray, clf) -> np.ndarray:
+    """Sliding-window RF probability map: divide chip into 32×32 patches, predict each."""
+    import cv2
+    from spectral import extract_features
+    patch = 32
+    h, w = chip.shape[1], chip.shape[2]
+    rows_n, cols_n = h // patch, w // patch
+    probs = np.zeros((rows_n, cols_n), dtype=np.float32)
+    classes = list(clf.classes_)
+    pos_idx = classes.index(1) if 1 in classes else 0
+    for r in range(rows_n):
+        for c in range(cols_n):
+            sub = chip[:, r * patch:(r + 1) * patch, c * patch:(c + 1) * patch]
+            feats = extract_features(sub).reshape(1, -1)
+            probs[r, c] = clf.predict_proba(feats)[0][pos_idx]
+    prob_map = cv2.resize(probs, (w, h), interpolation=cv2.INTER_LINEAR)
+    return _colormap_image(prob_map, "hot", vmin=0, vmax=1)
+
+
 def _do_diagnose(
     lon: float,
     lat: float,
     imagery_dir: str,
     rf_model_path: str,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     from pyproj import Transformer
     from diagnose_point import find_covering_jp2, extract_chip_at
     from spectral import compute_ndwi, compute_ndvi, extract_features
@@ -816,9 +1020,10 @@ def _do_diagnose(
         print(f"  {cls_name}: {prob:.3f}")
 
     chip_img = _chip_to_image(chip)
-    ndwi_img = _colormap_image(compute_ndwi(chip), "RdBu",    vmin=-1, vmax=1)
-    ndvi_img = _colormap_image(compute_ndvi(chip), "RdYlGn",  vmin=-1, vmax=1)
-    return chip_img, ndwi_img, ndvi_img
+    ndwi_img = _colormap_image(compute_ndwi(chip), "RdBu",   vmin=-1, vmax=1)
+    ndvi_img = _colormap_image(compute_ndvi(chip), "RdYlGn", vmin=-1, vmax=1)
+    prob_img = _probability_heatmap(chip, clf)
+    return chip_img, ndwi_img, ndvi_img, prob_img
 
 
 def handle_diagnose(
@@ -829,16 +1034,16 @@ def handle_diagnose(
 ):
     import io as _io
     if not imagery_dir or not imagery_dir.strip():
-        return None, None, None, "ERROR: Imagery directory or .jp2 file is required."
+        return None, None, None, None, "ERROR: Imagery directory or .jp2 file is required."
     if not rf_model_path or not rf_model_path.strip():
-        return None, None, None, "ERROR: RF model path is required."
+        return None, None, None, None, "ERROR: RF model path is required."
     buf = _io.StringIO()
     old = sys.stdout
     sys.stdout = buf
-    chip_img = ndwi_img = ndvi_img = None
+    chip_img = ndwi_img = ndvi_img = prob_img = None
     error: str = ""
     try:
-        chip_img, ndwi_img, ndvi_img = _do_diagnose(
+        chip_img, ndwi_img, ndvi_img, prob_img = _do_diagnose(
             float(lon), float(lat),
             imagery_dir.strip(), rf_model_path.strip(),
         )
@@ -849,7 +1054,7 @@ def handle_diagnose(
     log = buf.getvalue() or ""
     if error:
         log += f"\nERROR: {error}"
-    return chip_img, ndwi_img, ndvi_img, log or "No output."
+    return chip_img, ndwi_img, ndvi_img, prob_img, log or "No output."
 
 
 def _do_overview(
@@ -996,6 +1201,41 @@ def handle_overview(
         return f"ERROR: {exc}"
 
 
+def _load_chip_gallery(chips_dir: str, n_per_class: int = 12) -> list:
+    """Return [(image_array, caption), ...] for a sample of chips from manifest.csv."""
+    import random
+    manifest = Path(chips_dir) / "manifest.csv"
+    if not manifest.exists():
+        return []
+    with open(manifest) as f:
+        rows = list(csv.DictReader(f))
+    positives = [r for r in rows if int(r["label"]) == 1]
+    negatives = [r for r in rows if int(r["label"]) == 0]
+    sample = (
+        random.sample(positives, min(n_per_class, len(positives))) +
+        random.sample(negatives, min(n_per_class, len(negatives)))
+    )
+    gallery = []
+    for r in sample:
+        try:
+            chip = np.load(r["path"])
+            img  = _chip_to_image(chip)
+            ft   = r.get("feature_type", "negative") if int(r["label"]) == 1 else "negative"
+            gallery.append((img, ft))
+        except Exception:
+            pass
+    return gallery
+
+
+def handle_chip_gallery(chips_dir: str) -> list:
+    if not chips_dir or not chips_dir.strip():
+        return []
+    try:
+        return _load_chip_gallery(chips_dir.strip())
+    except Exception:
+        return []
+
+
 def _do_evaluate_compare(
     manifest_path: str,
     rf_model_path: str,
@@ -1083,9 +1323,14 @@ with gr.Blocks(title="CastorDetector") as demo:
                 rf_chips   = gr.Textbox(label="Chip directory (optional, enables evaluate-rf)", placeholder="data/chips/", value=_s.get("rf_chips", ""))
                 rf_augment = gr.Slider(minimum=0, maximum=12, value=6, step=1,
                                        label="Augment positives (extra offset chips per label)")
-            rf_btn = gr.Button("Train RF", variant="primary")
+            with gr.Row():
+                rf_btn  = gr.Button("Train RF", variant="primary")
+                rf_stop = gr.Button("Stop", variant="stop")
             rf_log = gr.Textbox(label="Log", lines=15, interactive=False)
-            rf_btn.click(
+            rf_history_state = gr.State([])
+            with gr.Accordion("Previous runs", open=False):
+                rf_history_text = gr.Textbox(label="", lines=10, interactive=False, show_label=False)
+            rf_event = rf_btn.click(
                 fn=handle_train_rf,
                 inputs=[rf_imagery, rf_labels, rf_model, rf_hydro, rf_chips, rf_augment],
                 outputs=rf_log,
@@ -1109,11 +1354,16 @@ with gr.Blocks(title="CastorDetector") as demo:
             with gr.Row():
                 cnn_hydro = gr.Textbox(label="Hydrography directory (optional)", placeholder="data/hydrography/",         value=_s.get("cnn_hydro",      ""))
             with gr.Row():
-                cnn_epochs = gr.Number(value=30,    label="Epochs",        precision=0)
-                cnn_lr     = gr.Number(value=0.001, label="Learning rate")
-            cnn_btn = gr.Button("Train CNN", variant="primary")
+                cnn_epochs = gr.Number(value=int(_s.get("cnn_epochs", 30)),       label="Epochs",        precision=0)
+                cnn_lr     = gr.Number(value=float(_s.get("cnn_lr", 0.001)), label="Learning rate")
+            with gr.Row():
+                cnn_btn  = gr.Button("Train CNN", variant="primary")
+                cnn_stop = gr.Button("Stop", variant="stop")
             cnn_log = gr.Textbox(label="Log", lines=15, interactive=False)
-            cnn_btn.click(
+            cnn_history_state = gr.State([])
+            with gr.Accordion("Previous runs", open=False):
+                cnn_history_text = gr.Textbox(label="", lines=10, interactive=False, show_label=False)
+            cnn_event = cnn_btn.click(
                 fn=handle_train_cnn,
                 inputs=[cnn_imagery, cnn_labels, cnn_model, cnn_norm_stats, cnn_hydro, cnn_epochs, cnn_lr],
                 outputs=cnn_log,
@@ -1131,18 +1381,31 @@ with gr.Blocks(title="CastorDetector") as demo:
                 det_imagery = gr.Textbox(label="Imagery directory or .jp2 file", placeholder="data/imagery/",             value=_s.get("det_imagery",    ""))
                 det_output  = gr.Textbox(label="Output KML path",   placeholder="data/output/detections.kml", value=_s.get("det_output",     ""))
             with gr.Row():
-                det_method = gr.Dropdown(choices=["rf", "cnn", "both"], value="rf", label="Method")
+                det_method = gr.Dropdown(choices=["rf", "cnn", "both"], value=_s.get("det_method", "rf"), label="Method")
                 det_hydro  = gr.Textbox(label="Hydrography directory (optional)", placeholder="data/hydrography/", value=_s.get("det_hydro", ""))
             with gr.Row():
-                det_rf_model  = gr.Textbox(label="RF model path (.pkl)",  placeholder="data/models/model.pkl",         value=_s.get("det_rf_model",  ""))
-                det_cnn_model = gr.Textbox(label="CNN model path (.pth)", placeholder="data/models/beaver_cnn_v1.pth", value=_s.get("det_cnn_model", ""))
+                with gr.Column():
+                    det_rf_model      = gr.Textbox(label="RF model path (.pkl)",  placeholder="data/models/model.pkl",         value=_s.get("det_rf_model",  ""))
+                    det_rf_model_btn  = gr.UploadButton("📂 Browse", file_types=[".pkl"],  size="sm")
+                with gr.Column():
+                    det_cnn_model     = gr.Textbox(label="CNN model path (.pth)", placeholder="data/models/beaver_cnn_v1.pth", value=_s.get("det_cnn_model", ""))
+                    det_cnn_model_btn = gr.UploadButton("📂 Browse", file_types=[".pth"],  size="sm")
             with gr.Row():
-                det_norm_stats = gr.Textbox(label="Norm stats path (.json)", placeholder="data/models/norm_stats.json", value=_s.get("det_norm_stats", ""))
-                det_threshold  = gr.Slider(minimum=0.0, maximum=1.0, value=0.5, step=0.05,
-                                           label="Confidence threshold")
-            det_btn  = gr.Button("Detect & Export KML", variant="primary")
-            det_log  = gr.Textbox(label="Log", lines=15, interactive=False)
-            det_file = gr.File(label="Download KML", interactive=False)
+                with gr.Column():
+                    det_norm_stats     = gr.Textbox(label="Norm stats path (.json)", placeholder="data/models/norm_stats.json", value=_s.get("det_norm_stats", ""))
+                    det_norm_stats_btn = gr.UploadButton("📂 Browse", file_types=[".json"], size="sm")
+                with gr.Column():
+                    det_threshold = gr.Slider(minimum=0.0, maximum=1.0, value=float(_s.get("det_threshold", 0.5)), step=0.05,
+                                              label="Confidence threshold")
+            with gr.Row():
+                det_btn  = gr.Button("Detect & Export KML", variant="primary")
+                det_stop = gr.Button("Stop", variant="stop")
+            det_log   = gr.Textbox(label="Log", lines=15, interactive=False)
+            det_stats = gr.Textbox(label="Statistics", lines=8, interactive=False)
+            det_file  = gr.File(label="Download KML", interactive=False)
+            det_history_state = gr.State([])
+            with gr.Accordion("Previous runs", open=False):
+                det_history_text = gr.Textbox(label="", lines=10, interactive=False, show_label=False)
             # det_btn.click() is wired after the Map tab so map_kml is in scope
 
         # ------------------------------------------------------------------ #
@@ -1156,15 +1419,25 @@ with gr.Blocks(title="CastorDetector") as demo:
                 "avoiding the spatial autocorrelation leak that a random split introduces."
             )
             with gr.Row():
-                ev_manifest  = gr.Textbox(label="Manifest CSV path",   placeholder="data/chips/manifest.csv",  value=_s.get("ev_manifest", ""))
-                ev_rf_model  = gr.Textbox(label="RF model path (.pkl)", placeholder="data/models/model.pkl",   value=_s.get("ev_rf_model", ""))
+                with gr.Column():
+                    ev_manifest     = gr.Textbox(label="Manifest CSV path",    placeholder="data/chips/manifest.csv", value=_s.get("ev_manifest", ""))
+                    ev_manifest_btn = gr.UploadButton("📂 Browse", file_types=[".csv"], size="sm")
+                with gr.Column():
+                    ev_rf_model     = gr.Textbox(label="RF model path (.pkl)", placeholder="data/models/model.pkl",   value=_s.get("ev_rf_model", ""))
+                    ev_rf_model_btn = gr.UploadButton("📂 Browse", file_types=[".pkl"], size="sm")
             with gr.Row():
-                ev_radius    = gr.Slider(minimum=100, maximum=2000, value=500, step=50,
+                ev_radius    = gr.Slider(minimum=100, maximum=2000, value=float(_s.get("ev_radius", 500)), step=50,
                                          label="Cluster radius (metres)")
-                ev_per_class = gr.Checkbox(label="Per-class breakdown (wet_forest / beaver_flood)", value=False)
-            ev_btn = gr.Button("Evaluate RF", variant="primary")
+                ev_per_class = gr.Checkbox(label="Per-class breakdown (wet_forest / beaver_flood)", value=bool(_s.get("ev_per_class", False)))
+            with gr.Row():
+                ev_btn  = gr.Button("Evaluate RF", variant="primary")
+                ev_stop = gr.Button("Stop", variant="stop")
             ev_log = gr.Textbox(label="Results", lines=20, interactive=False)
-            ev_btn.click(
+            ev_cm  = gr.Image(label="Confusion matrix", type="numpy", height=320)
+            ev_history_state = gr.State([])
+            with gr.Accordion("Previous runs", open=False):
+                ev_history_text = gr.Textbox(label="", lines=10, interactive=False, show_label=False)
+            ev_event = ev_btn.click(
                 fn=handle_evaluate_rf,
                 inputs=[ev_manifest, ev_rf_model, ev_radius, ev_per_class],
                 outputs=ev_log,
@@ -1181,16 +1454,29 @@ with gr.Blocks(title="CastorDetector") as demo:
                 "Use the **Evaluate RF** tab for spatially rigorous cross-validation."
             )
             with gr.Row():
-                cmp_manifest   = gr.Textbox(label="Manifest CSV path",       placeholder="data/chips/manifest.csv",       value=_s.get("cmp_manifest",   ""))
-                cmp_rf_model   = gr.Textbox(label="RF model path (.pkl)",    placeholder="data/models/model.pkl",         value=_s.get("cmp_rf_model",   ""))
+                with gr.Column():
+                    cmp_manifest     = gr.Textbox(label="Manifest CSV path",       placeholder="data/chips/manifest.csv",       value=_s.get("cmp_manifest",   ""))
+                    cmp_manifest_btn = gr.UploadButton("📂 Browse", file_types=[".csv"], size="sm")
+                with gr.Column():
+                    cmp_rf_model     = gr.Textbox(label="RF model path (.pkl)",    placeholder="data/models/model.pkl",         value=_s.get("cmp_rf_model",   ""))
+                    cmp_rf_model_btn = gr.UploadButton("📂 Browse", file_types=[".pkl"], size="sm")
             with gr.Row():
-                cmp_cnn_model  = gr.Textbox(label="CNN model path (.pth)",   placeholder="data/models/beaver_cnn_v1.pth", value=_s.get("cmp_cnn_model",  ""))
-                cmp_norm_stats = gr.Textbox(label="Norm stats path (.json)", placeholder="data/models/norm_stats.json",   value=_s.get("cmp_norm_stats", ""))
-            cmp_test_frac = gr.Slider(minimum=0.1, maximum=0.5, value=0.2, step=0.05,
+                with gr.Column():
+                    cmp_cnn_model     = gr.Textbox(label="CNN model path (.pth)",   placeholder="data/models/beaver_cnn_v1.pth", value=_s.get("cmp_cnn_model",  ""))
+                    cmp_cnn_model_btn = gr.UploadButton("📂 Browse", file_types=[".pth"],  size="sm")
+                with gr.Column():
+                    cmp_norm_stats     = gr.Textbox(label="Norm stats path (.json)", placeholder="data/models/norm_stats.json",   value=_s.get("cmp_norm_stats", ""))
+                    cmp_norm_stats_btn = gr.UploadButton("📂 Browse", file_types=[".json"], size="sm")
+            cmp_test_frac = gr.Slider(minimum=0.1, maximum=0.5, value=float(_s.get("cmp_test_frac", 0.2)), step=0.05,
                                       label="Test fraction")
-            cmp_btn = gr.Button("Evaluate", variant="primary")
+            with gr.Row():
+                cmp_btn  = gr.Button("Evaluate", variant="primary")
+                cmp_stop = gr.Button("Stop", variant="stop")
             cmp_log = gr.Textbox(label="Results", lines=12, interactive=False)
-            cmp_btn.click(
+            cmp_history_state = gr.State([])
+            with gr.Accordion("Previous runs", open=False):
+                cmp_history_text = gr.Textbox(label="", lines=10, interactive=False, show_label=False)
+            cmp_event = cmp_btn.click(
                 fn=handle_evaluate_compare,
                 inputs=[cmp_manifest, cmp_rf_model, cmp_cnn_model, cmp_norm_stats, cmp_test_frac],
                 outputs=cmp_log,
@@ -1210,18 +1496,21 @@ with gr.Blocks(title="CastorDetector") as demo:
                 diag_lon       = gr.Number(value=25.0,  label="Longitude (WGS84)")
                 diag_lat       = gr.Number(value=62.0,  label="Latitude (WGS84)")
             with gr.Row():
-                diag_imagery   = gr.Textbox(label="Imagery directory or .jp2 file", placeholder="data/imagery/",           value=_s.get("diag_imagery",  ""))
-                diag_rf_model  = gr.Textbox(label="RF model path (.pkl)", placeholder="data/models/model.pkl",  value=_s.get("diag_rf_model", ""))
+                diag_imagery  = gr.Textbox(label="Imagery directory or .jp2 file", placeholder="data/imagery/", value=_s.get("diag_imagery", ""))
+                with gr.Column():
+                    diag_rf_model     = gr.Textbox(label="RF model path (.pkl)", placeholder="data/models/model.pkl", value=_s.get("diag_rf_model", ""))
+                    diag_rf_model_btn = gr.UploadButton("📂 Browse", file_types=[".pkl"], size="sm")
             diag_btn = gr.Button("Diagnose", variant="primary")
             with gr.Row():
                 diag_chip = gr.Image(label="CIR chip (NIR=R, Red=G, Green=B)", type="numpy")
                 diag_ndwi = gr.Image(label="NDWI  (blue=water, red=dry)",       type="numpy")
                 diag_ndvi = gr.Image(label="NDVI  (green=veg, red=bare)",        type="numpy")
+                diag_prob = gr.Image(label="RF probability map (bright=flood)",  type="numpy")
             diag_log = gr.Textbox(label="Prediction & band stats", lines=12, interactive=False)
             diag_btn.click(
                 fn=handle_diagnose,
                 inputs=[diag_lon, diag_lat, diag_imagery, diag_rf_model],
-                outputs=[diag_chip, diag_ndwi, diag_ndvi, diag_log],
+                outputs=[diag_chip, diag_ndwi, diag_ndvi, diag_prob, diag_log],
             )
 
         # ------------------------------------------------------------------ #
@@ -1240,10 +1529,20 @@ with gr.Blocks(title="CastorDetector") as demo:
                 ov_chips      = gr.Textbox(label="Chip directory (optional)", placeholder="data/chips/",   value=_s.get("ov_chips",      ""))
             ov_btn = gr.Button("Scan", variant="primary")
             ov_out = gr.Textbox(label="Summary", lines=22, interactive=False)
-            ov_btn.click(
+            gr.Markdown("### Chip sample (CIR false-colour)")
+            ov_gallery = gr.Gallery(
+                label="Training chips — positives then negatives (up to 12 each)",
+                columns=6, height=320, object_fit="contain",
+            )
+            ov_event = ov_btn.click(
                 fn=handle_overview,
                 inputs=[ov_imagery, ov_labels, ov_models_dir, ov_chips],
                 outputs=ov_out,
+            )
+            ov_event.then(
+                fn=handle_chip_gallery,
+                inputs=[ov_chips],
+                outputs=[ov_gallery],
             )
 
         # ------------------------------------------------------------------ #
@@ -1267,30 +1566,88 @@ with gr.Blocks(title="CastorDetector") as demo:
                 map_show_hydro  = gr.Checkbox(label="Show hydrography",     value=True)
             map_btn  = gr.Button("Load Map", variant="primary")
             map_html = gr.HTML()
+            map_diagnose_btn = gr.Button(
+                "Diagnose selected point (click map first)", variant="secondary"
+            )
+            gr.Markdown("### Export filtered detections")
+            with gr.Row():
+                map_filter_threshold = gr.Slider(
+                    minimum=0.0, maximum=1.0, value=0.75, step=0.05,
+                    label="Minimum confidence to keep",
+                )
+                map_export_btn = gr.Button("Export filtered KML", variant="secondary", scale=0)
+            map_export_file = gr.File(label="Filtered KML download", interactive=False)
             map_btn.click(
                 fn=handle_load_map,
                 inputs=[map_kml, map_labels, map_hydro, map_basemap,
                         map_show_det, map_show_labels, map_show_hydro],
                 outputs=map_html,
             )
+            # Reads JS globals set by the Leaflet click handler; populates Diagnose tab
+            map_diagnose_btn.click(
+                fn=None,
+                inputs=[],
+                outputs=[diag_lon, diag_lat],
+                js="() => [window._mapClickLon ?? 25.0, window._mapClickLat ?? 62.0]",
+            )
+            map_export_btn.click(
+                fn=handle_export_filtered_kml,
+                inputs=[map_kml, map_filter_threshold],
+                outputs=[map_export_file],
+            )
 
     # Wire detect button here so map_kml is in scope
-    det_btn.click(
+    det_event = det_btn.click(
         fn=handle_detect,
         inputs=[det_imagery, det_method, det_rf_model, det_cnn_model,
                 det_norm_stats, det_hydro, det_threshold, det_output],
         outputs=[det_log, det_file, map_kml],
     )
 
+    det_event.then(fn=_detection_stats, inputs=[det_output], outputs=[det_stats])
+
+    # Confusion matrix — render after Evaluate RF completes
+    ev_event.then(fn=_confusion_matrix_image,
+                  inputs=[ev_manifest, ev_rf_model],
+                  outputs=[ev_cm])
+
+    # Run log history — append completed log to each tab's accordion
+    rf_event.then(fn=_append_log_history,
+                  inputs=[rf_log,  rf_history_state],
+                  outputs=[rf_history_state,  rf_history_text])
+    cnn_event.then(fn=_append_log_history,
+                   inputs=[cnn_log, cnn_history_state],
+                   outputs=[cnn_history_state, cnn_history_text])
+    det_event.then(fn=_append_log_history,
+                   inputs=[det_log, det_history_state],
+                   outputs=[det_history_state, det_history_text])
+    ev_event.then(fn=_append_log_history,
+                  inputs=[ev_log,  ev_history_state],
+                  outputs=[ev_history_state,  ev_history_text])
+    cmp_event.then(fn=_append_log_history,
+                   inputs=[cmp_log, cmp_history_state],
+                   outputs=[cmp_history_state, cmp_history_text])
+
+    # Stop buttons
+    rf_stop.click(fn=None,  cancels=[rf_event])
+    cnn_stop.click(fn=None, cancels=[cnn_event])
+    det_stop.click(fn=None, cancels=[det_event])
+    ev_stop.click(fn=None,  cancels=[ev_event])
+    cmp_stop.click(fn=None, cancels=[cmp_event])
+
     save_btn.click(
         fn=handle_save_settings,
         inputs=[
             rf_imagery, rf_labels, rf_model, rf_hydro, rf_chips,
             cnn_imagery, cnn_labels, cnn_model, cnn_norm_stats, cnn_hydro,
+            cnn_epochs, cnn_lr,
             det_imagery, det_output, det_rf_model, det_cnn_model,
             det_norm_stats, det_hydro,
+            det_method, det_threshold,
             ev_manifest, ev_rf_model,
+            ev_radius, ev_per_class,
             cmp_manifest, cmp_rf_model, cmp_cnn_model, cmp_norm_stats,
+            cmp_test_frac,
             diag_imagery, diag_rf_model,
             ov_imagery, ov_labels, ov_models_dir, ov_chips,
             map_kml, map_labels, map_hydro,
@@ -1298,6 +1655,18 @@ with gr.Blocks(title="CastorDetector") as demo:
         outputs=save_status,
     )
 
+
+    # Browse-button wirings — populate adjacent textbox with selected file path
+    det_rf_model_btn.upload( fn=_file_to_path, inputs=[det_rf_model_btn],  outputs=[det_rf_model])
+    det_cnn_model_btn.upload(fn=_file_to_path, inputs=[det_cnn_model_btn], outputs=[det_cnn_model])
+    det_norm_stats_btn.upload(fn=_file_to_path, inputs=[det_norm_stats_btn], outputs=[det_norm_stats])
+    ev_manifest_btn.upload(  fn=_file_to_path, inputs=[ev_manifest_btn],   outputs=[ev_manifest])
+    ev_rf_model_btn.upload(  fn=_file_to_path, inputs=[ev_rf_model_btn],   outputs=[ev_rf_model])
+    cmp_manifest_btn.upload( fn=_file_to_path, inputs=[cmp_manifest_btn],  outputs=[cmp_manifest])
+    cmp_rf_model_btn.upload( fn=_file_to_path, inputs=[cmp_rf_model_btn],  outputs=[cmp_rf_model])
+    cmp_cnn_model_btn.upload(fn=_file_to_path, inputs=[cmp_cnn_model_btn], outputs=[cmp_cnn_model])
+    cmp_norm_stats_btn.upload(fn=_file_to_path, inputs=[cmp_norm_stats_btn], outputs=[cmp_norm_stats])
+    diag_rf_model_btn.upload(fn=_file_to_path, inputs=[diag_rf_model_btn], outputs=[diag_rf_model])
 
 demo.queue()
 
