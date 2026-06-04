@@ -859,6 +859,57 @@ def _do_evaluate_rf(
         )
 
 
+def _confusion_matrix_image(manifest_path: str, rf_model_path: str):
+    """Predict on all manifest chips and return a confusion matrix as a numpy RGB image."""
+    if not manifest_path or not Path(manifest_path).exists():
+        return None
+    if not rf_model_path or not Path(rf_model_path).exists():
+        return None
+    try:
+        import io as _io
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+        from spectral import extract_features
+        from models.random_forest import load_model
+
+        with open(manifest_path) as f:
+            rows = list(csv.DictReader(f))
+
+        feats_list, labels = [], []
+        for r in rows:
+            try:
+                chip = np.load(r["path"])
+                feats_list.append(extract_features(chip))
+                labels.append(int(r["label"]))
+            except Exception:
+                pass
+        if not feats_list:
+            return None
+
+        X = np.array(feats_list)
+        y = np.array(labels)
+        clf = load_model(rf_model_path)
+        y_pred = clf.predict(X)
+
+        cm = confusion_matrix(y, y_pred)
+        disp = ConfusionMatrixDisplay(cm, display_labels=["negative", "flood"])
+        fig, ax = plt.subplots(figsize=(4, 4))
+        disp.plot(ax=ax, cmap="Blues", colorbar=False)
+        ax.set_title("Confusion Matrix (full dataset)")
+        fig.tight_layout()
+
+        buf = _io.BytesIO()
+        fig.savefig(buf, format="png", dpi=100)
+        plt.close(fig)
+        buf.seek(0)
+        from PIL import Image
+        return np.array(Image.open(buf))
+    except Exception:
+        return None
+
+
 def _chip_to_image(chip: np.ndarray) -> np.ndarray:
     """CIR chip (bands, H, W) → false-colour RGB uint8 (H, W, 3): NIR→R, Red→G, Green→B."""
     rgb = np.stack([chip[0], chip[1], chip[2]], axis=-1).astype(np.float32)
@@ -1330,6 +1381,7 @@ with gr.Blocks(title="CastorDetector") as demo:
                 ev_btn  = gr.Button("Evaluate RF", variant="primary")
                 ev_stop = gr.Button("Stop", variant="stop")
             ev_log = gr.Textbox(label="Results", lines=20, interactive=False)
+            ev_cm  = gr.Image(label="Confusion matrix", type="numpy", height=320)
             ev_history_state = gr.State([])
             with gr.Accordion("Previous runs", open=False):
                 ev_history_text = gr.Textbox(label="", lines=10, interactive=False, show_label=False)
@@ -1487,6 +1539,11 @@ with gr.Blocks(title="CastorDetector") as demo:
     )
 
     det_event.then(fn=_detection_stats, inputs=[det_output], outputs=[det_stats])
+
+    # Confusion matrix — render after Evaluate RF completes
+    ev_event.then(fn=_confusion_matrix_image,
+                  inputs=[ev_manifest, ev_rf_model],
+                  outputs=[ev_cm])
 
     # Run log history — append completed log to each tab's accordion
     rf_event.then(fn=_append_log_history,
