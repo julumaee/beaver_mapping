@@ -8,7 +8,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from spectral import compute_ndvi, compute_ndwi, extract_features
+from spectral import compute_ndvi, compute_ndwi, extract_features, FEATURE_VECTOR_LENGTH
 
 
 def _chip(nir, red, grn, size=4):
@@ -73,7 +73,7 @@ class TestExtractFeatures:
     def test_output_shape(self):
         chip = _chip(nir=100, red=80, grn=60, size=64)
         feats = extract_features(chip)
-        assert feats.shape == (99,)
+        assert feats.shape == (FEATURE_VECTOR_LENGTH,)
 
     def test_output_dtype(self):
         chip = _chip(nir=100, red=80, grn=60, size=64)

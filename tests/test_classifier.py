@@ -11,6 +11,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from models.random_forest import train, predict, save_model, load_model, build_feature_matrix
+from spectral import FEATURE_VECTOR_LENGTH
 
 
 def _make_chips_and_manifest(tmp_path: Path, n=10) -> str:
@@ -48,7 +49,7 @@ class TestBuildFeatureMatrix:
     def test_shape(self, tmp_path):
         manifest = _make_chips_and_manifest(tmp_path, n=3)
         X, y = build_feature_matrix(manifest)
-        assert X.shape == (6, 99)  # 2 classes × 3 samples each
+        assert X.shape == (6, FEATURE_VECTOR_LENGTH)  # 2 classes × 3 samples each
         assert y.shape == (6,)
 
     def test_labels_correct(self, tmp_path):
