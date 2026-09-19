@@ -37,6 +37,29 @@ pip install -r requirements.txt
 >
 > All commands below assume the venv is active. If not, prefix with `.venv/bin/python`.
 
+## GUI
+
+A Gradio-based control panel wraps every CLI command below in a browser UI — recommended for interactive use. The CLI (see sections below) is better suited to scripting and automation.
+
+```bash
+python src/app.py
+```
+
+Opens `http://localhost:7860`. Each tab drives one pipeline step, streams log output live, and has a **Stop** button to cancel an in-flight run:
+
+| Tab | Purpose |
+|---|---|
+| **Train RF** | Extract chips from labelled imagery and train the Random Forest classifier |
+| **Train CNN** | Fine-tune the Prithvi-EO CNN on the same labelled chips |
+| **Detect & Export** | Run RF, CNN, or both on imagery and export a KML; download the result directly from the tab |
+| **Evaluate RF** | Spatial leave-one-cluster-out cross-validation, with a confusion matrix and optional per-class breakdown |
+| **Evaluate RF vs CNN** | Compare both models on a random held-out split of the manifest |
+| **Diagnose Point** | Inspect the chip, NDWI/NDVI, and RF probability map at a single lon/lat — useful for debugging false positives/negatives |
+| **Overview** | Scan your data directories and preview a gallery of training chips before running anything |
+| **Map** | View detection polygons, training labels, and hydrography on an interactive satellite/OSM map; click a point to jump into Diagnose Point |
+
+Path fields default to whatever you last typed; click **Save as defaults** (top of the window) to persist the current values in every tab to `data/settings.json` so they're pre-filled next time you launch the app. Model file fields also accept a **📂 Browse** button to upload a `.pkl`/`.pth`/`.json`/`.csv` file instead of typing a path.
+
 ## Random Forest
 
 ### Label format
