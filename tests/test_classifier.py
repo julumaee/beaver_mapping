@@ -48,7 +48,7 @@ class TestBuildFeatureMatrix:
     def test_shape(self, tmp_path):
         manifest = _make_chips_and_manifest(tmp_path, n=3)
         X, y = build_feature_matrix(manifest)
-        assert X.shape == (6, 36)  # 2 classes × 3 samples each
+        assert X.shape == (6, 99)  # 2 classes × 3 samples each
         assert y.shape == (6,)
 
     def test_labels_correct(self, tmp_path):

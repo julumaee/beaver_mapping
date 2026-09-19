@@ -73,7 +73,7 @@ class TestExtractFeatures:
     def test_output_shape(self):
         chip = _chip(nir=100, red=80, grn=60, size=64)
         feats = extract_features(chip)
-        assert feats.shape == (36,)
+        assert feats.shape == (99,)
 
     def test_output_dtype(self):
         chip = _chip(nir=100, red=80, grn=60, size=64)
@@ -83,7 +83,7 @@ class TestExtractFeatures:
         # Water: low NIR, high Green → NDWI > 0
         chip = _chip(nir=30, red=40, grn=180, size=64)
         feats = extract_features(chip)
-        ndwi_fraction = feats[17]  # last feature: fraction NDWI > 0
+        ndwi_fraction = feats[17]  # 32px-scale block: fraction NDWI > 0
         assert ndwi_fraction > 0.9
 
     def test_vegetation_chip_high_ndvi_fraction(self):
