@@ -26,7 +26,9 @@ _check_dependencies()
 
 import argparse
 import csv
+import datetime
 import json
+import os
 import queue
 import tempfile
 import threading
@@ -39,50 +41,259 @@ sys.path.insert(0, str(Path(__file__).parent))
 import gradio as gr
 
 # --------------------------------------------------------------------------- #
-# Persistent settings
+# Project paths — G1.1: one shared Project panel, everything else derived
 # --------------------------------------------------------------------------- #
 
-_SETTINGS_PATH = Path(__file__).parent.parent / "data" / "settings.json"
+DEFAULT_PROJECT_DIR = "data"
+RF_MODEL_FILENAME = "model.pkl"
+CNN_MODEL_FILENAME = "beaver_cnn_v1.pth"
+NORM_STATS_FILENAME = "norm_stats.json"
+
+
+def derive_paths(project_dir: str, rf_model_override: str = "") -> dict:
+    """Derive every standard sub-path from a project directory.
+
+    Everything lives under <project_dir>: models/, chips/, output/. The RF
+    model file itself can be overridden (Advanced: override RF model path)
+    without changing where anything else lives; its metadata sidecar
+    (<model>.json, written by the training pipeline) follows it.
+    """
+    project_dir = (project_dir or "").strip() or DEFAULT_PROJECT_DIR
+    p = Path(project_dir)
+    models_dir = p / "models"
+    chips_dir = p / "chips"
+
+    override = (rf_model_override or "").strip()
+    rf_model = Path(override) if override else models_dir / RF_MODEL_FILENAME
+
+    return {
+        "project_dir": str(p),
+        "models_dir": str(models_dir),
+        "rf_model": str(rf_model),
+        "rf_sidecar": str(rf_model.with_suffix(".json")),
+        "chips_dir": str(chips_dir),
+        "manifest": str(chips_dir / "manifest.csv"),
+        "oof_csv": str(chips_dir / "oof.csv"),
+        "cnn_model": str(models_dir / CNN_MODEL_FILENAME),
+        "norm_stats": str(models_dir / NORM_STATS_FILENAME),
+        "output_dir": str(p / "output"),
+    }
+
+
+def make_output_path(project_dir: str, method: str) -> str:
+    """Timestamped detection output path — G3.x."""
+    paths = derive_paths(project_dir)
+    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M")
+    return str(Path(paths["output_dir"]) / f"detections_{method}_{ts}.kml")
+
+
+def list_output_kmls(project_dir: str) -> list[str]:
+    """KML files under <project>/output, newest first — G3.x past-runs dropdown."""
+    out_dir = Path(derive_paths(project_dir)["output_dir"])
+    if not out_dir.exists():
+        return []
+    files = sorted(out_dir.glob("*.kml"), key=lambda f: f.stat().st_mtime, reverse=True)
+    return [str(f) for f in files]
+
+
+def list_model_files(models_dir: str, suffix: str) -> list[str]:
+    """Files with the given suffix under models_dir — G3.x dropdown instead of Browse."""
+    p = Path(models_dir)
+    if not p.exists():
+        return []
+    return sorted(str(f) for f in p.glob(f"*{suffix}"))
+
+
+def read_model_sidecar(model_path: str) -> dict | None:
+    """Read <model>.json next to an RF model, if present. The training
+    pipeline (another agent, same wave) is expected to write keys including
+    created, n_chips, chips_by_type, feature_length, recommended_threshold
+    (float|None) and cv (dict with roc_auc, pr_auc, per_type, ... or None).
+    Returns None if the sidecar doesn't exist or can't be parsed — callers
+    must treat that as "no metadata available" rather than an error."""
+    if not model_path:
+        return None
+    try:
+        sidecar = Path(model_path).with_suffix(".json")
+    except Exception:
+        return None
+    if not sidecar.exists():
+        return None
+    try:
+        with open(sidecar) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def build_status_line(rf_model_path: str, labels_dir: str = "") -> str:
+    """Header status line — G3.x: 'Model: trained <date> · <n> chips · CV
+    PR-AUC x · recommended threshold y', plus a staleness warning if any
+    label file is newer than the model."""
+    meta = read_model_sidecar(rf_model_path)
+    if not meta:
+        if rf_model_path and Path(rf_model_path).exists():
+            return "**Model:** trained (no metadata sidecar found — run Evaluate for CV stats)"
+        return "**Model:** not trained yet — use the Train tab."
+
+    parts = []
+    created = meta.get("created")
+    if created:
+        parts.append(f"trained {created}")
+    n_chips = meta.get("n_chips")
+    if n_chips is not None:
+        parts.append(f"{n_chips} chips")
+    cv = meta.get("cv") if isinstance(meta.get("cv"), dict) else None
+    if cv and cv.get("pr_auc") is not None:
+        parts.append(f"CV PR-AUC {cv['pr_auc']:.2f}")
+    rt = meta.get("recommended_threshold")
+    if rt is not None:
+        parts.append(f"recommended threshold {rt:.2f}")
+
+    line = "**Model:** " + (" · ".join(parts) if parts else "trained (empty metadata)")
+
+    try:
+        if labels_dir and rf_model_path and Path(rf_model_path).exists():
+            model_mtime = Path(rf_model_path).stat().st_mtime
+            label_files = _find_files(labels_dir, ".kml") + _find_files(labels_dir, ".kmz")
+            newest_label = max((Path(f).stat().st_mtime for f in label_files), default=0.0)
+            if newest_label > model_mtime:
+                line += "  \n⚠️ Labels changed since this model was trained — consider retraining."
+    except Exception:
+        pass
+    return line
+
+
+# --------------------------------------------------------------------------- #
+# Persistent settings — G1.4
+# --------------------------------------------------------------------------- #
+
+def _settings_path() -> Path:
+    """Read CASTOR_SETTINGS fresh on every call (not cached at import time) so
+    tests/dev tooling can point the app at a tmp file for the whole process."""
+    env = os.environ.get("CASTOR_SETTINGS")
+    if env:
+        return Path(env)
+    return Path(__file__).parent.parent / "data" / "settings.json"
+
 
 _SETTINGS_KEYS = [
-    "rf_imagery", "rf_labels", "rf_model", "rf_hydro", "rf_chips",
-    "rf_flood_samples", "rf_hydro_negatives",
-    "cnn_imagery", "cnn_labels", "cnn_model", "cnn_norm_stats", "cnn_hydro",
-    "cnn_epochs", "cnn_lr",
-    "det_imagery", "det_output", "det_rf_model", "det_cnn_model",
-    "det_norm_stats", "det_hydro",
-    "det_method", "det_threshold",
-    "ev_manifest", "ev_rf_model",
-    "ev_radius", "ev_per_class",
-    "cmp_manifest", "cmp_rf_model", "cmp_cnn_model", "cmp_norm_stats",
-    "cmp_test_frac",
-    "diag_imagery", "diag_rf_model",
-    "ov_imagery", "ov_labels", "ov_models_dir", "ov_chips",
-    "map_kml", "map_labels", "map_hydro",
+    # Project panel
+    "project_dir", "imagery_dir", "labels_dir", "hydro_dir", "rf_model_override",
+    # Train
+    "train_augment", "train_flood_samples", "train_hydro_negatives",
+    "train_neg_ratio", "train_run_cv",
+    # Evaluate
+    "ev_radius", "ev_n_splits", "ev_per_class",
+    "audit_low", "audit_high", "audit_include_auto_neg",
+    # Detect
+    "det_threshold", "det_min_area", "det_seed_threshold", "det_no_smooth",
+    "det_output_override",
+    # Map & Review
+    "map_basemap", "map_show_det", "map_show_labels", "map_show_hydro",
+    "map_show_audit", "map_conf_threshold", "map_kml",
+    "diag_lon", "diag_lat",
+    # Experimental (CNN)
+    "cnn_epochs", "cnn_lr", "cmp_test_frac",
+    "exp_det_method", "exp_det_threshold", "exp_det_output_override",
 ]
+
+# Legacy (pre-G1.1) settings.json had ~30 per-tab path fields instead of one
+# shared Project panel. Presence of any of these marks an old-format file.
+_LEGACY_KEY_HINTS = (
+    "rf_imagery", "rf_labels", "rf_hydro", "det_imagery", "det_hydro",
+    "ov_imagery", "ov_labels", "map_labels", "map_hydro", "det_rf_model",
+    "ev_rf_model", "cnn_imagery", "cnn_labels", "cnn_hydro", "diag_imagery",
+)
+
+
+def migrate_settings(old: dict) -> dict:
+    """Migrate a legacy (pre-G1.1) settings.json to the new project-panel
+    schema. Already-migrated settings (containing "project_dir") and
+    unrecognised/empty settings both pass through unchanged, so this is safe
+    to call on any settings.json this app has ever written."""
+    if not old:
+        return {}
+    if "project_dir" in old:
+        return dict(old)
+    if not any(k in old for k in _LEGACY_KEY_HINTS):
+        return dict(old)
+
+    imagery_dir = (
+        old.get("rf_imagery") or old.get("ov_imagery") or old.get("det_imagery")
+        or old.get("cnn_imagery") or old.get("diag_imagery") or ""
+    )
+    labels_dir = (
+        old.get("rf_labels") or old.get("ov_labels") or old.get("map_labels")
+        or old.get("cnn_labels") or ""
+    )
+    hydro_dir = (
+        old.get("rf_hydro") or old.get("det_hydro") or old.get("map_hydro")
+        or old.get("cnn_hydro") or ""
+    )
+
+    project_dir = DEFAULT_PROJECT_DIR
+    if imagery_dir:
+        parent = str(Path(imagery_dir).parent)
+        if parent not in ("", "."):
+            project_dir = parent
+
+    default_rf_model = str(Path(project_dir) / "models" / RF_MODEL_FILENAME)
+    rf_model_override = ""
+    for key in ("det_rf_model", "rf_model", "ev_rf_model", "diag_rf_model"):
+        val = old.get(key)
+        if val and val != default_rf_model:
+            rf_model_override = val
+            break
+
+    det_method = old.get("det_method")
+    if det_method not in ("rf", "cnn", "both"):
+        det_method = "rf"
+
+    return {
+        "project_dir": project_dir,
+        "imagery_dir": imagery_dir,
+        "labels_dir": labels_dir,
+        "hydro_dir": hydro_dir,
+        "rf_model_override": rf_model_override,
+        "train_flood_samples": int(old.get("rf_flood_samples", 0) or 0),
+        "train_hydro_negatives": bool(old.get("rf_hydro_negatives", False)),
+        "exp_det_method": det_method if det_method in ("cnn", "both") else "cnn",
+        "det_threshold": float(old.get("det_threshold", 0.5) or 0.5),
+        "ev_radius": float(old.get("ev_radius", 500) or 500),
+        "ev_per_class": bool(old.get("ev_per_class", False)),
+        "cnn_epochs": int(old.get("cnn_epochs", 30) or 30),
+        "cnn_lr": float(old.get("cnn_lr", 0.001) or 0.001),
+        "cmp_test_frac": float(old.get("cmp_test_frac", 0.2) or 0.2),
+        "map_kml": old.get("map_kml", ""),
+    }
 
 
 def _load_settings() -> dict:
     try:
-        if _SETTINGS_PATH.exists():
-            with open(_SETTINGS_PATH) as f:
-                return json.load(f)
+        path = _settings_path()
+        if path.exists():
+            with open(path) as f:
+                raw = json.load(f)
+            return migrate_settings(raw)
     except Exception:
         pass
     return {}
 
 
 def _save_settings(settings: dict) -> None:
-    _SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(_SETTINGS_PATH, "w") as f:
+    path = _settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
         json.dump(settings, f, indent=2)
 
 
-def handle_save_settings(*values) -> str:
+def handle_autosave(*values) -> str:
+    """G1.4 — autosave on change; replaces the old explicit 'Save as defaults' button."""
     settings = dict(zip(_SETTINGS_KEYS, values))
     try:
         _save_settings(settings)
-        return f"Defaults saved to {_SETTINGS_PATH}"
+        return f"Settings saved {datetime.datetime.now().strftime('%H:%M:%S')}"
     except Exception as exc:
         return f"ERROR saving settings: {exc}"
 
@@ -95,23 +306,11 @@ _MAX_LOG_HISTORY = 5
 
 def _append_log_history(log: str, history: list) -> tuple[list, str]:
     """Prepend the completed run log to the history list (newest first)."""
-    import datetime
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     entry = f"─── {ts} ───\n{(log or '').rstrip()}"
     history = list(history or [])[-(_MAX_LOG_HISTORY - 1):]
     history.append(entry)
     return history, "\n\n".join(reversed(history))
-
-
-def _file_to_path(f) -> str:
-    """Return a file path string from whatever gr.UploadButton hands back."""
-    if f is None:
-        return ""
-    if isinstance(f, list):
-        f = f[0] if f else None
-        if f is None:
-            return ""
-    return f.name if hasattr(f, "name") else str(f)
 
 
 # --------------------------------------------------------------------------- #
@@ -135,7 +334,6 @@ def _find_files(path: str, suffix: str) -> list[str]:
 class _NullContext:
     """Context manager that creates and returns a fixed directory path."""
     def __init__(self, path: str) -> None:
-        import os
         os.makedirs(path, exist_ok=True)
         self._path = path
 
@@ -199,72 +397,111 @@ def _stream(fn, *args, **kwargs):
 def _do_train_rf(
     imagery_dir: str,
     labels_dir: str,
-    model_path: str,
     hydro_dir: str,
-    chip_dir: str,
+    project_dir: str,
+    rf_model_override: str,
     augment: int,
     flood_samples: int,
     hydro_negatives: bool,
+    neg_ratio: float,
 ) -> None:
     from cli import cmd_train
+    paths = derive_paths(project_dir, rf_model_override)
+    Path(paths["chips_dir"]).mkdir(parents=True, exist_ok=True)
+    Path(paths["models_dir"]).mkdir(parents=True, exist_ok=True)
     cmd_train(argparse.Namespace(
         imagery=imagery_dir,
         labels=labels_dir,
-        model=model_path,
+        model=paths["rf_model"],
         hydro=hydro_dir or None,
-        chip_dir=chip_dir or None,
+        # G1.5 — always keep chips in the project chip dir so Evaluate works right away.
+        chip_dir=paths["chips_dir"],
         augment_positives=augment,
         flood_samples=flood_samples,
         no_hydro_negatives=not hydro_negatives,
+        neg_ratio=neg_ratio,
     ))
 
 
 def handle_train_rf(
     imagery_dir: str,
     labels_dir: str,
-    model_path: str,
     hydro_dir: str,
-    chip_dir: str,
+    project_dir: str,
+    rf_model_override: str,
     augment: float,
     flood_samples: float,
     hydro_negatives: bool,
+    neg_ratio: float,
+    progress: gr.Progress = gr.Progress(),
 ):
     if not imagery_dir or not imagery_dir.strip():
-        yield "ERROR: Imagery directory or .jp2 file is required."; return
+        yield "ERROR: Imagery directory is required — set it in the Project panel above."
+        return
     if not labels_dir or not labels_dir.strip():
-        yield "ERROR: Labels directory is required."; return
-    if not model_path or not model_path.strip():
-        yield "ERROR: Model output path is required."; return
+        yield "ERROR: Labels directory is required — set it in the Project panel above."
+        return
     if int(flood_samples) > 0 and not (hydro_dir and hydro_dir.strip()):
-        yield "ERROR: Hydrography directory is required when flood samples > 0."; return
-    yield from _stream(
+        yield "ERROR: Hydrography directory is required when flood samples > 0."
+        return
+    progress(0.02, desc="Extracting training chips ...")
+    last_log = ""
+    for log in _stream(
         _do_train_rf,
-        imagery_dir.strip(), labels_dir.strip(), model_path.strip(),
-        hydro_dir.strip() if hydro_dir else "",
-        chip_dir.strip() if chip_dir else "",
-        int(augment), int(flood_samples), bool(hydro_negatives),
-    )
+        imagery_dir.strip(), labels_dir.strip(), (hydro_dir or "").strip(),
+        project_dir.strip(), (rf_model_override or "").strip(),
+        int(augment), int(flood_samples), bool(hydro_negatives), float(neg_ratio),
+    ):
+        new = log[len(last_log):]
+        if "Training Random Forest" in new:
+            progress(0.7, desc="Training Random Forest ...")
+        elif "Model saved to" in new:
+            progress(0.95, desc="Finishing ...")
+        last_log = log
+        yield log
+    progress(1.0, desc="Done")
+    yield last_log
+
+
+def handle_post_train_cv(
+    run_cv: bool,
+    project_dir: str,
+    rf_model_override: str,
+    cluster_radius: float,
+    n_splits: float,
+    per_class: bool,
+):
+    """After Train RF finishes: chain into Evaluate RF if the "Run spatial
+    cross-validation after training" checkbox is on (G1.2). Leaves the
+    Evaluate log untouched (gr.update(), a no-op) when the box is unchecked."""
+    if not run_cv:
+        yield gr.update()
+        return
+    yield "Training finished — running spatial cross-validation ...\n"
+    for log in handle_evaluate_rf(project_dir, rf_model_override, cluster_radius, n_splits, per_class):
+        yield log
 
 
 # --------------------------------------------------------------------------- #
-# Train CNN backend
+# Train CNN backend (Experimental)
 # --------------------------------------------------------------------------- #
 
 def _do_train_cnn(
     imagery_dir: str,
     labels_dir: str,
-    model_path: str,
-    norm_stats_path: str,
     hydro_dir: str,
+    project_dir: str,
     epochs: int,
     lr: float,
 ) -> None:
     from cli import cmd_cnn_train
+    paths = derive_paths(project_dir)
+    Path(paths["models_dir"]).mkdir(parents=True, exist_ok=True)
     cmd_cnn_train(argparse.Namespace(
         imagery=imagery_dir,
         labels=labels_dir,
-        model=model_path,
-        norm_stats=norm_stats_path,
+        model=paths["cnn_model"],
+        norm_stats=paths["norm_stats"],
         hydro=hydro_dir or None,
         epochs=epochs,
         lr=lr,
@@ -274,26 +511,21 @@ def _do_train_cnn(
 def handle_train_cnn(
     imagery_dir: str,
     labels_dir: str,
-    model_path: str,
-    norm_stats_path: str,
     hydro_dir: str,
+    project_dir: str,
     epochs: float,
     lr: float,
 ):
     if not imagery_dir or not imagery_dir.strip():
-        yield "ERROR: Imagery directory or .jp2 file is required."; return
+        yield "ERROR: Imagery directory is required — set it in the Project panel above."
+        return
     if not labels_dir or not labels_dir.strip():
-        yield "ERROR: Labels directory is required."; return
-    if not model_path or not model_path.strip():
-        yield "ERROR: Model output path is required."; return
-    if not norm_stats_path or not norm_stats_path.strip():
-        yield "ERROR: Norm stats path is required."; return
+        yield "ERROR: Labels directory is required — set it in the Project panel above."
+        return
     yield from _stream(
         _do_train_cnn,
-        imagery_dir.strip(), labels_dir.strip(), model_path.strip(),
-        norm_stats_path.strip(),
-        hydro_dir.strip() if hydro_dir else "",
-        int(epochs), float(lr),
+        imagery_dir.strip(), labels_dir.strip(), (hydro_dir or "").strip(),
+        project_dir.strip(), int(epochs), float(lr),
     )
 
 
@@ -310,6 +542,9 @@ def _do_detect(
     hydro_dir: str,
     threshold: float,
     output_path: str,
+    min_area: float,
+    seed_threshold: float | None,
+    no_smooth: bool,
 ) -> None:
     from cli import cmd_detect
     cmd_detect(argparse.Namespace(
@@ -321,31 +556,40 @@ def _do_detect(
         hydro=hydro_dir or None,
         threshold=threshold,
         output=output_path,
+        min_area=min_area,
+        seed_threshold=seed_threshold,
+        no_smooth=no_smooth,
     ))
 
 
 def handle_detect(
     imagery_dir: str,
     method: str,
-    rf_model_path: str,
-    cnn_model_path: str,
-    norm_stats_path: str,
     hydro_dir: str,
+    project_dir: str,
+    rf_model_override: str,
     threshold: float,
-    output_path: str,
+    output_override: str,
+    min_area: float,
+    seed_threshold,
+    no_smooth: bool,
     progress: gr.Progress = gr.Progress(),
 ):
     if not imagery_dir or not imagery_dir.strip():
-        yield "ERROR: Imagery directory or .jp2 file is required.", None; return
-    if not output_path or not output_path.strip():
-        yield "ERROR: Output KML path is required.", None; return
-    if method in ("rf", "both") and (not rf_model_path or not rf_model_path.strip()):
-        yield "ERROR: RF model path is required for this method.", None; return
-    if method in ("cnn", "both") and (not cnn_model_path or not cnn_model_path.strip()):
-        yield "ERROR: CNN model path is required for this method.", None; return
-    if method in ("cnn", "both") and (not norm_stats_path or not norm_stats_path.strip()):
-        yield "ERROR: Norm stats path is required for this method.", None; return
-    out = output_path.strip()
+        yield "ERROR: Imagery directory is required — set it in the Project panel above.", None, gr.update()
+        return
+    paths = derive_paths(project_dir, rf_model_override)
+    if method in ("rf", "both") and not Path(paths["rf_model"]).exists():
+        yield f"ERROR: RF model not found at {paths['rf_model']}. Train a model first.", None, gr.update()
+        return
+    if method in ("cnn", "both") and not Path(paths["cnn_model"]).exists():
+        yield f"ERROR: CNN model not found at {paths['cnn_model']}. Train a CNN first.", None, gr.update()
+        return
+
+    out = (output_override or "").strip() or make_output_path(project_dir, method)
+    Path(out).parent.mkdir(parents=True, exist_ok=True)
+    seed = float(seed_threshold) if seed_threshold not in (None, "") else None
+
     try:
         total_tiles = len(_find_files(imagery_dir.strip(), ".jp2"))
     except Exception:
@@ -355,9 +599,9 @@ def handle_detect(
     last_log = ""
     for log in _stream(
         _do_detect,
-        imagery_dir.strip(), method,
-        rf_model_path.strip(), cnn_model_path.strip(), norm_stats_path.strip(),
-        hydro_dir.strip(), float(threshold), out,
+        imagery_dir.strip(), method, paths["rf_model"], paths["cnn_model"], paths["norm_stats"],
+        (hydro_dir or "").strip(), float(threshold), out,
+        float(min_area), seed, bool(no_smooth),
     ):
         new = log[len(last_log):]
         tiles_done += new.count("Processing ")
@@ -367,7 +611,32 @@ def handle_detect(
         yield log, None, gr.update()
     progress(1.0, desc="Done")
     kml_exists = out and Path(out).exists()
-    yield last_log, (out if kml_exists else None), (out if kml_exists else gr.update())
+    if kml_exists:
+        dropdown_update = gr.update(choices=list_output_kmls(project_dir), value=out)
+    else:
+        dropdown_update = gr.update()
+    yield last_log, (out if kml_exists else None), dropdown_update
+
+
+def handle_refresh_threshold(project_dir: str, rf_model_override: str):
+    """G1.2 — threshold defaults to the sidecar's recommended_threshold when
+    available, shown as 'recommended: 0.33'."""
+    paths = derive_paths(project_dir, rf_model_override)
+    meta = read_model_sidecar(paths["rf_model"])
+    rt = (meta or {}).get("recommended_threshold")
+    if rt is not None:
+        return gr.update(value=float(rt), label=f"Confidence threshold (recommended: {rt:.2f})")
+    return gr.update(label="Confidence threshold (recommended: n/a — train & evaluate first)")
+
+
+def handle_refresh_status(project_dir: str, rf_model_override: str, labels_dir: str):
+    paths = derive_paths(project_dir, rf_model_override)
+    return build_status_line(paths["rf_model"], labels_dir)
+
+
+def handle_refresh_rf_model_choices(project_dir: str):
+    paths = derive_paths(project_dir)
+    return gr.update(choices=list_model_files(paths["models_dir"], ".pkl"))
 
 
 # --------------------------------------------------------------------------- #
@@ -377,9 +646,9 @@ def handle_detect(
 _MAP_NS = "http://www.opengis.net/kml/2.2"
 
 # Folder-based label type (as returned by training_data.parse_kml_labels) -> colour
-# group. Mirrors training_data.FEATURE_TO_LABEL's name variants so the map/Overview
-# agree with what training actually uses, plus dam/lodge/other (excluded from
-# training but still labelled in KML).
+# group. Mirrors training_data.FEATURE_TO_LABEL's name variants so the map/Data
+# check agree with what training actually uses, plus dam/lodge/other (excluded
+# from training but still labelled in KML).
 _LABEL_TYPE_GROUPS: dict[str, str] = {
     "dead_forest":    "dead_forest",
     "flood":          "flood",
@@ -666,6 +935,54 @@ def _add_labels_layer(m, labels_dir: str) -> tuple[list[tuple[float, float]], di
     return bounds, legend
 
 
+def _add_audit_layer(
+    m,
+    oof_csv: str,
+    low: float = 0.2,
+    high: float = 0.8,
+    include_auto_neg: bool = False,
+) -> list[tuple[float, float]]:
+    """Render suspicious label points (R1.5 / G2.2) as red rings with a
+    tooltip. Reuses the same map (and hence the same click handler) as
+    everything else, so clicking one of these rings still populates
+    window._mapClickLat/Lon for the Diagnose button below."""
+    import folium
+    import label_audit
+    from pyproj import Transformer
+
+    if not oof_csv or not Path(oof_csv).exists():
+        return []
+    try:
+        rows = label_audit.audit_labels(oof_csv, low=low, high=high, include_auto_negatives=include_auto_neg)
+    except Exception as exc:
+        print(f"Warning: could not audit labels: {exc}")
+        return []
+    if not rows:
+        return []
+
+    to_wgs84 = Transformer.from_crs(3067, 4326, always_xy=True)
+    group = folium.FeatureGroup(name="Label audit (suspicious)", show=True)
+    bounds: list[tuple[float, float]] = []
+    for r in rows:
+        lon, lat = to_wgs84.transform(r["x"], r["y"])
+        pt = (lat, lon)
+        bounds.append(pt)
+        label_name = "positive" if r["label"] == 1 else "negative"
+        folium.CircleMarker(
+            location=pt,
+            radius=11,
+            color="#ff0000",
+            fill=False,
+            weight=2.5,
+            tooltip=(
+                f"{r['feature_type']} ({label_name}) — "
+                f"mean OOF prob {r['mean_prob']:.2f} over {r['n_chips']} chip(s)"
+            ),
+        ).add_to(group)
+    group.add_to(m)
+    return bounds
+
+
 _HYDRO_SIMPLIFY_M = 5.0          # metres; normal (small-extent) simplify tolerance
 _HYDRO_SIMPLIFY_CAPPED_M = 30.0  # metres; heavier simplify when the window was capped
 _HYDRO_LAYERS = ("virtavesialue", "virtavesikapea")
@@ -756,6 +1073,11 @@ def _build_map(
     show_labels: bool = True,
     show_hydro: bool = True,
     confidence_threshold: float = 0.0,
+    oof_csv: str = "",
+    show_audit: bool = False,
+    audit_low: float = 0.2,
+    audit_high: float = 0.8,
+    audit_include_auto_neg: bool = False,
 ) -> str:
     import folium
     satellite_url = (
@@ -810,6 +1132,9 @@ def _build_map(
         lbl_bounds, label_legend = _add_labels_layer(m, labels_dir)
         bounds.extend(lbl_bounds)
 
+    if show_audit and oof_csv:
+        bounds.extend(_add_audit_layer(m, oof_csv, audit_low, audit_high, audit_include_auto_neg))
+
     folium.LayerControl(collapsed=False).add_to(m)
 
     if bounds:
@@ -843,7 +1168,9 @@ def _build_map(
       <b>Labels</b><br>
       {labels_legend_html}<br>
       <b>Hydrography</b><br>
-      <span style="color:#1a6aa8">&#9644;</span> streams / water bodies
+      <span style="color:#1a6aa8">&#9644;</span> streams / water bodies<br>
+      <b>Label audit</b><br>
+      <span style="color:#ff0000">&#9711;</span> suspicious (label disagrees with model)
     </div>"""
     m.get_root().html.add_child(folium.Element(legend_html))
 
@@ -855,7 +1182,7 @@ def _build_map(
     map_var = m.get_name()
     click_js = f"""
     <div id="map-click-coords" style="text-align:center;font-size:12px;color:#555;padding:4px 0">
-      Click on the map to select a point for diagnosis
+      Click on the map to select a point for diagnosis (works on detections, labels, and audit rings too)
     </div>
     <script>
     (function() {{
@@ -929,7 +1256,13 @@ def handle_load_map(
     show_detections: bool,
     show_labels: bool,
     show_hydro: bool,
-    confidence_threshold: float = 0.0,
+    show_audit: bool,
+    confidence_threshold: float,
+    project_dir: str,
+    rf_model_override: str,
+    audit_low: float = 0.2,
+    audit_high: float = 0.8,
+    audit_include_auto_neg: bool = False,
 ) -> str:
     kml_path   = (kml_path   or "").strip()
     labels_dir = (labels_dir or "").strip()
@@ -940,10 +1273,15 @@ def handle_load_map(
             "Specify at least one data source, then click Load Map."
             "</p>"
         )
+    paths = derive_paths(project_dir, rf_model_override)
+    oof_csv = paths["oof_csv"] if show_audit else ""
     try:
         return _build_map(kml_path, labels_dir, hydro_dir, basemap,
                           show_detections, show_labels, show_hydro,
-                          float(confidence_threshold or 0.0))
+                          float(confidence_threshold or 0.0),
+                          oof_csv=oof_csv, show_audit=bool(show_audit),
+                          audit_low=float(audit_low), audit_high=float(audit_high),
+                          audit_include_auto_neg=bool(audit_include_auto_neg))
     except Exception as exc:
         return f"<p style='color:red'><b>ERROR:</b> {exc}</p>"
 
@@ -953,22 +1291,48 @@ def handle_load_map(
 # --------------------------------------------------------------------------- #
 
 def _do_evaluate_rf(
-    manifest_path: str,
-    rf_model_path: str,
+    project_dir: str,
+    rf_model_override: str,
     cluster_radius: float,
+    n_splits: int,
     per_class: bool,
 ) -> None:
     from cli import cmd_evaluate_rf
+    paths = derive_paths(project_dir, rf_model_override)
+    rf_model = paths["rf_model"] if Path(paths["rf_model"]).exists() else None
     cmd_evaluate_rf(argparse.Namespace(
-        manifest=manifest_path,
-        rf_model=rf_model_path or None,
+        manifest=paths["manifest"],
+        rf_model=rf_model,
         cluster_radius=cluster_radius,
-        n_splits=5,
-        oof_path=None,     # defaults to <manifest_dir>/oof.csv — read back by _confusion_matrix_image
-        cache_dir=None,    # defaults to the manifest's own directory
+        n_splits=n_splits,
+        oof_path=paths["oof_csv"],
+        cache_dir=paths["chips_dir"],
         no_cache=False,
         per_class=per_class,
     ))
+
+
+def handle_evaluate_rf(
+    project_dir: str,
+    rf_model_override: str,
+    cluster_radius: float,
+    n_splits: float,
+    per_class: bool,
+):
+    paths = derive_paths(project_dir, rf_model_override)
+    if not Path(paths["manifest"]).exists():
+        yield f"ERROR: No training manifest at {paths['manifest']}. Run Train first (with chips kept)."
+        return
+    yield from _stream(
+        _do_evaluate_rf,
+        project_dir.strip(), (rf_model_override or "").strip(),
+        float(cluster_radius), int(n_splits), bool(per_class),
+    )
+
+
+def handle_confusion_matrix(project_dir: str, rf_model_override: str):
+    paths = derive_paths(project_dir, rf_model_override)
+    return _confusion_matrix_image(paths["manifest"], paths["rf_model"])
 
 
 def _confusion_matrix_image(manifest_path: str, rf_model_path: str):
@@ -1020,6 +1384,86 @@ def _confusion_matrix_image(manifest_path: str, rf_model_path: str):
     except Exception:
         return None
 
+
+def handle_audit_table(
+    project_dir: str,
+    rf_model_override: str,
+    low: float = 0.2,
+    high: float = 0.8,
+    include_auto_neg: bool = False,
+) -> list[list]:
+    """R1.5 / G2.2 — suspicious label points as table rows: type, lat, lon,
+    mean OOF probability, label, chip count."""
+    import label_audit
+    paths = derive_paths(project_dir, rf_model_override)
+    oof_path = paths["oof_csv"]
+    if not Path(oof_path).exists():
+        return []
+    try:
+        rows = label_audit.audit_labels(
+            oof_path, low=float(low), high=float(high), include_auto_negatives=bool(include_auto_neg),
+        )
+    except Exception as exc:
+        print(f"Warning: could not audit labels: {exc}")
+        return []
+    if not rows:
+        return []
+    from pyproj import Transformer
+    to_wgs84 = Transformer.from_crs(3067, 4326, always_xy=True)
+    table = []
+    for r in rows:
+        lon, lat = to_wgs84.transform(r["x"], r["y"])
+        label_name = "positive" if r["label"] == 1 else "negative"
+        table.append([r["feature_type"], label_name, round(lat, 6), round(lon, 6),
+                      round(r["mean_prob"], 3), r["n_chips"]])
+    return table
+
+
+# --------------------------------------------------------------------------- #
+# Evaluate RF vs CNN backend (Experimental)
+# --------------------------------------------------------------------------- #
+
+def _do_evaluate_compare(
+    project_dir: str,
+    rf_model_override: str,
+    test_fraction: float,
+) -> None:
+    from cli import cmd_evaluate
+    paths = derive_paths(project_dir, rf_model_override)
+    cmd_evaluate(argparse.Namespace(
+        manifest=paths["manifest"],
+        rf_model=paths["rf_model"],
+        cnn_model=paths["cnn_model"],
+        norm_stats=paths["norm_stats"],
+        test_manifest=None,
+        test_fraction=test_fraction,
+    ))
+
+
+def handle_evaluate_compare(
+    project_dir: str,
+    rf_model_override: str,
+    test_fraction: float,
+):
+    paths = derive_paths(project_dir, rf_model_override)
+    if not Path(paths["manifest"]).exists():
+        yield f"ERROR: No training manifest at {paths['manifest']}. Run Train (RF) with chips first."
+        return
+    if not Path(paths["rf_model"]).exists():
+        yield f"ERROR: No RF model at {paths['rf_model']}. Train RF first."
+        return
+    if not Path(paths["cnn_model"]).exists():
+        yield f"ERROR: No CNN model at {paths['cnn_model']}. Train a CNN first."
+        return
+    yield from _stream(
+        _do_evaluate_compare,
+        project_dir.strip(), (rf_model_override or "").strip(), float(test_fraction),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Diagnose Point (lives inside the Map & Review tab)
+# --------------------------------------------------------------------------- #
 
 def _chip_to_image(chip: np.ndarray) -> np.ndarray:
     """CIR chip (bands, H, W) → false-colour RGB uint8 (H, W, 3): NIR→R, Red→G, Green→B."""
@@ -1113,9 +1557,9 @@ def handle_diagnose(
 ):
     import io as _io
     if not imagery_dir or not imagery_dir.strip():
-        return None, None, None, None, "ERROR: Imagery directory or .jp2 file is required."
-    if not rf_model_path or not rf_model_path.strip():
-        return None, None, None, None, "ERROR: RF model path is required."
+        return None, None, None, None, "ERROR: Imagery directory is required — set it in the Project panel above."
+    if not rf_model_path or not rf_model_path.strip() or not Path(rf_model_path).exists():
+        return None, None, None, None, f"ERROR: RF model not found at {rf_model_path!r}. Train a model first."
     buf = _io.StringIO()
     old = sys.stdout
     sys.stdout = buf
@@ -1136,54 +1580,76 @@ def handle_diagnose(
     return chip_img, ndwi_img, ndvi_img, prob_img, log or "No output."
 
 
+def handle_diagnose_proj(
+    lon: float,
+    lat: float,
+    imagery_dir: str,
+    project_dir: str,
+    rf_model_override: str,
+):
+    paths = derive_paths(project_dir, rf_model_override)
+    return handle_diagnose(lon, lat, imagery_dir, paths["rf_model"])
+
+
 def handle_map_click_followup(
     status_msg: str,
     lon: float,
     lat: float,
     imagery_dir: str,
-    rf_model_path: str,
+    project_dir: str,
+    rf_model_override: str,
 ):
-    """After the map-click JS fills diag_lon/diag_lat: switch to the Diagnose Point
-    tab and run the diagnosis automatically — but only if a point was actually
-    clicked (status_msg starts with "Selected:"; see the map_diagnose_btn wiring).
-    Otherwise leave everything as-is so the "click the map first" message stands.
-    """
+    """After the map-click JS fills diag_lon/diag_lat: run the diagnosis
+    automatically — but only if a point was actually clicked (status_msg
+    starts with "Selected:"; see the map_diagnose_btn wiring). Otherwise
+    leave everything as-is so the "click the map first" message stands.
+    Diagnose Point lives in the same tab as the map now, so no tab switch
+    is needed (unlike the old separate-tab layout)."""
     if not (status_msg or "").startswith("Selected:"):
-        return gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
-    chip_img, ndwi_img, ndvi_img, prob_img, log = handle_diagnose(
-        lon, lat, imagery_dir, rf_model_path
+        return gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
+    chip_img, ndwi_img, ndvi_img, prob_img, log = handle_diagnose_proj(
+        lon, lat, imagery_dir, project_dir, rf_model_override
     )
-    return gr.Tabs(selected="diagnose"), chip_img, ndwi_img, ndvi_img, prob_img, log
+    return chip_img, ndwi_img, ndvi_img, prob_img, log
 
 
-def _do_overview(
+# --------------------------------------------------------------------------- #
+# Data check (Overview + validation) — G1.2
+# --------------------------------------------------------------------------- #
+
+def _fmt_size(path: str) -> str:
+    try:
+        s = Path(path).stat().st_size
+        if s > 1e9: return f"{s/1e9:.1f} GB"
+        if s > 1e6: return f"{s/1e6:.1f} MB"
+        return f"{s/1e3:.0f} KB"
+    except Exception:
+        return "?"
+
+
+def _fmt_mtime(path: str) -> str:
+    try:
+        ts = Path(path).stat().st_mtime
+        return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return "?"
+
+
+def _do_data_check(
     imagery_dir: str,
     labels_dir: str,
-    models_dir: str,
-    chips_dir: str,
+    hydro_dir: str,
+    project_dir: str,
 ) -> str:
-    import datetime
+    import training_data
+
+    paths = derive_paths(project_dir)
     lines: list[str] = []
     warnings: list[str] = []
 
-    def _fmt_size(path: str) -> str:
-        try:
-            s = Path(path).stat().st_size
-            if s > 1e9: return f"{s/1e9:.1f} GB"
-            if s > 1e6: return f"{s/1e6:.1f} MB"
-            return f"{s/1e3:.0f} KB"
-        except Exception:
-            return "?"
-
-    def _fmt_mtime(path: str) -> str:
-        try:
-            ts = Path(path).stat().st_mtime
-            return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
-        except Exception:
-            return "?"
-
     # ---- Imagery ----
     lines.append("=== Imagery ===")
+    jp2s: list[str] = []
     if imagery_dir:
         jp2s = _find_files(imagery_dir, ".jp2")
         if jp2s:
@@ -1197,78 +1663,116 @@ def _do_overview(
             lines.append(f"  No .jp2 files found in {imagery_dir!r}")
             warnings.append(f"No imagery found in {imagery_dir!r}")
     else:
-        lines.append("  (not specified)")
+        lines.append("  (not specified — set Imagery directory in the Project panel)")
 
     # ---- Labels ----
     lines.append("\n=== Labels ===")
+    all_points: list[tuple] = []
     if labels_dir:
         kml_files = _find_files(labels_dir, ".kml") + _find_files(labels_dir, ".kmz")
         if kml_files:
             lines.append(f"  {len(kml_files)} KML/KMZ file(s)")
-            # Feature type comes from the enclosing KML *folder* name — the same
-            # resolution training_data.parse_kml_labels uses to derive the class,
-            # not the placemark name (which training ignores when inside a folder).
-            import training_data
             counts: dict[str, int] = {}
             for kp in kml_files:
                 try:
-                    for _, ftype in training_data.parse_kml_labels(kp):
+                    for point, ftype in training_data.parse_kml_labels(kp):
                         counts[ftype] = counts.get(ftype, 0) + 1
-                except Exception:
-                    pass
+                        all_points.append((point, ftype))
+                except Exception as exc:
+                    warnings.append(f"Could not parse {kp}: {exc}")
+            unknown_total = 0
             for k, v in sorted(counts.items()):
-                lines.append(f"    {k}: {v}")
+                tag = ""
+                if k not in training_data.FEATURE_TO_LABEL and k not in training_data.DEFAULT_EXCLUDE:
+                    tag = "  (unrecognised — dropped by training)"
+                    unknown_total += v
+                lines.append(f"    {k}: {v}{tag}")
+            if unknown_total:
+                warnings.append(
+                    f"{unknown_total} label(s) have an unrecognised folder/type name and "
+                    "will be dropped by training"
+                )
             if not counts:
                 warnings.append("No placemark points found in KML files")
         else:
             lines.append(f"  No KML/KMZ files found in {labels_dir!r}")
             warnings.append(f"No labels found in {labels_dir!r}")
     else:
-        lines.append("  (not specified)")
+        lines.append("  (not specified — set Labels directory in the Project panel)")
+
+    # ---- Labels outside imagery coverage ----
+    if all_points and jp2s:
+        try:
+            import rasterio
+            tile_bboxes = []
+            for f in jp2s:
+                with rasterio.open(f) as src:
+                    b = src.bounds
+                    tile_bboxes.append((b.left, b.bottom, b.right, b.top))
+            outside = 0
+            for point, _ in all_points:
+                x, y = point.x, point.y
+                if not any(minx <= x <= maxx and miny <= y <= maxy for minx, miny, maxx, maxy in tile_bboxes):
+                    outside += 1
+            if outside:
+                warnings.append(f"{outside} label(s) fall outside any imagery tile's coverage")
+        except Exception as exc:
+            warnings.append(f"Could not check label/tile coverage: {exc}")
+
+    # ---- Hydrography ----
+    lines.append("\n=== Hydrography ===")
+    if hydro_dir:
+        try:
+            from masking import _resolve_files
+            files = _resolve_files(hydro_dir)
+            if files:
+                lines.append(f"  {len(files)} file(s) found")
+            else:
+                lines.append(f"  No hydrography files found in {hydro_dir!r}")
+                warnings.append(f"No hydrography files found in {hydro_dir!r}")
+        except Exception as exc:
+            warnings.append(f"Could not read hydrography: {exc}")
+    else:
+        lines.append("  (not specified — optional, but recommended for stream-filtered detection)")
 
     # ---- Models ----
     lines.append("\n=== Models ===")
-    if models_dir:
-        p = Path(models_dir)
-        if p.exists():
-            model_files = sorted(
-                f for f in p.iterdir()
-                if f.is_file() and f.suffix in (".pkl", ".pth", ".json")
-            )
-            if model_files:
-                for f in model_files:
-                    lines.append(f"  {f.name}  ({_fmt_size(str(f))}  modified {_fmt_mtime(str(f))})")
-            else:
-                lines.append(f"  No model files (.pkl/.pth/.json) found in {models_dir!r}")
+    models_dir = paths["models_dir"]
+    p = Path(models_dir)
+    if p.exists():
+        model_files = sorted(
+            f for f in p.iterdir()
+            if f.is_file() and f.suffix in (".pkl", ".pth", ".json")
+        )
+        if model_files:
+            for f in model_files:
+                lines.append(f"  {f.name}  ({_fmt_size(str(f))}  modified {_fmt_mtime(str(f))})")
         else:
-            lines.append(f"  Directory not found: {models_dir!r}")
+            lines.append(f"  No model files (.pkl/.pth/.json) found in {models_dir!r}")
     else:
-        lines.append("  (not specified)")
+        lines.append(f"  Directory not found: {models_dir!r} (created on first train)")
 
     # ---- Training chips ----
     lines.append("\n=== Training Chips ===")
-    if chips_dir:
-        manifest_path = Path(chips_dir) / "manifest.csv"
-        if manifest_path.exists():
-            try:
-                with open(manifest_path) as f:
-                    rows = list(csv.DictReader(f))
-                positive = [r for r in rows if int(r["label"]) == 1]
-                negative = [r for r in rows if int(r["label"]) == 0]
-                by_type: dict[str, int] = {}
-                for r in positive:
-                    ft = r.get("feature_type", "unknown")
-                    by_type[ft] = by_type.get(ft, 0) + 1
-                type_str = "  ".join(f"{k}: {v}" for k, v in sorted(by_type.items()))
-                lines.append(f"  {len(rows)} chips total")
-                lines.append(f"  Positive: {len(positive)}  ({type_str})")
-                lines.append(f"  Negative: {len(negative)}")
-            except Exception as exc:
-                lines.append(f"  Error reading manifest: {exc}")
-        else:
-            lines.append(f"  No manifest.csv found in {chips_dir!r}")
+    manifest_path = Path(paths["manifest"])
+    if manifest_path.exists():
+        try:
+            with open(manifest_path) as f:
+                rows = list(csv.DictReader(f))
+            positive = [r for r in rows if int(r["label"]) == 1]
+            negative = [r for r in rows if int(r["label"]) == 0]
+            by_type: dict[str, int] = {}
+            for r in positive:
+                ft = r.get("feature_type", "unknown")
+                by_type[ft] = by_type.get(ft, 0) + 1
+            type_str = "  ".join(f"{k}: {v}" for k, v in sorted(by_type.items()))
+            lines.append(f"  {len(rows)} chips total")
+            lines.append(f"  Positive: {len(positive)}  ({type_str})")
+            lines.append(f"  Negative: {len(negative)}")
+        except Exception as exc:
+            lines.append(f"  Error reading manifest: {exc}")
     else:
-        lines.append("  (not specified)")
+        lines.append(f"  No manifest.csv yet at {manifest_path} — run Train to create it")
 
     if warnings:
         lines.append("\n=== Warnings ===")
@@ -1278,18 +1782,16 @@ def _do_overview(
     return "\n".join(lines)
 
 
-def handle_overview(
+def handle_data_check(
     imagery_dir: str,
     labels_dir: str,
-    models_dir: str,
-    chips_dir: str,
+    hydro_dir: str,
+    project_dir: str,
 ) -> str:
     try:
-        return _do_overview(
-            (imagery_dir or "").strip(),
-            (labels_dir  or "").strip(),
-            (models_dir  or "").strip(),
-            (chips_dir   or "").strip(),
+        return _do_data_check(
+            (imagery_dir or "").strip(), (labels_dir or "").strip(),
+            (hydro_dir or "").strip(), (project_dir or "").strip(),
         )
     except Exception as exc:
         return f"ERROR: {exc}"
@@ -1321,70 +1823,14 @@ def _load_chip_gallery(chips_dir: str, n_per_class: int = 12) -> list:
     return gallery
 
 
-def handle_chip_gallery(chips_dir: str) -> list:
-    if not chips_dir or not chips_dir.strip():
+def handle_chip_gallery(project_dir: str) -> list:
+    if not project_dir or not project_dir.strip():
         return []
     try:
-        return _load_chip_gallery(chips_dir.strip())
+        paths = derive_paths(project_dir.strip())
+        return _load_chip_gallery(paths["chips_dir"])
     except Exception:
         return []
-
-
-def _do_evaluate_compare(
-    manifest_path: str,
-    rf_model_path: str,
-    cnn_model_path: str,
-    norm_stats_path: str,
-    test_fraction: float,
-) -> None:
-    from cli import cmd_evaluate
-    cmd_evaluate(argparse.Namespace(
-        manifest=manifest_path,
-        rf_model=rf_model_path,
-        cnn_model=cnn_model_path,
-        norm_stats=norm_stats_path,
-        test_fraction=test_fraction,
-    ))
-
-
-def handle_evaluate_compare(
-    manifest_path: str,
-    rf_model_path: str,
-    cnn_model_path: str,
-    norm_stats_path: str,
-    test_fraction: float,
-):
-    if not manifest_path or not manifest_path.strip():
-        yield "ERROR: Manifest CSV path is required."; return
-    if not rf_model_path or not rf_model_path.strip():
-        yield "ERROR: RF model path is required."; return
-    if not cnn_model_path or not cnn_model_path.strip():
-        yield "ERROR: CNN model path is required."; return
-    if not norm_stats_path or not norm_stats_path.strip():
-        yield "ERROR: Norm stats path is required."; return
-    yield from _stream(
-        _do_evaluate_compare,
-        manifest_path.strip(), rf_model_path.strip(),
-        cnn_model_path.strip(), norm_stats_path.strip(),
-        float(test_fraction),
-    )
-
-
-def handle_evaluate_rf(
-    manifest_path: str,
-    rf_model_path: str,
-    cluster_radius: float,
-    per_class: bool,
-):
-    if not manifest_path or not manifest_path.strip():
-        yield "ERROR: Manifest CSV path is required."; return
-    # RF model path is optional here — CV folds are always trained fresh
-    # (see models.random_forest.make_classifier); it's only echoed for reference.
-    yield from _stream(
-        _do_evaluate_rf,
-        manifest_path.strip(), (rf_model_path or "").strip(),
-        float(cluster_radius), bool(per_class),
-    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1393,313 +1839,324 @@ def handle_evaluate_rf(
 
 with gr.Blocks(title="CastorDetector") as demo:
     gr.Markdown("# CastorDetector\nBeaver activity detection in MML aerial imagery.")
-    with gr.Row():
-        save_btn    = gr.Button("Save as defaults", variant="secondary", scale=0)
-        save_status = gr.Textbox(label="", interactive=False, scale=1, max_lines=1,
-                                 show_label=False, placeholder="")
+
+    _project_configured = bool(_s.get("imagery_dir") or _s.get("labels_dir"))
+
+    # ------------------------------------------------------------------ #
+    # G1.1 — Shared Project panel (collapsible once set)
+    # ------------------------------------------------------------------ #
+    with gr.Accordion("Project", open=not _project_configured) as project_accordion:
+        with gr.Row():
+            proj_imagery = gr.Textbox(
+                label="Imagery directory", placeholder="data/imagery/",
+                value=_s.get("imagery_dir", ""),
+            )
+            proj_labels = gr.Textbox(
+                label="Labels directory", placeholder="data/labels/",
+                value=_s.get("labels_dir", ""),
+            )
+        with gr.Row():
+            proj_hydro = gr.Textbox(
+                label="Hydrography directory (optional)", placeholder="data/hydrography/",
+                value=_s.get("hydro_dir", ""),
+            )
+            proj_dir = gr.Textbox(
+                label="Project directory", placeholder=DEFAULT_PROJECT_DIR,
+                value=_s.get("project_dir", DEFAULT_PROJECT_DIR),
+                info="Models, chips, and detection outputs are all derived from this directory.",
+            )
+        with gr.Accordion("Advanced: override model path", open=False):
+            proj_rf_model_override = gr.Dropdown(
+                label="RF model file (.pkl) — default: <project>/models/model.pkl",
+                choices=list_model_files(
+                    derive_paths(_s.get("project_dir", DEFAULT_PROJECT_DIR))["models_dir"], ".pkl"
+                ),
+                value=_s.get("rf_model_override", ""),
+                allow_custom_value=True,
+                info="Leave blank to use the default. Pick a saved .pkl to compare models without retraining.",
+            )
+            proj_refresh_models_btn = gr.Button("Refresh list", size="sm", scale=0)
+        status_line = gr.Markdown(build_status_line(
+            derive_paths(_s.get("project_dir", DEFAULT_PROJECT_DIR),
+                         _s.get("rf_model_override", ""))["rf_model"],
+            _s.get("labels_dir", ""),
+        ))
+
+    save_status = gr.Textbox(
+        label="", interactive=False, max_lines=1, show_label=False,
+        placeholder="Settings are saved automatically as you edit them.",
+    )
+
     with gr.Tabs() as main_tabs:
 
         # ------------------------------------------------------------------ #
-        # Train RF
+        # 1. Data check
         # ------------------------------------------------------------------ #
-        with gr.Tab("Train RF"):
+        with gr.Tab("1. Data check"):
+            gr.Markdown(
+                "## Data Check\n"
+                "Validate your project before training or detection: confirms paths exist, "
+                "counts tiles and labels by type, flags unrecognised label types and labels "
+                "outside imagery coverage, and confirms hydrography is available."
+            )
+            dc_btn = gr.Button("Scan", variant="primary")
+            dc_out = gr.Textbox(label="Summary", lines=24, interactive=False)
+            gr.Markdown("### Chip sample (CIR false-colour)")
+            dc_gallery = gr.Gallery(
+                label="Training chips — positives then negatives (up to 12 each)",
+                columns=6, height=320, object_fit="contain",
+            )
+            dc_event = dc_btn.click(
+                fn=handle_data_check,
+                inputs=[proj_imagery, proj_labels, proj_hydro, proj_dir],
+                outputs=dc_out,
+            )
+            dc_event.then(fn=handle_chip_gallery, inputs=[proj_dir], outputs=[dc_gallery])
+
+        # ------------------------------------------------------------------ #
+        # 2. Train
+        # ------------------------------------------------------------------ #
+        with gr.Tab("2. Train"):
             gr.Markdown(
                 "## Train Random Forest\n"
-                "Extract chips from labelled imagery and train a Random Forest classifier."
+                "Extract chips from labelled imagery and train the Random Forest classifier. "
+                "Chips are always kept in `<project>/chips/` so Evaluate can run right away."
             )
-            with gr.Row():
-                rf_imagery = gr.Textbox(label="Imagery directory or .jp2 file", placeholder="data/imagery/",   value=_s.get("rf_imagery", ""))
-                rf_labels  = gr.Textbox(label="Labels directory",  placeholder="data/labels/",    value=_s.get("rf_labels",  ""))
-            with gr.Row():
-                rf_model  = gr.Textbox(label="Model output path (.pkl)", placeholder="data/models/model.pkl",   value=_s.get("rf_model", ""))
-                rf_hydro  = gr.Textbox(label="Hydrography directory (optional)", placeholder="data/hydrography/", value=_s.get("rf_hydro", ""))
-            with gr.Row():
-                rf_chips   = gr.Textbox(label="Chip directory (optional, enables evaluate-rf)", placeholder="data/chips/", value=_s.get("rf_chips", ""))
-                rf_augment = gr.Slider(minimum=0, maximum=12, value=6, step=1,
-                                       label="Augment positives (extra offset chips per label)")
-            with gr.Row():
-                rf_flood_samples = gr.Number(
-                    label="Flood samples from hydrography (tulvaalue, 0 = disabled)",
-                    value=int(_s.get("rf_flood_samples", 0)), precision=0, minimum=0,
+            tr_run_cv = gr.Checkbox(
+                label="Run spatial cross-validation after training", value=bool(_s.get("train_run_cv", True)),
+                info="Recommended — populates the Evaluate tab automatically when training finishes.",
+            )
+            with gr.Accordion("Advanced", open=False):
+                tr_augment = gr.Slider(
+                    minimum=0, maximum=12, value=int(_s.get("train_augment", 6)), step=1,
+                    label="Augment positives (extra offset chips per label)",
+                    info="More augmentation helps with few labels but can overfit to a single feature.",
                 )
-                rf_hydro_negatives = gr.Checkbox(
-                    label="Restrict auto-negatives to stream corridor (requires hydrography)",
-                    value=bool(_s.get("rf_hydro_negatives", False)),
+                tr_flood_samples = gr.Number(
+                    label="Flood samples from hydrography", value=int(_s.get("train_flood_samples", 0)),
+                    precision=0, minimum=0,
+                    info="Extra positives sampled from mapped flood areas (MML tulvaalue). Requires hydrography.",
+                )
+                tr_hydro_negatives = gr.Checkbox(
+                    label="Restrict auto-negatives to stream corridor",
+                    value=bool(_s.get("train_hydro_negatives", False)),
+                    info="Requires hydrography. Leave off (default) when using generic dead_forest/flood labels "
+                         "so negatives are sampled from the full imagery extent, per the training workflow.",
+                )
+                tr_neg_ratio = gr.Slider(
+                    minimum=0.25, maximum=4.0, value=float(_s.get("train_neg_ratio", 1.0)), step=0.25,
+                    label="Negative:positive ratio",
+                    info="Auto-negative chip count relative to positives after augmentation.",
                 )
             with gr.Row():
-                rf_btn  = gr.Button("Train RF", variant="primary")
-                rf_stop = gr.Button("Stop", variant="stop")
-            rf_log = gr.Textbox(label="Log", lines=15, interactive=False)
-            rf_history_state = gr.State([])
+                tr_btn  = gr.Button("Train RF", variant="primary")
+                tr_stop = gr.Button("Stop", variant="stop")
+            tr_log = gr.Textbox(label="Log", lines=15, interactive=False)
+            tr_history_state = gr.State([])
             with gr.Accordion("Previous runs", open=False):
-                rf_history_text = gr.Textbox(label="", lines=10, interactive=False, show_label=False)
-            rf_event = rf_btn.click(
+                tr_history_text = gr.Textbox(label="", lines=10, interactive=False, show_label=False)
+            tr_event = tr_btn.click(
                 fn=handle_train_rf,
-                inputs=[rf_imagery, rf_labels, rf_model, rf_hydro, rf_chips,
-                        rf_augment, rf_flood_samples, rf_hydro_negatives],
-                outputs=rf_log,
+                inputs=[proj_imagery, proj_labels, proj_hydro, proj_dir, proj_rf_model_override,
+                        tr_augment, tr_flood_samples, tr_hydro_negatives, tr_neg_ratio],
+                outputs=tr_log,
             )
 
         # ------------------------------------------------------------------ #
-        # Train CNN
+        # 3. Evaluate
         # ------------------------------------------------------------------ #
-        with gr.Tab("Train CNN"):
-            gr.Markdown(
-                "## Train CNN (Prithvi-EO-1.0-100M)\n"
-                "Fine-tune the pretrained geospatial foundation model on your labelled chips.\n"
-                "> **Note:** Downloads ~454 MB of pretrained weights from HuggingFace on first run."
-            )
-            with gr.Row():
-                cnn_imagery    = gr.Textbox(label="Imagery directory or .jp2 file", placeholder="data/imagery/",                value=_s.get("cnn_imagery",    ""))
-                cnn_labels     = gr.Textbox(label="Labels directory",         placeholder="data/labels/",                 value=_s.get("cnn_labels",     ""))
-            with gr.Row():
-                cnn_model      = gr.Textbox(label="Model output path (.pth)", placeholder="data/models/beaver_cnn_v1.pth", value=_s.get("cnn_model",      ""))
-                cnn_norm_stats = gr.Textbox(label="Norm stats path (.json)",  placeholder="data/models/norm_stats.json",   value=_s.get("cnn_norm_stats", ""))
-            with gr.Row():
-                cnn_hydro = gr.Textbox(label="Hydrography directory (optional)", placeholder="data/hydrography/",         value=_s.get("cnn_hydro",      ""))
-            with gr.Row():
-                cnn_epochs = gr.Number(value=int(_s.get("cnn_epochs", 30)),       label="Epochs",        precision=0)
-                cnn_lr     = gr.Number(value=float(_s.get("cnn_lr", 0.001)), label="Learning rate")
-            with gr.Row():
-                cnn_btn  = gr.Button("Train CNN", variant="primary")
-                cnn_stop = gr.Button("Stop", variant="stop")
-            cnn_log = gr.Textbox(label="Log", lines=15, interactive=False)
-            cnn_history_state = gr.State([])
-            with gr.Accordion("Previous runs", open=False):
-                cnn_history_text = gr.Textbox(label="", lines=10, interactive=False, show_label=False)
-            cnn_event = cnn_btn.click(
-                fn=handle_train_cnn,
-                inputs=[cnn_imagery, cnn_labels, cnn_model, cnn_norm_stats, cnn_hydro, cnn_epochs, cnn_lr],
-                outputs=cnn_log,
-            )
-
-        # ------------------------------------------------------------------ #
-        # Detect & Export
-        # ------------------------------------------------------------------ #
-        with gr.Tab("Detect & Export"):
-            gr.Markdown(
-                "## Detect & Export\n"
-                "Run the trained model on imagery and export detections as a KML file."
-            )
-            with gr.Row():
-                det_imagery = gr.Textbox(label="Imagery directory or .jp2 file", placeholder="data/imagery/",             value=_s.get("det_imagery",    ""))
-                det_output  = gr.Textbox(label="Output KML path",   placeholder="data/output/detections.kml", value=_s.get("det_output",     ""))
-            with gr.Row():
-                det_method = gr.Dropdown(choices=["rf", "cnn", "both"], value=_s.get("det_method", "rf"), label="Method")
-                det_hydro  = gr.Textbox(label="Hydrography directory (optional)", placeholder="data/hydrography/", value=_s.get("det_hydro", ""))
-            with gr.Row():
-                with gr.Column():
-                    det_rf_model      = gr.Textbox(label="RF model path (.pkl)",  placeholder="data/models/model.pkl",         value=_s.get("det_rf_model",  ""))
-                    det_rf_model_btn  = gr.UploadButton("📂 Browse", file_types=[".pkl"],  size="sm")
-                with gr.Column():
-                    det_cnn_model     = gr.Textbox(label="CNN model path (.pth)", placeholder="data/models/beaver_cnn_v1.pth", value=_s.get("det_cnn_model", ""))
-                    det_cnn_model_btn = gr.UploadButton("📂 Browse", file_types=[".pth"],  size="sm")
-            with gr.Row():
-                with gr.Column():
-                    det_norm_stats     = gr.Textbox(label="Norm stats path (.json)", placeholder="data/models/norm_stats.json", value=_s.get("det_norm_stats", ""))
-                    det_norm_stats_btn = gr.UploadButton("📂 Browse", file_types=[".json"], size="sm")
-                with gr.Column():
-                    det_threshold = gr.Slider(minimum=0.0, maximum=1.0, value=float(_s.get("det_threshold", 0.5)), step=0.05,
-                                              label="Confidence threshold")
-            with gr.Row():
-                det_btn  = gr.Button("Detect & Export KML", variant="primary")
-                det_stop = gr.Button("Stop", variant="stop")
-            det_log   = gr.Textbox(label="Log", lines=15, interactive=False)
-            det_stats = gr.Textbox(label="Statistics", lines=8, interactive=False)
-            det_file  = gr.File(label="Download KML", interactive=False)
-            det_history_state = gr.State([])
-            with gr.Accordion("Previous runs", open=False):
-                det_history_text = gr.Textbox(label="", lines=10, interactive=False, show_label=False)
-            # det_btn.click() is wired after the Map tab so map_kml is in scope
-
-        # ------------------------------------------------------------------ #
-        # Evaluate RF
-        # ------------------------------------------------------------------ #
-        with gr.Tab("Evaluate RF"):
+        with gr.Tab("3. Evaluate"):
             gr.Markdown(
                 "## Evaluate RF\n"
-                "Assess model quality using pooled out-of-fold spatial cross-validation: "
-                "label points within the cluster radius are grouped into the same fold "
-                "(avoiding the spatial autocorrelation leak a random split introduces), each "
-                "fold's held-out probabilities are pooled before computing metrics, and results "
-                "are reported at both a chip level and a point level (chips from the same label "
-                "point, including augmented copies, are averaged together).\n"
-                "Reports ROC-AUC, PR-AUC, a recommended (max-F1) threshold, and a breakdown by "
-                "feature type. Results are written to `oof.csv` next to the manifest."
+                "Pooled out-of-fold spatial cross-validation: label points within the cluster "
+                "radius are grouped into the same fold (avoiding the spatial-autocorrelation "
+                "leak a random split introduces), each fold's held-out probabilities are pooled "
+                "before computing metrics, and results are reported at both a chip level and a "
+                "point level. Reports ROC-AUC, PR-AUC, a recommended (max-F1) threshold, and a "
+                "per-feature-type breakdown. Results are written to `chips/oof.csv`."
             )
-            with gr.Row():
-                with gr.Column():
-                    ev_manifest     = gr.Textbox(label="Manifest CSV path",    placeholder="data/chips/manifest.csv", value=_s.get("ev_manifest", ""))
-                    ev_manifest_btn = gr.UploadButton("📂 Browse", file_types=[".csv"], size="sm")
-                with gr.Column():
-                    ev_rf_model     = gr.Textbox(label="RF model path (.pkl, optional — for reference only; CV folds are always trained fresh)", placeholder="data/models/model.pkl",   value=_s.get("ev_rf_model", ""))
-                    ev_rf_model_btn = gr.UploadButton("📂 Browse", file_types=[".pkl"], size="sm")
-            with gr.Row():
-                ev_radius    = gr.Slider(minimum=100, maximum=2000, value=float(_s.get("ev_radius", 500)), step=50,
-                                         label="Cluster radius (metres)")
-                ev_per_class = gr.Checkbox(label="Per-feature-type breakdown (recall for positive types, specificity for negative types)", value=bool(_s.get("ev_per_class", False)))
+            with gr.Accordion("Advanced", open=False):
+                ev_radius = gr.Slider(
+                    minimum=100, maximum=2000, value=float(_s.get("ev_radius", 500)), step=50,
+                    label="Cluster radius (metres)",
+                    info="Label points within this distance are treated as one spatial cluster.",
+                )
+                ev_n_splits = gr.Slider(
+                    minimum=2, maximum=10, value=int(_s.get("ev_n_splits", 5)), step=1,
+                    label="CV folds", info="Capped automatically at the number of spatial clusters.",
+                )
+                ev_per_class = gr.Checkbox(
+                    label="Per-feature-type breakdown", value=bool(_s.get("ev_per_class", True)),
+                    info="Recall for positive types, specificity for negative types.",
+                )
+                gr.Markdown("**Label audit thresholds**")
+                with gr.Row():
+                    audit_low = gr.Slider(
+                        minimum=0.0, maximum=0.5, value=float(_s.get("audit_low", 0.2)), step=0.05,
+                        label="Flag positives below this probability",
+                    )
+                    audit_high = gr.Slider(
+                        minimum=0.5, maximum=1.0, value=float(_s.get("audit_high", 0.8)), step=0.05,
+                        label="Flag negatives above this probability",
+                    )
+                audit_include_auto_neg = gr.Checkbox(
+                    label="Include auto-sampled negatives in the audit",
+                    value=bool(_s.get("audit_include_auto_neg", False)),
+                    info="Auto-negatives come from random sampling, not a human decision — off by default.",
+                )
             with gr.Row():
                 ev_btn  = gr.Button("Evaluate RF", variant="primary")
                 ev_stop = gr.Button("Stop", variant="stop")
             ev_log = gr.Textbox(label="Results", lines=20, interactive=False)
             ev_cm  = gr.Image(label="Confusion matrix — spatial CV (out-of-fold)", type="numpy", height=320)
+            gr.Markdown(
+                "### Label audit — suspicious label points\n"
+                "Positives the model consistently scores low, and hand-labelled negatives it "
+                "scores high. Worth a second look in Google Earth — some are mislabels."
+            )
+            ev_audit_table = gr.Dataframe(
+                headers=["type", "label", "lat", "lon", "mean OOF prob", "n chips"],
+                interactive=False,
+            )
             ev_history_state = gr.State([])
             with gr.Accordion("Previous runs", open=False):
                 ev_history_text = gr.Textbox(label="", lines=10, interactive=False, show_label=False)
             ev_event = ev_btn.click(
                 fn=handle_evaluate_rf,
-                inputs=[ev_manifest, ev_rf_model, ev_radius, ev_per_class],
+                inputs=[proj_dir, proj_rf_model_override, ev_radius, ev_n_splits, ev_per_class],
                 outputs=ev_log,
             )
 
         # ------------------------------------------------------------------ #
-        # Evaluate RF vs CNN
+        # 4. Detect
         # ------------------------------------------------------------------ #
-        with gr.Tab("Evaluate RF vs CNN"):
+        with gr.Tab("4. Detect"):
             gr.Markdown(
-                "## Evaluate RF vs CNN\n"
-                "Compare the two saved models on a spatially-held-out slice of the training "
-                "manifest.\n"
-                "> **⚠ IN-SAMPLE — these chips were used to train the saved models; numbers "
-                "are optimistic.** Both models were fit on the full manifest, so no split of "
-                "it is truly held out. Pass `--test-manifest` on the CLI with chips built from "
-                "separate, unseen tiles for a genuine out-of-sample comparison. "
-                "Use the **Evaluate RF** tab for spatially rigorous cross-validation of the RF model."
+                "## Detect (Random Forest)\n"
+                "Run the trained RF model on imagery and export detections as a timestamped KML file."
             )
+            dt_method_state = gr.State("rf")
+            det_threshold_default = float((read_model_sidecar(
+                derive_paths(_s.get("project_dir", DEFAULT_PROJECT_DIR),
+                             _s.get("rf_model_override", ""))["rf_model"]
+            ) or {}).get("recommended_threshold") or _s.get("det_threshold", 0.5) or 0.5)
+            det_threshold_label = "Confidence threshold"
+            _det_meta = read_model_sidecar(derive_paths(
+                _s.get("project_dir", DEFAULT_PROJECT_DIR), _s.get("rf_model_override", ""))["rf_model"])
+            if _det_meta and _det_meta.get("recommended_threshold") is not None:
+                det_threshold_label = f"Confidence threshold (recommended: {_det_meta['recommended_threshold']:.2f})"
+            dt_threshold = gr.Slider(
+                minimum=0.0, maximum=1.0, value=det_threshold_default, step=0.05,
+                label=det_threshold_label,
+            )
+            with gr.Accordion("Advanced", open=False):
+                dt_min_area = gr.Number(
+                    label="Minimum detection area (m²)", value=float(_s.get("det_min_area", 2048.0)),
+                    info="Roughly 2 RF patches; a single 64px patch is 1024 m².",
+                )
+                dt_seed_threshold = gr.Number(
+                    label="Seed threshold (blank = auto: threshold + 0.15)",
+                    value=_s.get("det_seed_threshold", None),
+                    info="A region is kept only if it contains a cell at or above this confidence.",
+                )
+                dt_no_smooth = gr.Checkbox(
+                    label="Disable probability-map smoothing", value=bool(_s.get("det_no_smooth", False)),
+                    info="Turns off 3x3 NaN-aware smoothing before hysteresis thresholding.",
+                )
+                dt_output = gr.Textbox(
+                    label="Output KML path (blank = auto-timestamped in <project>/output/)",
+                    placeholder="(auto)", value=_s.get("det_output_override", ""),
+                )
             with gr.Row():
-                with gr.Column():
-                    cmp_manifest     = gr.Textbox(label="Manifest CSV path",       placeholder="data/chips/manifest.csv",       value=_s.get("cmp_manifest",   ""))
-                    cmp_manifest_btn = gr.UploadButton("📂 Browse", file_types=[".csv"], size="sm")
-                with gr.Column():
-                    cmp_rf_model     = gr.Textbox(label="RF model path (.pkl)",    placeholder="data/models/model.pkl",         value=_s.get("cmp_rf_model",   ""))
-                    cmp_rf_model_btn = gr.UploadButton("📂 Browse", file_types=[".pkl"], size="sm")
-            with gr.Row():
-                with gr.Column():
-                    cmp_cnn_model     = gr.Textbox(label="CNN model path (.pth)",   placeholder="data/models/beaver_cnn_v1.pth", value=_s.get("cmp_cnn_model",  ""))
-                    cmp_cnn_model_btn = gr.UploadButton("📂 Browse", file_types=[".pth"],  size="sm")
-                with gr.Column():
-                    cmp_norm_stats     = gr.Textbox(label="Norm stats path (.json)", placeholder="data/models/norm_stats.json",   value=_s.get("cmp_norm_stats", ""))
-                    cmp_norm_stats_btn = gr.UploadButton("📂 Browse", file_types=[".json"], size="sm")
-            cmp_test_frac = gr.Slider(minimum=0.1, maximum=0.5, value=float(_s.get("cmp_test_frac", 0.2)), step=0.05,
-                                      label="Test fraction")
-            with gr.Row():
-                cmp_btn  = gr.Button("Evaluate", variant="primary")
-                cmp_stop = gr.Button("Stop", variant="stop")
-            cmp_log = gr.Textbox(label="Results", lines=12, interactive=False)
-            cmp_history_state = gr.State([])
+                dt_btn  = gr.Button("Detect & Export KML", variant="primary")
+                dt_stop = gr.Button("Stop", variant="stop")
+            dt_log   = gr.Textbox(label="Log", lines=15, interactive=False)
+            dt_stats = gr.Textbox(label="Statistics", lines=8, interactive=False)
+            dt_file  = gr.File(label="Download KML", interactive=False)
+            dt_history_state = gr.State([])
             with gr.Accordion("Previous runs", open=False):
-                cmp_history_text = gr.Textbox(label="", lines=10, interactive=False, show_label=False)
-            cmp_event = cmp_btn.click(
-                fn=handle_evaluate_compare,
-                inputs=[cmp_manifest, cmp_rf_model, cmp_cnn_model, cmp_norm_stats, cmp_test_frac],
-                outputs=cmp_log,
-            )
+                dt_history_text = gr.Textbox(label="", lines=10, interactive=False, show_label=False)
+            # dt_btn.click() wired after Map & Review so mp_kml_dropdown is in scope
 
         # ------------------------------------------------------------------ #
-        # Diagnose Point
+        # 5. Map & Review
         # ------------------------------------------------------------------ #
-        with gr.Tab("Diagnose Point", id="diagnose"):
+        with gr.Tab("5. Map & Review"):
             gr.Markdown(
-                "## Diagnose Point\n"
-                "Extract the chip at a known WGS84 location, run the RF classifier, "
-                "and visualise the spectral signature. Useful for understanding false "
-                "positives and missed detections."
+                "## Map & Review\n"
+                "View detection polygons, training labels, hydrography, and suspicious label "
+                "audit points on an interactive map. Click anywhere on the map (including a "
+                "marker) to diagnose that point below."
             )
             with gr.Row():
-                diag_lon       = gr.Number(value=25.0,  label="Longitude (WGS84)")
-                diag_lat       = gr.Number(value=62.0,  label="Latitude (WGS84)")
+                mp_kml_dropdown = gr.Dropdown(
+                    label="Detections KML (past runs, newest first)",
+                    choices=list_output_kmls(_s.get("project_dir", DEFAULT_PROJECT_DIR)),
+                    value=_s.get("map_kml", ""), allow_custom_value=True,
+                )
+                mp_refresh_btn = gr.Button("Refresh list", size="sm", scale=0)
             with gr.Row():
-                diag_imagery  = gr.Textbox(label="Imagery directory or .jp2 file", placeholder="data/imagery/", value=_s.get("diag_imagery", ""))
-                with gr.Column():
-                    diag_rf_model     = gr.Textbox(label="RF model path (.pkl)", placeholder="data/models/model.pkl", value=_s.get("diag_rf_model", ""))
-                    diag_rf_model_btn = gr.UploadButton("📂 Browse", file_types=[".pkl"], size="sm")
-            diag_btn = gr.Button("Diagnose", variant="primary")
+                mp_basemap = gr.Dropdown(
+                    choices=["Satellite", "OpenStreetMap"], value=_s.get("map_basemap", "Satellite"),
+                    label="Base map",
+                )
+                mp_filter_threshold = gr.Slider(
+                    minimum=0.0, maximum=1.0, value=float(_s.get("map_conf_threshold", 0.75)), step=0.05,
+                    label="Minimum confidence to show/export",
+                )
             with gr.Row():
-                diag_chip = gr.Image(label="CIR chip (NIR=R, Red=G, Green=B)", type="numpy")
-                diag_ndwi = gr.Image(label="NDWI  (blue=water, red=dry)",       type="numpy")
-                diag_ndvi = gr.Image(label="NDVI  (green=veg, red=bare)",        type="numpy")
-                diag_prob = gr.Image(label="RF probability map (bright=flood)",  type="numpy")
-            diag_log = gr.Textbox(label="Prediction & band stats", lines=12, interactive=False)
-            diag_btn.click(
-                fn=handle_diagnose,
-                inputs=[diag_lon, diag_lat, diag_imagery, diag_rf_model],
-                outputs=[diag_chip, diag_ndwi, diag_ndvi, diag_prob, diag_log],
-            )
-
-        # ------------------------------------------------------------------ #
-        # Overview
-        # ------------------------------------------------------------------ #
-        with gr.Tab("Overview"):
-            gr.Markdown(
-                "## Data Overview\n"
-                "Scan your data directories to verify what is available before training or detection."
-            )
-            with gr.Row():
-                ov_imagery    = gr.Textbox(label="Imagery directory or .jp2 file", placeholder="data/imagery/", value=_s.get("ov_imagery",    ""))
-                ov_labels     = gr.Textbox(label="Labels directory",          placeholder="data/labels/",  value=_s.get("ov_labels",     ""))
-            with gr.Row():
-                ov_models_dir = gr.Textbox(label="Models directory",          placeholder="data/models/",  value=_s.get("ov_models_dir", ""))
-                ov_chips      = gr.Textbox(label="Chip directory (optional)", placeholder="data/chips/",   value=_s.get("ov_chips",      ""))
-            ov_btn = gr.Button("Scan", variant="primary")
-            ov_out = gr.Textbox(label="Summary", lines=22, interactive=False)
-            gr.Markdown("### Chip sample (CIR false-colour)")
-            ov_gallery = gr.Gallery(
-                label="Training chips — positives then negatives (up to 12 each)",
-                columns=6, height=320, object_fit="contain",
-            )
-            ov_event = ov_btn.click(
-                fn=handle_overview,
-                inputs=[ov_imagery, ov_labels, ov_models_dir, ov_chips],
-                outputs=ov_out,
-            )
-            ov_event.then(
-                fn=handle_chip_gallery,
-                inputs=[ov_chips],
-                outputs=[ov_gallery],
-            )
-
-        # ------------------------------------------------------------------ #
-        # Map
-        # ------------------------------------------------------------------ #
-        with gr.Tab("Map"):
-            gr.Markdown(
-                "## Results Map\n"
-                "View detection polygons and training label points on an interactive map."
-            )
-            with gr.Row():
-                map_kml    = gr.Textbox(label="Detections KML path", placeholder="data/output/detections.kml", value=_s.get("map_kml",    ""))
-                map_labels = gr.Textbox(label="Labels directory",    placeholder="data/labels/",               value=_s.get("map_labels", ""))
-            with gr.Row():
-                map_hydro  = gr.Textbox(label="Hydrography directory (optional)", placeholder="data/hydrography/", value=_s.get("map_hydro", ""))
-                map_basemap = gr.Dropdown(choices=["Satellite", "OpenStreetMap"], value="Satellite",
-                                          label="Base map")
-            with gr.Row():
-                map_show_det    = gr.Checkbox(label="Show detections",      value=True)
-                map_show_labels = gr.Checkbox(label="Show training labels", value=True)
-                map_show_hydro  = gr.Checkbox(label="Show hydrography",     value=True)
-            map_btn  = gr.Button("Load Map", variant="primary")
-            map_html = gr.HTML()
-            map_diagnose_btn = gr.Button(
+                mp_show_det    = gr.Checkbox(label="Show detections",      value=bool(_s.get("map_show_det", True)))
+                mp_show_labels = gr.Checkbox(label="Show training labels", value=bool(_s.get("map_show_labels", True)))
+                mp_show_hydro  = gr.Checkbox(label="Show hydrography",     value=bool(_s.get("map_show_hydro", True)))
+                mp_show_audit  = gr.Checkbox(
+                    label="Show label audit (suspicious points)", value=bool(_s.get("map_show_audit", False)),
+                    info="Red rings — run Evaluate first to generate oof.csv.",
+                )
+            mp_btn  = gr.Button("Load Map", variant="primary")
+            mp_html = gr.HTML()
+            mp_diagnose_btn = gr.Button(
                 "Diagnose selected point (click map first)", variant="secondary"
             )
-            map_click_status = gr.Textbox(
+            mp_click_status = gr.Textbox(
                 label="", interactive=False, show_label=False, max_lines=1,
                 value="Click a point on the map, then press the button above.",
             )
             gr.Markdown("### Export filtered detections")
+            mp_export_btn = gr.Button("Export filtered KML (above threshold)", variant="secondary", scale=0)
+            mp_export_file = gr.File(label="Filtered KML download", interactive=False)
+
+            gr.Markdown("### Diagnose Point")
+            gr.Markdown(
+                "Extract the chip at a known WGS84 location, run the RF classifier, and "
+                "visualise the spectral signature — useful for false positives and misses."
+            )
             with gr.Row():
-                map_filter_threshold = gr.Slider(
-                    minimum=0.0, maximum=1.0, value=0.75, step=0.05,
-                    label="Minimum confidence to keep (applies to map load & export)",
-                )
-                map_export_btn = gr.Button("Export filtered KML", variant="secondary", scale=0)
-            map_export_file = gr.File(label="Filtered KML download", interactive=False)
-            map_btn.click(
+                dg_lon = gr.Number(value=float(_s.get("diag_lon", 25.0)), label="Longitude (WGS84)")
+                dg_lat = gr.Number(value=float(_s.get("diag_lat", 62.0)), label="Latitude (WGS84)")
+                dg_btn = gr.Button("Diagnose", variant="primary")
+            with gr.Row():
+                dg_chip = gr.Image(label="CIR chip (NIR=R, Red=G, Green=B)", type="numpy")
+                dg_ndwi = gr.Image(label="NDWI  (blue=water, red=dry)",       type="numpy")
+                dg_ndvi = gr.Image(label="NDVI  (green=veg, red=bare)",        type="numpy")
+                dg_prob = gr.Image(label="RF probability map (bright=flood)",  type="numpy")
+            dg_log = gr.Textbox(label="Prediction & band stats", lines=12, interactive=False)
+
+            dg_btn.click(
+                fn=handle_diagnose_proj,
+                inputs=[dg_lon, dg_lat, proj_imagery, proj_dir, proj_rf_model_override],
+                outputs=[dg_chip, dg_ndwi, dg_ndvi, dg_prob, dg_log],
+            )
+            mp_btn.click(
                 fn=handle_load_map,
-                inputs=[map_kml, map_labels, map_hydro, map_basemap,
-                        map_show_det, map_show_labels, map_show_hydro,
-                        map_filter_threshold],
-                outputs=map_html,
+                inputs=[mp_kml_dropdown, proj_labels, proj_hydro, mp_basemap,
+                        mp_show_det, mp_show_labels, mp_show_hydro, mp_show_audit,
+                        mp_filter_threshold, proj_dir, proj_rf_model_override,
+                        audit_low, audit_high, audit_include_auto_neg],
+                outputs=mp_html,
+            )
+            mp_refresh_btn.click(
+                fn=lambda pd: gr.update(choices=list_output_kmls(pd)),
+                inputs=[proj_dir], outputs=[mp_kml_dropdown],
             )
             # Click-to-diagnose: the folium map is embedded via an <iframe srcdoc="...">
             # (see _build_map's click_js), which has its own `window` — separate from
@@ -1707,10 +2164,10 @@ with gr.Blocks(title="CastorDetector") as demo:
             # handler writes to window.parent too, so plain window._mapClickLat/Lon
             # here (in the parent) sees it. Falls back to the current lon/lat plus a
             # "click first" message if nothing has been clicked yet.
-            map_click_event = map_diagnose_btn.click(
+            mp_click_event = mp_diagnose_btn.click(
                 fn=None,
-                inputs=[diag_lon, diag_lat],
-                outputs=[diag_lon, diag_lat, map_click_status],
+                inputs=[dg_lon, dg_lat],
+                outputs=[dg_lon, dg_lat, mp_click_status],
                 js="""
                 (lon, lat) => {
                   const clat = window._mapClickLat, clon = window._mapClickLon;
@@ -1722,91 +2179,191 @@ with gr.Blocks(title="CastorDetector") as demo:
                 }
                 """,
             )
-            # Switch to the Diagnose Point tab and run the diagnosis automatically —
-            # only if a point was actually clicked (see handle_map_click_followup).
-            map_click_event.then(
+            mp_click_event.then(
                 fn=handle_map_click_followup,
-                inputs=[map_click_status, diag_lon, diag_lat, diag_imagery, diag_rf_model],
-                outputs=[main_tabs, diag_chip, diag_ndwi, diag_ndvi, diag_prob, diag_log],
+                inputs=[mp_click_status, dg_lon, dg_lat, proj_imagery, proj_dir, proj_rf_model_override],
+                outputs=[dg_chip, dg_ndwi, dg_ndvi, dg_prob, dg_log],
             )
-            map_export_btn.click(
+            mp_export_btn.click(
                 fn=handle_export_filtered_kml,
-                inputs=[map_kml, map_filter_threshold],
-                outputs=[map_export_file],
+                inputs=[mp_kml_dropdown, mp_filter_threshold],
+                outputs=[mp_export_file],
             )
 
-    # Wire detect button here so map_kml is in scope
-    det_event = det_btn.click(
+        # ------------------------------------------------------------------ #
+        # 6. Experimental (CNN)
+        # ------------------------------------------------------------------ #
+        with gr.Tab("6. Experimental (CNN)"):
+            gr.Markdown(
+                "## Experimental: Prithvi-EO CNN\n"
+                "> **⚠ Slow & experimental.** CPU inference is roughly 40 min/tile without a "
+                "hydrography mask, ~15 min with one. Training downloads ~454 MB of pretrained "
+                "weights from HuggingFace on first run. The Random Forest pipeline (tabs 1–5) "
+                "is the primary, supported workflow."
+            )
+            with gr.Accordion("Train CNN", open=False):
+                with gr.Row():
+                    xp_epochs = gr.Number(value=int(_s.get("cnn_epochs", 30)), label="Epochs", precision=0)
+                    xp_lr     = gr.Number(value=float(_s.get("cnn_lr", 0.001)), label="Learning rate")
+                with gr.Row():
+                    xp_train_btn  = gr.Button("Train CNN", variant="primary")
+                    xp_train_stop = gr.Button("Stop", variant="stop")
+                xp_train_log = gr.Textbox(label="Log", lines=15, interactive=False)
+                xp_train_history_state = gr.State([])
+                with gr.Accordion("Previous runs", open=False):
+                    xp_train_history_text = gr.Textbox(label="", lines=10, interactive=False, show_label=False)
+                xp_train_event = xp_train_btn.click(
+                    fn=handle_train_cnn,
+                    inputs=[proj_imagery, proj_labels, proj_hydro, proj_dir, xp_epochs, xp_lr],
+                    outputs=xp_train_log,
+                )
+
+            with gr.Accordion("Evaluate RF vs CNN", open=False):
+                gr.Markdown(
+                    "> **⚠ IN-SAMPLE** — both models were fit on the full manifest, so no split "
+                    "of it is truly held out. Use the **3. Evaluate** tab for spatially rigorous "
+                    "RF cross-validation."
+                )
+                xp_test_frac = gr.Slider(
+                    minimum=0.1, maximum=0.5, value=float(_s.get("cmp_test_frac", 0.2)), step=0.05,
+                    label="Test fraction",
+                )
+                with gr.Row():
+                    xp_cmp_btn  = gr.Button("Evaluate", variant="primary")
+                    xp_cmp_stop = gr.Button("Stop", variant="stop")
+                xp_cmp_log = gr.Textbox(label="Results", lines=12, interactive=False)
+                xp_cmp_history_state = gr.State([])
+                with gr.Accordion("Previous runs", open=False):
+                    xp_cmp_history_text = gr.Textbox(label="", lines=10, interactive=False, show_label=False)
+                xp_cmp_event = xp_cmp_btn.click(
+                    fn=handle_evaluate_compare,
+                    inputs=[proj_dir, proj_rf_model_override, xp_test_frac],
+                    outputs=xp_cmp_log,
+                )
+
+            with gr.Accordion("Detect (CNN / both)", open=False):
+                xp_det_method = gr.Dropdown(
+                    choices=["cnn", "both"], value=_s.get("exp_det_method", "cnn"),
+                    label="Method", info="'both' runs RF and CNN and tags agreement.",
+                )
+                xp_det_threshold = gr.Slider(
+                    minimum=0.0, maximum=1.0, value=float(_s.get("exp_det_threshold", 0.5)), step=0.05,
+                    label="Confidence threshold",
+                )
+                xp_det_output = gr.Textbox(
+                    label="Output KML path (blank = auto-timestamped in <project>/output/)",
+                    placeholder="(auto)", value=_s.get("exp_det_output_override", ""),
+                )
+                with gr.Row():
+                    xp_det_btn  = gr.Button("Detect & Export KML", variant="primary")
+                    xp_det_stop = gr.Button("Stop", variant="stop")
+                xp_det_log  = gr.Textbox(label="Log", lines=15, interactive=False)
+                xp_det_file = gr.File(label="Download KML", interactive=False)
+                xp_det_history_state = gr.State([])
+                with gr.Accordion("Previous runs", open=False):
+                    xp_det_history_text = gr.Textbox(label="", lines=10, interactive=False, show_label=False)
+                xp_det_event = xp_det_btn.click(
+                    fn=handle_detect,
+                    inputs=[proj_imagery, xp_det_method, proj_hydro, proj_dir, proj_rf_model_override,
+                            xp_det_threshold, xp_det_output, dt_min_area, dt_seed_threshold, dt_no_smooth],
+                    outputs=[xp_det_log, xp_det_file, mp_kml_dropdown],
+                )
+                xp_det_event.then(
+                    fn=_append_log_history, inputs=[xp_det_log, xp_det_history_state],
+                    outputs=[xp_det_history_state, xp_det_history_text],
+                )
+
+    # ------------------------------------------------------------------ #
+    # Cross-tab wiring
+    # ------------------------------------------------------------------ #
+
+    # Detect RF button — wired here so mp_kml_dropdown is in scope
+    dt_event = dt_btn.click(
         fn=handle_detect,
-        inputs=[det_imagery, det_method, det_rf_model, det_cnn_model,
-                det_norm_stats, det_hydro, det_threshold, det_output],
-        outputs=[det_log, det_file, map_kml],
+        inputs=[proj_imagery, dt_method_state, proj_hydro, proj_dir, proj_rf_model_override,
+                dt_threshold, dt_output, dt_min_area, dt_seed_threshold, dt_no_smooth],
+        outputs=[dt_log, dt_file, mp_kml_dropdown],
     )
+    dt_event.then(fn=_detection_stats, inputs=[dt_file], outputs=[dt_stats])
+    dt_event.then(fn=_append_log_history, inputs=[dt_log, dt_history_state],
+                  outputs=[dt_history_state, dt_history_text])
 
-    det_event.then(fn=_detection_stats, inputs=[det_output], outputs=[det_stats])
+    # Post-training: chain into Evaluate RF when the checkbox is on
+    tr_cv_event = tr_event.then(
+        fn=handle_post_train_cv,
+        inputs=[tr_run_cv, proj_dir, proj_rf_model_override, ev_radius, ev_n_splits, ev_per_class],
+        outputs=[ev_log],
+    )
+    tr_cv_event.then(fn=handle_confusion_matrix, inputs=[proj_dir, proj_rf_model_override], outputs=[ev_cm])
+    tr_cv_event.then(
+        fn=handle_audit_table,
+        inputs=[proj_dir, proj_rf_model_override, audit_low, audit_high, audit_include_auto_neg],
+        outputs=[ev_audit_table],
+    )
+    tr_event.then(fn=_append_log_history, inputs=[tr_log, tr_history_state],
+                  outputs=[tr_history_state, tr_history_text])
+    tr_event.then(fn=handle_refresh_status, inputs=[proj_dir, proj_rf_model_override, proj_labels],
+                  outputs=[status_line])
+    tr_event.then(fn=handle_refresh_threshold, inputs=[proj_dir, proj_rf_model_override],
+                  outputs=[dt_threshold])
+    tr_event.then(fn=handle_refresh_rf_model_choices, inputs=[proj_dir], outputs=[proj_rf_model_override])
 
-    # Confusion matrix — render after Evaluate RF completes
-    ev_event.then(fn=_confusion_matrix_image,
-                  inputs=[ev_manifest, ev_rf_model],
-                  outputs=[ev_cm])
+    # Evaluate RF button — confusion matrix + audit table + history
+    ev_event.then(fn=handle_confusion_matrix, inputs=[proj_dir, proj_rf_model_override], outputs=[ev_cm])
+    ev_event.then(
+        fn=handle_audit_table,
+        inputs=[proj_dir, proj_rf_model_override, audit_low, audit_high, audit_include_auto_neg],
+        outputs=[ev_audit_table],
+    )
+    ev_event.then(fn=_append_log_history, inputs=[ev_log, ev_history_state],
+                  outputs=[ev_history_state, ev_history_text])
 
-    # Run log history — append completed log to each tab's accordion
-    rf_event.then(fn=_append_log_history,
-                  inputs=[rf_log,  rf_history_state],
-                  outputs=[rf_history_state,  rf_history_text])
-    cnn_event.then(fn=_append_log_history,
-                   inputs=[cnn_log, cnn_history_state],
-                   outputs=[cnn_history_state, cnn_history_text])
-    det_event.then(fn=_append_log_history,
-                   inputs=[det_log, det_history_state],
-                   outputs=[det_history_state, det_history_text])
-    ev_event.then(fn=_append_log_history,
-                  inputs=[ev_log,  ev_history_state],
-                  outputs=[ev_history_state,  ev_history_text])
-    cmp_event.then(fn=_append_log_history,
-                   inputs=[cmp_log, cmp_history_state],
-                   outputs=[cmp_history_state, cmp_history_text])
+    xp_cmp_event.then(fn=_append_log_history, inputs=[xp_cmp_log, xp_cmp_history_state],
+                      outputs=[xp_cmp_history_state, xp_cmp_history_text])
+
+    # Refresh status/threshold/model-list whenever the project changes
+    proj_refresh_models_btn.click(fn=handle_refresh_rf_model_choices, inputs=[proj_dir],
+                                  outputs=[proj_rf_model_override])
+    for _trigger in (proj_dir, proj_rf_model_override, proj_labels):
+        _trigger.change(fn=handle_refresh_status, inputs=[proj_dir, proj_rf_model_override, proj_labels],
+                        outputs=[status_line])
+    for _trigger in (proj_dir, proj_rf_model_override):
+        _trigger.change(fn=handle_refresh_threshold, inputs=[proj_dir, proj_rf_model_override],
+                        outputs=[dt_threshold])
 
     # Stop buttons
-    rf_stop.click(fn=None,  cancels=[rf_event])
-    cnn_stop.click(fn=None, cancels=[cnn_event])
-    det_stop.click(fn=None, cancels=[det_event])
-    ev_stop.click(fn=None,  cancels=[ev_event])
-    cmp_stop.click(fn=None, cancels=[cmp_event])
+    tr_stop.click(fn=None, cancels=[tr_event])
+    ev_stop.click(fn=None, cancels=[ev_event])
+    dt_stop.click(fn=None, cancels=[dt_event])
+    xp_train_stop.click(fn=None, cancels=[xp_train_event])
+    xp_cmp_stop.click(fn=None, cancels=[xp_cmp_event])
+    xp_det_stop.click(fn=None, cancels=[xp_det_event])
 
-    save_btn.click(
-        fn=handle_save_settings,
-        inputs=[
-            rf_imagery, rf_labels, rf_model, rf_hydro, rf_chips,
-            rf_flood_samples, rf_hydro_negatives,
-            cnn_imagery, cnn_labels, cnn_model, cnn_norm_stats, cnn_hydro,
-            cnn_epochs, cnn_lr,
-            det_imagery, det_output, det_rf_model, det_cnn_model,
-            det_norm_stats, det_hydro,
-            det_method, det_threshold,
-            ev_manifest, ev_rf_model,
-            ev_radius, ev_per_class,
-            cmp_manifest, cmp_rf_model, cmp_cnn_model, cmp_norm_stats,
-            cmp_test_frac,
-            diag_imagery, diag_rf_model,
-            ov_imagery, ov_labels, ov_models_dir, ov_chips,
-            map_kml, map_labels, map_hydro,
-        ],
-        outputs=save_status,
+    # ------------------------------------------------------------------ #
+    # G1.4 — autosave settings on change (replaces "Save as defaults")
+    # ------------------------------------------------------------------ #
+    _AUTOSAVE_COMPONENTS = [
+        proj_dir, proj_imagery, proj_labels, proj_hydro, proj_rf_model_override,
+        tr_augment, tr_flood_samples, tr_hydro_negatives, tr_neg_ratio, tr_run_cv,
+        ev_radius, ev_n_splits, ev_per_class,
+        audit_low, audit_high, audit_include_auto_neg,
+        dt_threshold, dt_min_area, dt_seed_threshold, dt_no_smooth, dt_output,
+        mp_basemap, mp_show_det, mp_show_labels, mp_show_hydro,
+        mp_show_audit, mp_filter_threshold, mp_kml_dropdown,
+        dg_lon, dg_lat,
+        xp_epochs, xp_lr, xp_test_frac,
+        xp_det_method, xp_det_threshold, xp_det_output,
+    ]
+    assert len(_AUTOSAVE_COMPONENTS) == len(_SETTINGS_KEYS), (
+        f"_AUTOSAVE_COMPONENTS ({len(_AUTOSAVE_COMPONENTS)}) must line up 1:1 with "
+        f"_SETTINGS_KEYS ({len(_SETTINGS_KEYS)})"
     )
-
-
-    # Browse-button wirings — populate adjacent textbox with selected file path
-    det_rf_model_btn.upload( fn=_file_to_path, inputs=[det_rf_model_btn],  outputs=[det_rf_model])
-    det_cnn_model_btn.upload(fn=_file_to_path, inputs=[det_cnn_model_btn], outputs=[det_cnn_model])
-    det_norm_stats_btn.upload(fn=_file_to_path, inputs=[det_norm_stats_btn], outputs=[det_norm_stats])
-    ev_manifest_btn.upload(  fn=_file_to_path, inputs=[ev_manifest_btn],   outputs=[ev_manifest])
-    ev_rf_model_btn.upload(  fn=_file_to_path, inputs=[ev_rf_model_btn],   outputs=[ev_rf_model])
-    cmp_manifest_btn.upload( fn=_file_to_path, inputs=[cmp_manifest_btn],  outputs=[cmp_manifest])
-    cmp_rf_model_btn.upload( fn=_file_to_path, inputs=[cmp_rf_model_btn],  outputs=[cmp_rf_model])
-    cmp_cnn_model_btn.upload(fn=_file_to_path, inputs=[cmp_cnn_model_btn], outputs=[cmp_cnn_model])
-    cmp_norm_stats_btn.upload(fn=_file_to_path, inputs=[cmp_norm_stats_btn], outputs=[cmp_norm_stats])
-    diag_rf_model_btn.upload(fn=_file_to_path, inputs=[diag_rf_model_btn], outputs=[diag_rf_model])
+    gr.on(
+        triggers=[c.change for c in _AUTOSAVE_COMPONENTS],
+        fn=handle_autosave,
+        inputs=_AUTOSAVE_COMPONENTS,
+        outputs=[save_status],
+    )
 
 demo.queue()
 

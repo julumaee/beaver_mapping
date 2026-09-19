@@ -45,20 +45,20 @@ A Gradio-based control panel wraps every CLI command below in a browser UI — r
 python src/app.py
 ```
 
-Opens `http://localhost:7860`. Each tab drives one pipeline step, streams log output live, and has a **Stop** button to cancel an in-flight run:
+Opens `http://localhost:7860`. A single **Project** panel at the top (imagery/labels/hydrography/project directory, collapsible once set) drives everything below it — models, chips, and detection outputs are all derived from the project directory (`<project>/models/model.pkl`, `<project>/chips/`, `<project>/output/`), so there is one place to set paths instead of one per tab. A header status line shows `Model: trained <date> · <n> chips · CV PR-AUC x · recommended threshold y` and warns if your labels have changed since the model was last trained. Settings are saved automatically as you edit them (to `data/settings.json`, or the file named by the `CASTOR_SETTINGS` env var) — there is no separate "save" step, and old-format settings files are migrated automatically on first load.
+
+The workflow is ordered left to right; each tab streams log output live and has a **Stop** button to cancel an in-flight run:
 
 | Tab | Purpose |
 |---|---|
-| **Train RF** | Extract chips from labelled imagery and train the Random Forest classifier |
-| **Train CNN** | Fine-tune the Prithvi-EO CNN on the same labelled chips |
-| **Detect & Export** | Run RF, CNN, or both on imagery and export a KML; download the result directly from the tab |
-| **Evaluate RF** | Spatial leave-one-cluster-out cross-validation, with a confusion matrix and optional per-class breakdown |
-| **Evaluate RF vs CNN** | Compare both models on a random held-out split of the manifest |
-| **Diagnose Point** | Inspect the chip, NDWI/NDVI, and RF probability map at a single lon/lat — useful for debugging false positives/negatives |
-| **Overview** | Scan your data directories and preview a gallery of training chips before running anything |
-| **Map** | View detection polygons, training labels, and hydrography on an interactive satellite/OSM map; click a point to jump into Diagnose Point |
+| **1. Data check** | Validate the project before running anything: paths exist, tile/label counts by type, unrecognised label types, labels outside imagery coverage, hydrography presence, plus a chip gallery preview |
+| **2. Train** | Extract chips (always kept under `<project>/chips/`) and train the Random Forest; optionally chains straight into spatial cross-validation when finished |
+| **3. Evaluate** | Pooled out-of-fold spatial cross-validation — confusion matrix, per-feature-type breakdown, and a **label audit** table of suspicious label points (positives the model scores low, hand-labelled negatives it scores high) |
+| **4. Detect** | Run the RF model on imagery and export a timestamped KML (`detections_rf_<YYYYmmdd-HHMM>.kml`); threshold defaults to the model's recommended value when available |
+| **5. Map & Review** | Interactive satellite/OSM map — detections, training labels, hydrography, and toggleable label-audit rings; a "past runs" dropdown lists `<project>/output/*.kml`, newest first; click any point (including a marker) to run **Diagnose Point**, shown directly below the map |
+| **6. Experimental (CNN)** | Prithvi-EO CNN training, RF-vs-CNN comparison, and CNN/"both" detection — collapsed by default and marked slow (CPU inference ~15–40 min/tile) |
 
-Fields are pre-filled from `data/settings.json`. Values are **not** remembered automatically — click **Save as defaults** (top of the window) to store the current values of every tab for the next launch. Some model fields have a **📂 Browse** button; it uploads a copy to a Gradio temp directory, so type the real path instead if you intend to save it as a default.
+An **Advanced** accordion in the Project panel lets you override the RF model file (e.g. to compare a saved checkpoint) without touching the default `<project>/models/model.pkl`; each tab has its own **Advanced** accordion for the less-common flags (augmentation, flood samples, negative ratio, CV folds/cluster radius, min detection area, seed threshold, smoothing, CNN epochs/LR), each with inline help text.
 
 ## Random Forest
 
