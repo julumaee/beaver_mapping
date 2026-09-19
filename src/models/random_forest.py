@@ -9,6 +9,23 @@ from sklearn.ensemble import RandomForestClassifier
 
 from spectral import extract_features
 
+# Single source of truth for RF hyperparameters — used by both train() and the
+# spatial cross-validation in models/evaluate.py so folds and the final saved
+# model are always trained with identical settings.
+_DEFAULT_RF_PARAMS: dict = dict(
+    n_estimators=100,
+    class_weight="balanced",
+    random_state=42,
+    n_jobs=-2,
+)
+
+
+def make_classifier(**overrides) -> RandomForestClassifier:
+    """Build a RandomForestClassifier with the project's default hyperparameters,
+    optionally overridden (e.g. random_state=fold_seed)."""
+    params = {**_DEFAULT_RF_PARAMS, **overrides}
+    return RandomForestClassifier(**params)
+
 
 def build_feature_matrix(manifest_path: str) -> tuple[np.ndarray, np.ndarray]:
     """Load chips listed in a manifest CSV and return (X, y) arrays."""
@@ -30,11 +47,10 @@ def train(
 ) -> RandomForestClassifier:
     """Train a Random Forest on chips in manifest_path and save to model_path."""
     X, y = build_feature_matrix(manifest_path)
-    clf = RandomForestClassifier(
+    clf = make_classifier(
         n_estimators=n_estimators,
         random_state=random_state,
         n_jobs=n_jobs,
-        class_weight="balanced",
     )
     clf.fit(X, y)
     save_model(clf, model_path)
