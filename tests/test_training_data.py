@@ -11,7 +11,7 @@ import rasterio
 from pyproj import Transformer
 from rasterio.crs import CRS
 from rasterio.transform import from_bounds
-from shapely.geometry import Point, box
+from shapely.geometry import Point, Polygon, box
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
@@ -22,6 +22,8 @@ from training_data import (
     extract_chips,
     parse_kml_labels,
     sample_negatives,
+    _parse_kml_labels_meta,
+    _polygon_sample_points,
 )
 
 _KML_TEMPLATE = """\
@@ -99,6 +101,79 @@ def _write_folder_kml(tmp_path: Path, folder_name: str, lon=_LON, lat=_LAT,
     )
     p = tmp_path / "folder.kml"
     p.write_text(text, encoding="utf-8")
+    return str(p)
+
+
+def _write_polygon_kml(tmp_path: Path, cx: float, cy: float, half_size: float = 100.0,
+                       name: str = "flood") -> str:
+    """Write a KML with a single square Polygon placemark, half_size in metres,
+    centred at (cx, cy) in EPSG:3067."""
+    corners_3067 = [
+        (cx - half_size, cy - half_size),
+        (cx + half_size, cy - half_size),
+        (cx + half_size, cy + half_size),
+        (cx - half_size, cy + half_size),
+        (cx - half_size, cy - half_size),
+    ]
+    corners_lonlat = [_TO_WGS84.transform(x, y) for x, y in corners_3067]
+    coords_text = " ".join(f"{lon},{lat},0" for lon, lat in corners_lonlat)
+    text = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<kml xmlns="http://www.opengis.net/kml/2.2"><Document>'
+        f'<Placemark><name>{name}</name>'
+        '<Polygon><outerBoundaryIs><LinearRing>'
+        f'<coordinates>{coords_text}</coordinates>'
+        '</LinearRing></outerBoundaryIs></Polygon>'
+        '</Placemark></Document></kml>'
+    )
+    p = tmp_path / "polygon.kml"
+    p.write_text(text, encoding="utf-8")
+    return str(p)
+
+
+def _crescent_ring_3067(cx: float, cy: float) -> list[tuple[float, float]]:
+    """
+    Build a thin crescent/C-shaped ring (difference of two near-coincident
+    circles) centred at (cx, cy) in EPSG:3067, small enough to sample a
+    single point but concave enough that the centroid falls outside it —
+    exercising the representative_point() fallback.
+    """
+    from shapely.geometry import Point as _P
+    big = _P(cx, cy).buffer(20, quad_segs=64)
+    small = _P(cx + 3, cy).buffer(19, quad_segs=64)
+    crescent = big.difference(small).simplify(0.5, preserve_topology=True)
+    assert not crescent.contains(crescent.centroid), "test fixture must be concave"
+    return list(crescent.exterior.coords)
+
+
+def _write_crescent_polygon_kml(tmp_path: Path, cx: float, cy: float,
+                                name: str = "flood") -> str:
+    """Write a KML with a small concave (crescent) Polygon placemark."""
+    ring_3067 = _crescent_ring_3067(cx, cy)
+    corners_lonlat = [_TO_WGS84.transform(x, y) for x, y in ring_3067]
+    coords_text = " ".join(f"{lon},{lat},0" for lon, lat in corners_lonlat)
+    text = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<kml xmlns="http://www.opengis.net/kml/2.2"><Document>'
+        f'<Placemark><name>{name}</name>'
+        '<Polygon><outerBoundaryIs><LinearRing>'
+        f'<coordinates>{coords_text}</coordinates>'
+        '</LinearRing></outerBoundaryIs></Polygon>'
+        '</Placemark></Document></kml>'
+    )
+    p = tmp_path / "crescent.kml"
+    p.write_text(text, encoding="utf-8")
+    return str(p)
+
+
+def _write_stream_gpkg(tmp_path: Path, cx: float, cy: float, length: float = 3000.0) -> str:
+    """Write a minimal GPKG with a virtavesikapea line through (cx, cy)."""
+    gpd = pytest.importorskip("geopandas")
+    from shapely.geometry import LineString
+    line = LineString([(cx - length / 2, cy), (cx + length / 2, cy)])
+    gdf = gpd.GeoDataFrame({"geometry": [line]}, crs="EPSG:3067")
+    p = tmp_path / "stream.gpkg"
+    gdf.to_file(str(p), layer="virtavesikapea", driver="GPKG")
     return str(p)
 
 
@@ -203,16 +278,24 @@ class TestExtractChips:
     def test_outside_raster_skipped(self, tmp_path):
         cx, cy = 328_000.0, 6_821_000.0
         jp2 = _write_raster(tmp_path, cx, cy, size=2048)
-        written = extract_chips(jp2, [(Point(cx + 1_000_000, cy), "dam")],
+        written = extract_chips(jp2, [(Point(cx + 1_000_000, cy), "wet_forest")],
                                 str(tmp_path / "far"))
         assert written == []
 
     def test_chip_shape(self, tmp_path):
         cx, cy = 328_000.0, 6_821_000.0
         jp2 = _write_raster(tmp_path, cx, cy, size=2048)
-        written = extract_chips(jp2, [(Point(cx, cy), "dam")],
+        written = extract_chips(jp2, [(Point(cx, cy), "wet_forest")],
                                 str(tmp_path / "chips"))
         assert np.load(written[0]).shape == (3, 512, 512)
+
+    def test_unmapped_feature_type_skipped_with_warning(self, tmp_path, capsys):
+        cx, cy = 328_000.0, 6_821_000.0
+        jp2 = _write_raster(tmp_path, cx, cy, size=2048)
+        written = extract_chips(jp2, [(Point(cx, cy), "totally_unrecognised")],
+                                str(tmp_path / "chips"))
+        assert written == []
+        assert "unrecognised feature_type 'totally_unrecognised'" in capsys.readouterr().out
 
 
 class TestFeatureToLabel:
@@ -223,8 +306,14 @@ class TestFeatureToLabel:
     def test_negative_is_0(self):
         assert FEATURE_TO_LABEL["negative"] == 0
 
-    def test_unknown_label_defaults_to_1(self):
-        assert FEATURE_TO_LABEL.get("unrecognised_type", 1) == 1
+    def test_auto_negative_is_0(self):
+        assert FEATURE_TO_LABEL["auto_negative"] == 0
+
+    def test_unknown_type_not_mapped(self):
+        # Unrecognised/misspelt names must NOT silently default to positive —
+        # build_training_dataset drops them instead (see TestUnknownLabels).
+        assert "unrecognised_type" not in FEATURE_TO_LABEL
+        assert "unknown" not in FEATURE_TO_LABEL
 
 
 class TestSampleNegatives:
@@ -352,3 +441,269 @@ class TestBuildTrainingDataset:
         with open(manifest) as f:
             rows = list(csv.DictReader(f))
         assert not any(r["feature_type"] == "flood" for r in rows)
+
+
+class TestUnknownLabelsDropped:
+    """R1.3 — unrecognised label types are excluded, not treated as positive."""
+
+    def test_unknown_type_excluded_with_warning(self, tmp_path, capsys):
+        cx, cy = 328_000.0, 6_821_000.0
+        jp2 = _write_raster(tmp_path, cx, cy, size=2048)
+        kml = _write_folder_kml(tmp_path, "Mystery Folder")  # -> "mystery_folder"
+        manifest = build_training_dataset([jp2], [kml], None,
+                                          str(tmp_path / "ds"), n_negatives=0)
+        with open(manifest) as f:
+            rows = list(csv.DictReader(f))
+        assert rows == []
+        out = capsys.readouterr().out
+        assert "mystery_folder" in out
+        assert "1 placemark" in out
+
+    def test_multiple_unknown_types_counted_separately(self, tmp_path, capsys):
+        cx, cy = 328_000.0, 6_821_000.0
+        jp2 = _write_raster(tmp_path, cx, cy, size=2048)
+        lon, lat = _TO_WGS84.transform(cx, cy)
+        placemarks = "".join(
+            f"<Placemark><name>{name}</name>"
+            f"<Point><coordinates>{lon},{lat},0</coordinates></Point></Placemark>"
+            for name in ("typo_flod", "typo_flod", "possible_dam")
+        )
+        text = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<kml xmlns="http://www.opengis.net/kml/2.2">'
+            f"<Document>{placemarks}</Document></kml>"
+        )
+        kml = tmp_path / "unknowns.kml"
+        kml.write_text(text, encoding="utf-8")
+        manifest = build_training_dataset([jp2], [str(kml)], None,
+                                          str(tmp_path / "ds"), n_negatives=0)
+        with open(manifest) as f:
+            rows = list(csv.DictReader(f))
+        assert rows == []
+        out = capsys.readouterr().out
+        assert "'typo_flod': 2 placemark" in out
+        assert "'possible_dam': 1 placemark" in out
+
+    def test_known_types_still_used_alongside_unknown(self, tmp_path):
+        cx, cy = 328_000.0, 6_821_000.0
+        jp2 = _write_raster(tmp_path, cx, cy, size=2048)
+        lon, lat = _TO_WGS84.transform(cx, cy)
+        placemarks = (
+            f"<Placemark><name>flood</name>"
+            f"<Point><coordinates>{lon},{lat},0</coordinates></Point></Placemark>"
+            f"<Placemark><name>gibberish_xyz</name>"
+            f"<Point><coordinates>{lon},{lat},0</coordinates></Point></Placemark>"
+        )
+        text = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<kml xmlns="http://www.opengis.net/kml/2.2">'
+            f"<Document>{placemarks}</Document></kml>"
+        )
+        kml = tmp_path / "mixed.kml"
+        kml.write_text(text, encoding="utf-8")
+        manifest = build_training_dataset([jp2], [str(kml)], None,
+                                          str(tmp_path / "ds"), n_negatives=0)
+        with open(manifest) as f:
+            rows = list(csv.DictReader(f))
+        ftypes = {r["feature_type"] for r in rows}
+        assert ftypes == {"flood"}
+
+
+class TestAutoNegativeNaming:
+    """R1.2/R1.4 — auto-sampled negatives get their own feature_type."""
+
+    def test_auto_negatives_named_auto_negative(self, tmp_path):
+        cx, cy = 328_000.0, 6_821_000.0
+        jp2 = _write_raster(tmp_path, cx, cy, size=2048)
+        lon, lat = _TO_WGS84.transform(cx, cy)
+        kml = _write_kml(tmp_path, lon=lon, lat=lat, name="flood")
+        manifest = build_training_dataset([jp2], [kml], None,
+                                          str(tmp_path / "ds"), n_negatives=3)
+        with open(manifest) as f:
+            rows = list(csv.DictReader(f))
+        neg_rows = [r for r in rows if int(r["label"]) == 0]
+        assert len(neg_rows) == 3
+        assert all(r["feature_type"] == "auto_negative" for r in neg_rows)
+
+    def test_hand_labelled_negative_keeps_its_own_type(self, tmp_path):
+        cx, cy = 328_000.0, 6_821_000.0
+        jp2 = _write_raster(tmp_path, cx, cy, size=2048)
+        lon, lat = _TO_WGS84.transform(cx, cy)
+        kml = _write_kml(tmp_path, lon=lon, lat=lat, name="hard_negatives")
+        manifest = build_training_dataset([jp2], [kml], None,
+                                          str(tmp_path / "ds"), n_negatives=0)
+        with open(manifest) as f:
+            rows = list(csv.DictReader(f))
+        assert all(r["feature_type"] == "hard_negatives" for r in rows)
+        assert len(rows) >= 1
+
+
+class TestPolygonLabels:
+    """R1.1 — Polygon placemarks yield several sample points, not one centroid."""
+
+    def test_small_polygon_yields_single_point_inside(self, tmp_path):
+        cx, cy = 328_000.0, 6_821_000.0
+        kml = _write_polygon_kml(tmp_path, cx, cy, half_size=5.0)
+        points = parse_kml_labels(kml)
+        assert len(points) == 1
+        pt, ftype = points[0]
+        assert ftype == "flood"
+        poly = Polygon([(cx - 5, cy - 5), (cx + 5, cy - 5), (cx + 5, cy + 5), (cx - 5, cy + 5)])
+        assert poly.buffer(0.5).contains(pt)  # small floating-point transform tolerance
+
+    def test_large_polygon_yields_multiple_points_capped_and_inside(self, tmp_path):
+        cx, cy = 328_000.0, 6_821_000.0
+        kml = _write_polygon_kml(tmp_path, cx, cy, half_size=300.0)  # 600x600 m
+        points = parse_kml_labels(kml, max_polygon_samples=10)
+        assert 2 <= len(points) <= 10
+        poly = Polygon([(cx - 300, cy - 300), (cx + 300, cy - 300),
+                        (cx + 300, cy + 300), (cx - 300, cy + 300)]).buffer(0.5)
+        for pt, ftype in points:
+            assert ftype == "flood"
+            assert poly.contains(pt)
+
+    def test_polygon_samples_respect_cap(self, tmp_path):
+        cx, cy = 328_000.0, 6_821_000.0
+        kml = _write_polygon_kml(tmp_path, cx, cy, half_size=300.0)
+        points = parse_kml_labels(kml, max_polygon_samples=3)
+        assert len(points) <= 3
+
+    def test_polygon_samples_spaced_apart(self, tmp_path):
+        cx, cy = 328_000.0, 6_821_000.0
+        kml = _write_polygon_kml(tmp_path, cx, cy, half_size=300.0)
+        points = [pt for pt, _ in parse_kml_labels(kml, max_polygon_samples=10)]
+        for i, a in enumerate(points):
+            for b in points[i + 1:]:
+                assert a.distance(b) >= 30.0 - 1e-6
+
+    def test_crescent_polygon_sample_inside_concave_shape(self, tmp_path):
+        cx, cy = 328_000.0, 6_821_000.0
+        kml = _write_crescent_polygon_kml(tmp_path, cx, cy)
+        points = parse_kml_labels(kml)
+        assert len(points) == 1
+        pt, ftype = points[0]
+        assert ftype == "flood"
+        ring_3067 = _crescent_ring_3067(cx, cy)
+        poly = Polygon(ring_3067)
+        assert not poly.contains(poly.centroid)  # sanity: fixture is concave
+        assert poly.buffer(0.5).contains(pt)     # sampled point is still inside
+
+    def test_multi_sample_polygon_points_marked_no_augment(self, tmp_path):
+        cx, cy = 328_000.0, 6_821_000.0
+        kml = _write_polygon_kml(tmp_path, cx, cy, half_size=300.0)
+        points, no_augment_ids = _parse_kml_labels_meta(kml, max_polygon_samples=10)
+        assert len(points) >= 2
+        assert all(id(pt) in no_augment_ids for pt, _ in points)
+
+    def test_single_sample_polygon_not_marked_no_augment(self, tmp_path):
+        cx, cy = 328_000.0, 6_821_000.0
+        kml = _write_polygon_kml(tmp_path, cx, cy, half_size=5.0)
+        points, no_augment_ids = _parse_kml_labels_meta(kml)
+        assert len(points) == 1
+        assert id(points[0][0]) not in no_augment_ids
+
+
+class TestExtractChipsNoAugment:
+    def test_no_augment_ids_skips_offset_augmentation(self, tmp_path):
+        cx, cy = 328_000.0, 6_821_000.0
+        jp2 = _write_raster(tmp_path, cx, cy, size=2048)
+        pt = Point(cx, cy)
+        rows: list[dict] = []
+        extract_chips(jp2, [(pt, "wet_forest")], str(tmp_path / "chips"),
+                      manifest_rows=rows, augment_positives=3, no_augment_ids={id(pt)})
+        assert len(rows) == 1
+
+    def test_hand_labelled_negative_is_augmented(self, tmp_path):
+        cx, cy = 328_000.0, 6_821_000.0
+        jp2 = _write_raster(tmp_path, cx, cy, size=2048)
+        rows: list[dict] = []
+        extract_chips(jp2, [(Point(cx, cy), "hard_negatives")], str(tmp_path / "chips"),
+                      manifest_rows=rows, augment_positives=3)
+        assert len(rows) == 4  # 1 original + 3 augmented
+
+    def test_auto_negative_is_never_augmented(self, tmp_path):
+        cx, cy = 328_000.0, 6_821_000.0
+        jp2 = _write_raster(tmp_path, cx, cy, size=2048)
+        rows: list[dict] = []
+        extract_chips(jp2, [(Point(cx, cy), "auto_negative")], str(tmp_path / "chips"),
+                      manifest_rows=rows, augment_positives=3)
+        assert len(rows) == 1
+
+
+class TestNegRatio:
+    """R1.4 — auto-negative count scales with positive CHIP count, not point count."""
+
+    def test_neg_ratio_scales_with_augmented_positive_chips(self, tmp_path):
+        cx, cy = 328_000.0, 6_821_000.0
+        jp2 = _write_raster(tmp_path, cx, cy, size=2048)
+        lon, lat = _TO_WGS84.transform(cx, cy)
+        kml = _write_kml(tmp_path, lon=lon, lat=lat, name="flood")
+        manifest = build_training_dataset(
+            [jp2], [kml], None, str(tmp_path / "ds"),
+            augment_positives=2, neg_ratio=1.0,
+        )
+        with open(manifest) as f:
+            rows = list(csv.DictReader(f))
+        pos_rows = [r for r in rows if int(r["label"]) == 1]
+        neg_rows = [r for r in rows if int(r["label"]) == 0]
+        # 1 positive point + 2 augmented = 3 positive chips; neg_ratio 1.0 -> 3 negatives
+        assert len(pos_rows) == 3
+        assert len(neg_rows) == 3
+
+    def test_neg_ratio_two_doubles_negatives(self, tmp_path):
+        cx, cy = 328_000.0, 6_821_000.0
+        jp2 = _write_raster(tmp_path, cx, cy, size=2048)
+        lon, lat = _TO_WGS84.transform(cx, cy)
+        kml = _write_kml(tmp_path, lon=lon, lat=lat, name="flood")
+        manifest = build_training_dataset(
+            [jp2], [kml], None, str(tmp_path / "ds"),
+            augment_positives=2, neg_ratio=2.0,
+        )
+        with open(manifest) as f:
+            rows = list(csv.DictReader(f))
+        neg_rows = [r for r in rows if int(r["label"]) == 0]
+        assert len(neg_rows) == 6
+
+    def test_explicit_n_negatives_overrides_neg_ratio(self, tmp_path):
+        cx, cy = 328_000.0, 6_821_000.0
+        jp2 = _write_raster(tmp_path, cx, cy, size=2048)
+        lon, lat = _TO_WGS84.transform(cx, cy)
+        kml = _write_kml(tmp_path, lon=lon, lat=lat, name="flood")
+        manifest = build_training_dataset(
+            [jp2], [kml], None, str(tmp_path / "ds"),
+            augment_positives=2, neg_ratio=5.0, n_negatives=1,
+        )
+        with open(manifest) as f:
+            rows = list(csv.DictReader(f))
+        neg_rows = [r for r in rows if int(r["label"]) == 0]
+        assert len(neg_rows) == 1
+
+    def test_hydro_negatives_split_half_stream_half_extent(self, tmp_path):
+        cx, cy = 328_000.0, 6_821_000.0
+        jp2 = _write_raster(tmp_path, cx, cy, size=2048)
+        lon, lat = _TO_WGS84.transform(cx, cy)
+        kml = _write_kml(tmp_path, lon=lon, lat=lat, name="flood")
+        gpkg = _write_stream_gpkg(tmp_path, cx, cy, length=3000.0)
+        manifest = build_training_dataset(
+            [jp2], [kml], None, str(tmp_path / "ds"),
+            augment_positives=5, neg_ratio=1.0,
+            hydro_path=gpkg, hydro_negatives=True,
+        )
+        with open(manifest) as f:
+            rows = list(csv.DictReader(f))
+        neg_rows = [r for r in rows if int(r["label"]) == 0]
+        # 1 positive point + 5 augmented = 6 positive chips -> 6 auto-negatives requested
+        assert len(neg_rows) == 6
+
+
+class TestSampleNegativesAtScale:
+    def test_respects_min_pos_distance_and_spacing_at_scale(self):
+        mask = box(320_000, 6_815_000, 330_000, 6_825_000)
+        positives = [Point(322_000, 6_817_000)]
+        samples = sample_negatives(mask, positives, n=150, min_pos_distance=200,
+                                   min_neg_spacing=100)
+        assert len(samples) == 150
+        for i, p in enumerate(samples):
+            assert p.distance(positives[0]) >= 200
+            for q in samples[i + 1:]:
+                assert p.distance(q) >= 100

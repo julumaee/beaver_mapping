@@ -5,13 +5,16 @@ import rasterio
 import rasterio.features
 from affine import Affine
 from rasterio.windows import Window
+from scipy import ndimage
 from shapely.geometry import box, shape
 from shapely.ops import unary_union
 
 from ingestion import TILE_SIZE
 from models.random_forest import predict as clf_predict
 
-MIN_AREA_M2 = 500
+# One 64px RF patch is 32x32m = 1024 m^2, so the old default of 500 let a
+# single isolated patch always survive. Require >= 2 contiguous patches.
+MIN_AREA_M2 = 2048
 DETECTION_STRIDE = TILE_SIZE // 2  # 50% overlap — used by the legacy detect_rois path
 
 # Dense patch-level RF segmentation constants
@@ -59,6 +62,8 @@ def detect_rois_rf_segmentation(
     stream_mask=None,
     confidence_threshold: float = 0.5,
     min_area_m2: float = MIN_AREA_M2,
+    seed_threshold: float | None = None,
+    smooth: bool = True,
 ) -> list[tuple]:
     """
     Dense patch-level RF detection using 64×64 px patches with 512×512 px context.
@@ -66,6 +71,13 @@ def detect_rois_rf_segmentation(
     Reads the full image once into memory and edge-pads it so every patch can be
     sliced in O(1) without further JP2 seeks — avoids ~150 repeated seeks into the
     compressed tile that made the strip-based approach slow.
+
+    seed_threshold: hysteresis seed threshold — a connected region of cells
+        >= confidence_threshold is only kept if it contains at least one cell
+        >= seed_threshold. Defaults to min(confidence_threshold + 0.15, 0.95).
+    smooth: apply a 3x3 NaN-aware mean filter to the probability map before
+        thresholding (default True). Confidence per ROI is still computed
+        from the unsmoothed probabilities.
 
     Returns flood_rois: [(polygon_epsg3067, confidence, area_m2), ...]
     """
@@ -161,7 +173,28 @@ def detect_rois_rf_segmentation(
             patches_processed += 1
 
     print(f"  Done — {patches_processed} patches classified in {(time.time()-t0)/60:.1f} min")
-    return _prob_map_to_rois(prob_map, patch_transform, confidence_threshold, min_area_m2)
+    return _prob_map_to_rois(prob_map, patch_transform, confidence_threshold, min_area_m2,
+                             seed_threshold=seed_threshold, smooth=smooth)
+
+
+def _nanmean_smooth_3x3(prob_map: np.ndarray) -> np.ndarray:
+    """
+    3x3 mean filter that ignores NaN (outside-mask) cells: each output cell
+    is the mean of its non-NaN 3x3 neighbours only. Cells that are NaN in the
+    input stay NaN in the output — a masked-out cell is never pulled "in" by
+    its neighbours.
+    """
+    nan_mask = np.isnan(prob_map)
+    filled = np.where(nan_mask, 0.0, prob_map).astype(np.float64)
+    valid = (~nan_mask).astype(np.float64)
+
+    sum_vals = ndimage.uniform_filter(filled, size=3, mode="constant", cval=0.0) * 9.0
+    count_vals = ndimage.uniform_filter(valid, size=3, mode="constant", cval=0.0) * 9.0
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        smoothed = np.where(count_vals > 0, sum_vals / count_vals, np.nan)
+    smoothed = np.where(nan_mask, np.nan, smoothed)
+    return smoothed.astype(np.float32)
 
 
 def _prob_map_to_rois(
@@ -169,21 +202,48 @@ def _prob_map_to_rois(
     patch_transform,
     threshold: float,
     min_area_m2: float,
+    seed_threshold: float | None = None,
+    smooth: bool = True,
 ) -> list[tuple]:
-    """Threshold probability map and polygonize detections."""
+    """
+    Threshold probability map and polygonize detections.
+
+    Optionally smooths the map with a 3x3 NaN-aware mean filter, then applies
+    hysteresis thresholding: an 8-connected region of cells >= threshold is
+    only kept if it contains at least one cell >= seed_threshold. Confidence
+    per ROI is the mean of the *unsmoothed* probabilities of its cells.
+    """
+    if seed_threshold is None:
+        seed_threshold = min(threshold + 0.15, 0.95)
+
     valid = np.where(np.isnan(prob_map), 0.0, prob_map).astype(np.float32)
-    binary = (valid >= threshold).astype(np.uint8)
-    if binary.sum() == 0:
+    working = _nanmean_smooth_3x3(prob_map) if smooth else prob_map
+    working_filled = np.where(np.isnan(working), 0.0, working).astype(np.float32)
+
+    binary = working_filled >= threshold
+    if not binary.any():
+        return []
+
+    structure = np.ones((3, 3), dtype=np.uint8)  # 8-connectivity
+    labeled, n_labels = ndimage.label(binary, structure=structure)
+
+    seed_mask = working_filled >= seed_threshold
+    keep = np.zeros(n_labels + 1, dtype=bool)
+    label_ids = labeled[seed_mask]
+    keep[label_ids[label_ids > 0]] = True
+
+    final_binary = keep[labeled].astype(np.uint8)
+    if final_binary.sum() == 0:
         return []
 
     rois = []
-    for geom_dict, val in rasterio.features.shapes(binary, transform=patch_transform):
+    for geom_dict, val in rasterio.features.shapes(final_binary, transform=patch_transform):
         if val != 1:
             continue
         poly = shape(geom_dict)
         if poly.area < min_area_m2:
             continue
-        # Mean probability over contributing patches
+        # Mean (unsmoothed) probability over contributing patches
         mask = rasterio.features.rasterize(
             [(poly, 1)],
             out_shape=prob_map.shape,

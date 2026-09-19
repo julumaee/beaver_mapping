@@ -13,9 +13,15 @@ Recommended label types:
   wet_forest   — saturated/flooded forest (older, kept for compatibility)
   beaver_flood — confirmed beaver open water (kept for compatibility)
   negative     — explicit hard negative (stream-adjacent, no beaver activity)
+  auto_negative — auto-sampled negative (assigned internally, do not use as a
+                 label name — see sample_negatives / build_training_dataset)
 
 Types excluded from training (point-scale features, not area classifiers):
-  dam, lodge
+  dam, lodge, other
+
+Any label name not in FEATURE_TO_LABEL and not excluded above is treated as
+unknown: build_training_dataset drops it and prints a warning rather than
+silently training on it as a positive.
 """
 
 import csv
@@ -28,8 +34,9 @@ import numpy as np
 import rasterio
 from rasterio.windows import Window
 from pyproj import Transformer
-from shapely.geometry import Point, MultiPoint
+from shapely.geometry import Point, MultiPoint, Polygon
 from shapely.ops import unary_union
+from shapely.strtree import STRtree
 
 from ingestion import TILE_SIZE
 
@@ -42,13 +49,17 @@ DEFAULT_EXCLUDE: frozenset[str] = frozenset({"lodge", "dam", "other"})
 # Maps KML feature type names to integer class labels:
 #   0 = negative (no beaver activity)
 #   1 = positive (any beaver-associated visual signature)
-# Unrecognised label names default to 1 so new types work without code changes.
+# Names not present here (and not in DEFAULT_EXCLUDE) are treated as unknown:
+# build_training_dataset drops them and prints a warning rather than silently
+# treating them as positive — misspelt or unrecognised folder/placemark names
+# used to inflate the positive class.
 FEATURE_TO_LABEL: dict[str, int] = {
     # Negative class — folder/placemark name variants all map to 0:
     "negative":       0,
     "negatives":      0,
     "hard_negative":  0,
     "hard_negatives": 0,
+    "auto_negative":  0,  # auto-sampled negatives (distinct from hand-labelled ones)
     # Generic positive labels — place anywhere in imagery:
     "dead_forest":    1,  # standing dead trees killed by beaver flooding
     "flood":          1,  # any open water impoundment
@@ -56,13 +67,12 @@ FEATURE_TO_LABEL: dict[str, int] = {
     # Legacy / specific labels kept for backwards compatibility:
     "wet_forest":     1,
     "beaver_flood":   1,
-    "unknown":        1,
 }
 
 
-def parse_kml_labels(kml_path: str) -> list[tuple[Point, str]]:
+def parse_kml_labels(kml_path: str, max_polygon_samples: int = 10) -> list[tuple[Point, str]]:
     """
-    Parse a KML or KMZ file and return (centroid_epsg3067, feature_type) pairs.
+    Parse a KML or KMZ file and return (point_epsg3067, feature_type) pairs.
 
     Feature type resolution (in priority order):
     1. Enclosing <Folder> name — Google Earth folder structure is the primary
@@ -70,19 +80,44 @@ def parse_kml_labels(kml_path: str) -> list[tuple[Point, str]]:
        feature type "dead_forest" to all placemarks inside it).
     2. Placemark <name> tag — used only for root-level placemarks not inside
        any named folder.
-    3. "unknown" — fallback when neither is present (treated as class 1).
+    3. "unknown" — fallback when neither is present. build_training_dataset
+       drops "unknown" (and any other unrecognised type name) with a warning
+       rather than treating it as a positive.
+
+    Geometry handling:
+    - Point placemarks yield a single sample point.
+    - LineString placemarks yield the centroid (unchanged behaviour).
+    - Polygon (and MultiGeometry containing Polygons) placemarks yield several
+      sample points inside the polygon — see _polygon_sample_points — instead
+      of collapsing to a single centroid, which can fall outside a concave
+      (e.g. crescent-shaped) flood polygon.
 
     Label names are normalised: lowercased, leading/trailing whitespace removed,
     spaces and hyphens replaced with underscores (so "Dead Forest" → "dead_forest").
+    """
+    results, _no_augment_ids = _parse_kml_labels_meta(kml_path, max_polygon_samples)
+    return results
+
+
+def _parse_kml_labels_meta(
+    kml_path: str, max_polygon_samples: int = 10,
+) -> tuple[list[tuple[Point, str]], set[int]]:
+    """
+    Like parse_kml_labels but also returns a set of id(Point) for sample points
+    that came from a polygon placemark that yielded >= 2 samples. Those points
+    already provide spatial diversity from the polygon itself and should not
+    additionally receive offset augmentation in extract_chips.
     """
     kml_text = _read_kml_text(kml_path)
     root = ET.fromstring(kml_text)
     ns = _KML_NS if root.tag.startswith("{") else ""
 
     results: list[tuple[Point, str]] = []
+    no_augment_ids: set[int] = set()
     doc = root.find(f"{{{ns}}}Document" if ns else "Document")
-    _parse_kml_element(doc if doc is not None else root, ns, None, results)
-    return results
+    _parse_kml_element(doc if doc is not None else root, ns, None, results,
+                       no_augment_ids, max_polygon_samples)
+    return results, no_augment_ids
 
 
 def _normalise_label(text: str) -> str:
@@ -94,6 +129,8 @@ def _parse_kml_element(
     ns: str,
     folder_type: str | None,
     results: list[tuple[Point, str]],
+    no_augment_ids: set[int],
+    max_polygon_samples: int = 10,
 ) -> None:
     """Recursively walk KML elements, propagating the enclosing folder name."""
     tag = lambda name: f"{{{ns}}}{name}" if ns else name  # noqa: E731
@@ -106,7 +143,8 @@ def _parse_kml_element(
                 if (name_el is not None and name_el.text)
                 else folder_type
             )
-            _parse_kml_element(child, ns, this_folder, results)
+            _parse_kml_element(child, ns, this_folder, results,
+                               no_augment_ids, max_polygon_samples)
         elif local == "Placemark":
             if folder_type is not None:
                 ftype = folder_type
@@ -117,13 +155,26 @@ def _parse_kml_element(
                     if (name_el is not None and name_el.text)
                     else "unknown"
                 )
-            raw = _extract_coords(child, ns)
-            if not raw:
+            geom = _extract_placemark_geometry(child, ns)
+            if geom is None:
                 continue
-            if len(raw) == 1:
-                lon, lat = raw[0]
-            else:
-                mp = MultiPoint(raw)
+            kind, payload = geom
+
+            if kind == "polygon":
+                for shell, holes in payload:
+                    pts = _polygon_sample_points(shell, holes, max_polygon_samples)
+                    if not pts:
+                        continue
+                    if len(pts) >= 2:
+                        no_augment_ids.update(id(p) for p in pts)
+                    for p in pts:
+                        results.append((p, ftype))
+                continue
+
+            if kind == "point":
+                lon, lat = payload
+            else:  # linestring -> centroid (unchanged behaviour)
+                mp = MultiPoint(payload)
                 lon, lat = mp.centroid.x, mp.centroid.y
             x, y = _WGS84_TO_ETRS.transform(lon, lat)
             results.append((Point(x, y), ftype))
@@ -137,17 +188,27 @@ def extract_chips(
     augment_positives: int = 6,
     augment_max_offset: int = 24,
     rng_seed: int = 42,
+    no_augment_ids: set[int] | None = None,
 ) -> list[str]:
     """
     For each (point, feature_type) extract a TILE_SIZE×TILE_SIZE chip centred
     on that point and save as a .npy file.  The class label (0/1) is derived
-    from FEATURE_TO_LABEL[feature_type].
+    from FEATURE_TO_LABEL[feature_type]; points whose feature_type is not in
+    FEATURE_TO_LABEL are skipped with a printed warning (callers should
+    normally filter these out before calling extract_chips — see
+    build_training_dataset — this is a defensive backstop).
 
-    Positive chips (label > 0) are augmented with augment_positives additional
-    chips extracted at random pixel offsets (±augment_max_offset). This simulates
-    the detection grid misalignment and multiplies positive training samples without
-    requiring new labels. x/y in the manifest stays at the original label point so
-    spatial CV groups augmented chips with their source territory.
+    Chips are augmented with augment_positives additional chips extracted at
+    random pixel offsets (±augment_max_offset), for both positive labels and
+    hand-labelled negatives (any class-0 type other than "auto_negative",
+    which is already spatially varied by construction). This simulates the
+    detection grid misalignment and multiplies training samples without
+    requiring new labels. Points listed in no_augment_ids (id(Point)) are
+    skipped for augmentation — used for polygon-derived multi-sample points,
+    which already provide spatial diversity from the polygon itself.
+
+    x/y in the manifest stays at the original label point so spatial CV
+    groups augmented chips with their source territory.
 
     Returns a list of written file paths.
     """
@@ -155,21 +216,32 @@ def extract_chips(
     out_path.mkdir(parents=True, exist_ok=True)
 
     _TAG = {0: "neg", 1: "pos"}
+    _no_augment = no_augment_ids or set()
     written: list[str] = []
     half = TILE_SIZE // 2
     rng = random.Random(rng_seed)
 
     with rasterio.open(jp2_path) as src:
         for i, (pt, feature_type) in enumerate(labeled_points):
-            label = FEATURE_TO_LABEL.get(feature_type, 1)
+            label = FEATURE_TO_LABEL.get(feature_type)
+            if label is None:
+                print(f"  WARNING: unrecognised feature_type '{feature_type}' "
+                      f"— skipping label point")
+                continue
 
             col, row = ~src.transform * (pt.x, pt.y)
             col, row = int(col), int(row)
 
+            should_augment = (
+                augment_positives > 0
+                and feature_type != "auto_negative"
+                and id(pt) not in _no_augment
+            )
+
             # Build list of (col_offset, row_offset, aug_index) to extract.
             # Index -1 = original (no offset); 0..N-1 = augmented.
             offsets: list[tuple[int, int, int]] = [(0, 0, -1)]
-            if label > 0 and augment_positives > 0:
+            if should_augment:
                 for aug_i in range(augment_positives):
                     dc = rng.randint(-augment_max_offset, augment_max_offset)
                     dr = rng.randint(-augment_max_offset, augment_max_offset)
@@ -250,8 +322,14 @@ def sample_negatives(
     min_pos_distance: reject candidates within this many metres of any positive.
     min_neg_spacing:  reject candidates within this many metres of an already
                       accepted negative (prevents spatial clustering).
+
+    Uses an STRtree over positive_points and a uniform spatial grid over the
+    accepted negatives so rejection sampling stays fast for large n (~1000+)
+    instead of scanning every prior point on every candidate draw.
     """
     if stream_mask is None and imagery_extent is None:
+        return []
+    if n <= 0:
         return []
 
     if imagery_extent is not None:
@@ -262,6 +340,34 @@ def sample_negatives(
     rng = random.Random(rng_seed)
     samples: list[Point] = []
 
+    pos_tree = STRtree(positive_points) if positive_points else None
+
+    # Uniform grid over accepted negatives: cell size == min_neg_spacing, so
+    # any point within min_neg_spacing of a candidate lies in one of the 3x3
+    # neighbouring cells — avoids O(n^2) distance checks as samples grows.
+    cell = min_neg_spacing if min_neg_spacing > 0 else 1.0
+    grid: dict[tuple[int, int], list[Point]] = {}
+
+    def _cell_of(pt: Point) -> tuple[int, int]:
+        return int(pt.x // cell), int(pt.y // cell)
+
+    def _too_close_to_positive(pt: Point) -> bool:
+        if pos_tree is None:
+            return False
+        for idx in pos_tree.query(pt.buffer(min_pos_distance)):
+            if pt.distance(positive_points[idx]) < min_pos_distance:
+                return True
+        return False
+
+    def _too_close_to_accepted(pt: Point) -> bool:
+        cx, cy = _cell_of(pt)
+        for gx in (cx - 1, cx, cx + 1):
+            for gy in (cy - 1, cy, cy + 1):
+                for other in grid.get((gx, gy), ()):
+                    if pt.distance(other) < min_neg_spacing:
+                        return True
+        return False
+
     for _ in range(n * 500):
         if len(samples) >= n:
             break
@@ -270,11 +376,12 @@ def sample_negatives(
             continue
         if stream_mask is not None and not stream_mask.intersects(pt):
             continue
-        if any(pt.distance(pos) < min_pos_distance for pos in positive_points):
+        if _too_close_to_positive(pt):
             continue
-        if any(pt.distance(neg) < min_neg_spacing for neg in samples):
+        if _too_close_to_accepted(pt):
             continue
         samples.append(pt)
+        grid.setdefault(_cell_of(pt), []).append(pt)
 
     return samples
 
@@ -292,6 +399,8 @@ def build_training_dataset(
     hydro_path: str | None = None,
     hydro_flood_samples: int = 0,
     hydro_negatives: bool = True,
+    neg_ratio: float = 1.0,
+    max_polygon_samples: int = 10,
 ) -> str:
     """
     Orchestrate the full training data pipeline and write a manifest CSV.
@@ -300,14 +409,22 @@ def build_training_dataset(
                 stream-mask negative sampling depending on the flags below.
     hydro_flood_samples: number of positive chips to auto-extract from the
                 tulvaalue layer in hydro_path (0 = disabled).
-    hydro_negatives: when True (default) and hydro_path is set, auto-sampled
-                negatives are restricted to the stream corridor.  Set to False
-                to sample negatives from the full imagery extent instead —
-                useful when hydro_path is only needed for tulvaalue extraction.
+    hydro_negatives: when True (default) and hydro_path is set, half of the
+                auto-sampled negatives come from the stream corridor (hard,
+                stream-adjacent negatives) and half from the full imagery
+                extent, so the model sees both. When False, all auto-negatives
+                come from the full imagery extent.
     stream_mask: legacy — passed directly to sample_negatives when hydro_path
                  is not set.
-    augment_positives: number of extra offset chips per positive label point.
+    augment_positives: number of extra offset chips per positive label point
+                (and per hand-labelled negative — see extract_chips).
     augment_max_offset: maximum pixel shift in each direction for augmentation.
+    neg_ratio: auto-negative chip count relative to the number of positive
+                CHIPS after augmentation (default 1.0 = as many auto-negative
+                chips as positive chips). Ignored when n_negatives is given
+                explicitly.
+    max_polygon_samples: cap on sample points drawn from one Polygon
+                placemark (see _polygon_sample_points).
     """
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
@@ -315,10 +432,25 @@ def build_training_dataset(
     imagery_extent = _imagery_union(jp2_paths)
 
     all_labeled: list[tuple[Point, str]] = []
+    no_augment_ids: set[int] = set()
+    unknown_counts: dict[str, int] = {}
     for kml_path in kml_paths:
-        for pt, ftype in parse_kml_labels(kml_path):
-            if ftype not in exclude_features:
-                all_labeled.append((pt, ftype))
+        points, kml_no_augment_ids = _parse_kml_labels_meta(kml_path, max_polygon_samples)
+        no_augment_ids |= kml_no_augment_ids
+        for pt, ftype in points:
+            if ftype in exclude_features:
+                continue
+            if ftype not in FEATURE_TO_LABEL:
+                unknown_counts[ftype] = unknown_counts.get(ftype, 0) + 1
+                continue
+            all_labeled.append((pt, ftype))
+
+    if unknown_counts:
+        print("  WARNING: unrecognised label type(s) excluded from training:")
+        for ftype, count in sorted(unknown_counts.items()):
+            print(f"    '{ftype}': {count} placemark(s)")
+        print("    Rename the folder/placemark to a recognised type, or add "
+              "it to FEATURE_TO_LABEL in training_data.py.")
 
     if hydro_path is not None and hydro_flood_samples > 0:
         flood_pts = _load_tulvaalue_points(
@@ -328,22 +460,39 @@ def build_training_dataset(
         print(f"  Auto-extracted {len(flood_pts)} flood chips from tulvaalue "
               f"(requested {hydro_flood_samples})")
 
-    # Count only true positives for auto-negative balance — hard negatives
-    # already in all_labeled must not inflate the auto-sample count.
-    n_true_pos = sum(1 for _, ftype in all_labeled if FEATURE_TO_LABEL.get(ftype, 1) == 1)
     positive_points = [pt for pt, _ in all_labeled]
-    n_neg = n_negatives if n_negatives is not None else n_true_pos
+
+    if n_negatives is not None:
+        n_neg = n_negatives
+    else:
+        # Estimate positive CHIP count after augmentation (matches what
+        # extract_chips will produce, modulo points that fall outside a tile)
+        # — hard negatives already in all_labeled must not inflate this count.
+        expected_pos_chips = sum(
+            1 if id(pt) in no_augment_ids else 1 + augment_positives
+            for pt, ftype in all_labeled if FEATURE_TO_LABEL[ftype] == 1
+        )
+        n_neg = max(1, round(expected_pos_chips * neg_ratio))
 
     if hydro_path is not None and hydro_negatives:
-        negative_points = _sample_negatives_per_tile(
-            hydro_path, jp2_paths, positive_points, n_neg, rng_seed,
+        n_stream = n_neg // 2
+        n_extent = n_neg - n_stream
+        stream_negatives = _sample_negatives_per_tile(
+            hydro_path, jp2_paths, positive_points, n_stream, rng_seed,
         )
+        extent_negatives = sample_negatives(
+            None, positive_points, n_extent, rng_seed=rng_seed + 9973,
+            imagery_extent=imagery_extent,
+        )
+        negative_points = stream_negatives + extent_negatives
+        print(f"  Auto-negatives: {len(stream_negatives)} stream-corridor, "
+              f"{len(extent_negatives)} full-extent (requested {n_neg})")
     else:
         negative_points = sample_negatives(
             stream_mask, positive_points, n_neg, rng_seed,
             imagery_extent=imagery_extent,
         )
-    negative_labeled = [(pt, "negative") for pt in negative_points]
+    negative_labeled = [(pt, "auto_negative") for pt in negative_points]
 
     manifest_rows: list[dict] = []
     for jp2_path in jp2_paths:
@@ -353,11 +502,12 @@ def build_training_dataset(
             augment_positives=augment_positives,
             augment_max_offset=augment_max_offset,
             rng_seed=rng_seed,
+            no_augment_ids=no_augment_ids,
         )
         extract_chips(
             jp2_path, negative_labeled, out_dir,
             manifest_rows=manifest_rows,
-            augment_positives=0,  # negatives are already spatially varied
+            augment_positives=0,  # auto-negatives are already spatially varied
         )
 
     _warn_skipped(all_labeled + negative_labeled, manifest_rows)
@@ -367,6 +517,13 @@ def build_training_dataset(
         writer = csv.DictWriter(f, fieldnames=["path", "label", "feature_type", "x", "y"])
         writer.writeheader()
         writer.writerows(manifest_rows)
+
+    type_counts: dict[str, int] = {}
+    for r in manifest_rows:
+        type_counts[r["feature_type"]] = type_counts.get(r["feature_type"], 0) + 1
+    print(f"  Final chip counts ({len(manifest_rows)} total):")
+    for ftype, count in sorted(type_counts.items()):
+        print(f"    {ftype}: {count}")
 
     return str(manifest_path)
 
@@ -534,15 +691,124 @@ def _read_kml_text(path: str) -> str:
         return f.read()
 
 
-def _extract_coords(placemark_el, ns: str) -> list[tuple[float, float]]:
+def _extract_placemark_geometry(placemark_el, ns: str):
+    """
+    Extract the usable geometry from a Placemark, searching descendants so
+    geometries nested inside a <MultiGeometry> are found too.
+
+    Returns one of:
+      ("point", (lon, lat))
+      ("linestring", [(lon, lat), ...])
+      ("polygon", [(shell, holes), ...])   # one entry per Polygon found;
+                                            # shell/holes are [(lon, lat), ...]
+    or None if no usable geometry is present.
+    """
     tag = lambda name: f"{{{ns}}}{name}" if ns else name  # noqa: E731
-    for geom_tag in ("Point", "Polygon", "LineString", "MultiGeometry"):
-        el = placemark_el.find(f".//{tag(geom_tag)}")
-        if el is not None:
-            coords_el = el.find(f".//{tag('coordinates')}")
-            if coords_el is not None and coords_el.text:
-                return _parse_coord_string(coords_el.text)
-    return []
+
+    def _ring_coords(ring_el):
+        coords_el = ring_el.find(f".//{tag('coordinates')}")
+        if coords_el is None or not coords_el.text:
+            return []
+        return _parse_coord_string(coords_el.text)
+
+    def _polygon_from_el(poly_el):
+        outer = poly_el.find(f"{tag('outerBoundaryIs')}/{tag('LinearRing')}")
+        if outer is None:
+            return None
+        shell = _ring_coords(outer)
+        if len(shell) < 3:
+            return None
+        holes = []
+        for inner in poly_el.findall(f"{tag('innerBoundaryIs')}/{tag('LinearRing')}"):
+            hole = _ring_coords(inner)
+            if len(hole) >= 3:
+                holes.append(hole)
+        return shell, holes
+
+    polygon_els = placemark_el.findall(f".//{tag('Polygon')}")
+    if polygon_els:
+        polys = [p for p in (_polygon_from_el(pe) for pe in polygon_els) if p is not None]
+        if polys:
+            return "polygon", polys
+
+    point_el = placemark_el.find(f".//{tag('Point')}")
+    if point_el is not None:
+        coords_el = point_el.find(f".//{tag('coordinates')}")
+        if coords_el is not None and coords_el.text:
+            pairs = _parse_coord_string(coords_el.text)
+            if pairs:
+                return "point", pairs[0]
+
+    linestring_el = placemark_el.find(f".//{tag('LineString')}")
+    if linestring_el is not None:
+        coords_el = linestring_el.find(f".//{tag('coordinates')}")
+        if coords_el is not None and coords_el.text:
+            pairs = _parse_coord_string(coords_el.text)
+            if pairs:
+                return "linestring", pairs
+
+    return None
+
+
+def _polygon_sample_points(
+    shell_lonlat: list[tuple[float, float]],
+    holes_lonlat: list[list[tuple[float, float]]],
+    max_samples: int = 10,
+    target_cell_m: float = 40.0,
+    min_spacing_m: float = 30.0,
+    rng_seed: int = 42,
+) -> list[Point]:
+    """
+    Build a Polygon in EPSG:3067 from WGS84 ring coordinates and return sample
+    points inside it (always inside, even for concave/crescent shapes).
+
+    Sample count is roughly proportional to polygon area (one point per
+    target_cell_m x target_cell_m cell), minimum 1, capped at max_samples.
+    Points are spaced >= min_spacing_m apart via rejection sampling. For the
+    single-sample case, representative_point() is used instead of the
+    centroid so the point is guaranteed to fall inside the polygon.
+    """
+    shell_3067 = [_WGS84_TO_ETRS.transform(lon, lat) for lon, lat in shell_lonlat]
+    holes_3067 = [
+        [_WGS84_TO_ETRS.transform(lon, lat) for lon, lat in hole]
+        for hole in holes_lonlat
+    ]
+    try:
+        poly = Polygon(shell_3067, holes_3067)
+        if not poly.is_valid:
+            poly = poly.buffer(0)
+    except Exception:
+        return []
+    if poly.is_empty or poly.area <= 0:
+        return []
+    # buffer(0) on a self-intersecting ring can yield a MultiPolygon — use the
+    # largest part.
+    if poly.geom_type == "MultiPolygon":
+        poly = max(poly.geoms, key=lambda g: g.area)
+
+    target_n = max(1, round(poly.area / (target_cell_m * target_cell_m)))
+    n = min(max_samples, target_n)
+
+    if n <= 1:
+        return [poly.representative_point()]
+
+    rng = random.Random(rng_seed)
+    minx, miny, maxx, maxy = poly.bounds
+    samples: list[Point] = []
+    max_attempts = n * 200
+    for _ in range(max_attempts):
+        if len(samples) >= n:
+            break
+        cand = Point(rng.uniform(minx, maxx), rng.uniform(miny, maxy))
+        if not poly.contains(cand):
+            continue
+        if any(cand.distance(s) < min_spacing_m for s in samples):
+            continue
+        samples.append(cand)
+
+    if not samples:
+        samples = [poly.representative_point()]
+    return samples
 
 
 def _parse_coord_string(text: str) -> list[tuple[float, float]]:
