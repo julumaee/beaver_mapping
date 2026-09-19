@@ -58,7 +58,7 @@ Opens `http://localhost:7860`. Each tab drives one pipeline step, streams log ou
 | **Overview** | Scan your data directories and preview a gallery of training chips before running anything |
 | **Map** | View detection polygons, training labels, and hydrography on an interactive satellite/OSM map; click a point to jump into Diagnose Point |
 
-Path fields default to whatever you last typed; click **Save as defaults** (top of the window) to persist the current values in every tab to `data/settings.json` so they're pre-filled next time you launch the app. Model file fields also accept a **📂 Browse** button to upload a `.pkl`/`.pth`/`.json`/`.csv` file instead of typing a path.
+Fields are pre-filled from `data/settings.json`. Values are **not** remembered automatically — click **Save as defaults** (top of the window) to store the current values of every tab for the next launch. Some model fields have a **📂 Browse** button; it uploads a copy to a Gradio temp directory, so type the real path instead if you intend to save it as a default.
 
 ## Random Forest
 
