@@ -1,15 +1,28 @@
 """Gradio web UI for CastorDetector."""
-import subprocess
 import sys
 from pathlib import Path
 
-def _ensure_dependencies() -> None:
-    req = Path(__file__).parent.parent / "requirements.txt"
-    subprocess.check_call(
-        [sys.executable, "-m", "pip", "install", "-q", "-r", str(req)],
-    )
+# Key third-party modules the app needs; import names differ from pip package
+# names for a couple of these (scikit-learn -> sklearn, scikit-image -> skimage).
+_REQUIRED_MODULES = ("gradio", "folium", "rasterio", "geopandas", "sklearn", "skimage")
 
-_ensure_dependencies()
+
+def _check_dependencies() -> None:
+    missing = []
+    for mod in _REQUIRED_MODULES:
+        try:
+            __import__(mod)
+        except ImportError:
+            missing.append(mod)
+    if missing:
+        print(
+            f"Missing dependencies: {', '.join(missing)}\n"
+            "Install them with: pip install -r requirements.txt",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+_check_dependencies()
 
 import argparse
 import csv
@@ -18,7 +31,6 @@ import queue
 import tempfile
 import threading
 import xml.etree.ElementTree as ET
-import zipfile
 
 import numpy as np
 
@@ -364,14 +376,51 @@ def handle_detect(
 
 _MAP_NS = "http://www.opengis.net/kml/2.2"
 
-_LABEL_COLORS = {
-    "wet_forest":   "#ff7700",
-    "beaver_flood": "#00aaff",
-    "negative":     "#888888",
-    "dam":          "#8b4513",
-    "lodge":        "#654321",
+# Folder-based label type (as returned by training_data.parse_kml_labels) -> colour
+# group. Mirrors training_data.FEATURE_TO_LABEL's name variants so the map/Overview
+# agree with what training actually uses, plus dam/lodge/other (excluded from
+# training but still labelled in KML).
+_LABEL_TYPE_GROUPS: dict[str, str] = {
+    "dead_forest":    "dead_forest",
+    "flood":          "flood",
+    "flooded_areas":  "flood",
+    "beaver_flood":   "flood",
+    "wet_forest":     "wet_forest",
+    "negative":       "negative",
+    "negatives":      "negative",
+    "hard_negative":  "negative",
+    "hard_negatives": "negative",
+    "dam":            "dam",
+    "lodge":          "lodge",
+    "other":          "other",
 }
-_LABEL_DEFAULT_COLOR = "#ffcc00"
+_LABEL_COLORS: dict[str, str] = {
+    "dead_forest": "#8b4513",  # brown — standing dead trees
+    "flood":       "#00aaff",  # blue — open water
+    "wet_forest":  "#ff7700",  # orange — saturated forest
+    "negative":    "#888888",  # grey — hard negative
+    "dam":         "#a0522d",  # sienna
+    "lodge":       "#654321",  # dark brown
+    "other":       "#bbbbbb",  # light grey
+}
+# Cycled through for label types not covered above, so new folder names still render.
+_LABEL_FALLBACK_PALETTE = [
+    "#e6194b", "#3cb44b", "#ffe119", "#4363d8",
+    "#f58231", "#911eb4", "#46f0f0", "#f032e6",
+]
+
+
+def _label_color_for(ftype: str, fallback_assignment: dict[str, str]) -> str:
+    """Colour for a label type: fixed colour for known groups, else a stable
+    colour drawn from the fallback palette (assigned once per type per call)."""
+    group = _LABEL_TYPE_GROUPS.get(ftype)
+    if group is not None:
+        return _LABEL_COLORS[group]
+    if ftype not in fallback_assignment:
+        fallback_assignment[ftype] = (
+            _LABEL_FALLBACK_PALETTE[len(fallback_assignment) % len(_LABEL_FALLBACK_PALETTE)]
+        )
+    return fallback_assignment[ftype]
 
 
 def _confidence_color(conf: float | None) -> str:
@@ -426,73 +475,180 @@ def _detection_stats(kml_path: str) -> str:
     return "\n".join(lines)
 
 
-def _add_detections_layer(m, kml_path: str) -> list[tuple[float, float]]:
+def _parse_detections_kml(kml_path: str) -> list[dict]:
+    """Parse a detections KML exactly once.
+
+    Returns a list of {"name", "confidence" (float|None), "model" (str|None),
+    "points" (list of (lat, lon) rounded to 5 decimals, ~1 m)} — enough to both
+    render the layer and compute its bbox without re-parsing the file.
+    """
     import re
-    import folium
-    group = folium.FeatureGroup(name="Detections", show=True)
-    bounds: list[tuple[float, float]] = []
+    features: list[dict] = []
     try:
         root = ET.parse(kml_path).getroot()
-        for pm in root.iter(f"{{{_MAP_NS}}}Placemark"):
-            name = pm.findtext(f"{{{_MAP_NS}}}name") or "Detection"
-            desc = (pm.findtext(f"{{{_MAP_NS}}}description") or "").replace("\n", "<br>")
-            match = re.search(r"Confidence:\s*([\d.]+)", desc)
-            conf  = float(match.group(1)) if match else None
-            color = _confidence_color(conf)
-            coords_raw = pm.findtext(f".//{{{_MAP_NS}}}coordinates") or ""
-            points: list[tuple[float, float]] = []
-            for part in coords_raw.strip().split():
-                vals = part.split(",")
-                if len(vals) >= 2:
-                    pt = (float(vals[1]), float(vals[0]))  # (lat, lon)
-                    points.append(pt)
-                    bounds.append(pt)
-            if len(points) >= 3:
-                folium.Polygon(
-                    locations=points,
-                    color=color,
-                    fill=True,
-                    fill_color=color,
-                    fill_opacity=0.35,
-                    weight=2,
-                    tooltip=folium.Tooltip(f"<b>{name}</b><br>{desc}"),
-                ).add_to(group)
     except Exception as exc:
         print(f"Warning: could not parse detections KML: {exc}")
+        return features
+    for pm in root.iter(f"{{{_MAP_NS}}}Placemark"):
+        name = pm.findtext(f"{{{_MAP_NS}}}name") or "Detection"
+        desc = pm.findtext(f"{{{_MAP_NS}}}description") or ""
+        conf_m = re.search(r"Confidence:\s*([\d.]+)", desc)
+        confidence = float(conf_m.group(1)) if conf_m else None
+        model_m = re.search(r"Model:\s*(\w+)", desc)
+        model = model_m.group(1) if model_m else None
+        coords_raw = pm.findtext(f".//{{{_MAP_NS}}}coordinates") or ""
+        points: list[tuple[float, float]] = []
+        for part in coords_raw.strip().split():
+            vals = part.split(",")
+            if len(vals) >= 2:
+                points.append((round(float(vals[1]), 5), round(float(vals[0]), 5)))
+        if len(points) >= 3:
+            features.append({
+                "name": name, "confidence": confidence, "model": model, "points": points,
+            })
+    return features
+
+
+def _filter_detections(features: list[dict], threshold: float) -> list[dict]:
+    """Keep only features with confidence >= threshold (features with no parsed
+    confidence are always kept, since we can't judge them)."""
+    if not threshold:
+        return features
+    return [f for f in features if f["confidence"] is None or f["confidence"] >= threshold]
+
+
+def _detections_bbox_3067(features: list[dict]):
+    """Return (minx, miny, maxx, maxy) in EPSG:3067 from already-parsed detection
+    features, or None."""
+    if not features:
+        return None
+    lats = [p[0] for f in features for p in f["points"]]
+    lons = [p[1] for f in features for p in f["points"]]
+    from pyproj import Transformer
+    t = Transformer.from_crs(4326, 3067, always_xy=True)
+    xs, ys = t.transform(lons, lats)
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _labels_bbox_3067(labels_dir: str):
+    """Return (minx, miny, maxx, maxy) in EPSG:3067 from all labels in a directory
+    (via training_data.parse_kml_labels, already EPSG:3067), or None."""
+    import training_data
+    xs: list[float] = []
+    ys: list[float] = []
+    for kml_path in _find_files(labels_dir, ".kml") + _find_files(labels_dir, ".kmz"):
+        try:
+            for point, _ in training_data.parse_kml_labels(kml_path):
+                xs.append(point.x)
+                ys.append(point.y)
+        except Exception as exc:
+            print(f"Warning: could not parse {kml_path}: {exc}")
+    if not xs:
+        return None
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _bbox_center(bbox: tuple[float, float, float, float]) -> tuple[float, float]:
+    minx, miny, maxx, maxy = bbox
+    return ((minx + maxx) / 2.0, (miny + maxy) / 2.0)
+
+
+_HYDRO_MAX_SPAN_M = 10_000.0  # cap the hydrography load window to 10x10 km
+
+
+def _cap_hydro_window(
+    bbox: tuple[float, float, float, float],
+    max_span: float = _HYDRO_MAX_SPAN_M,
+) -> tuple[tuple[float, float, float, float], bool]:
+    """Clip bbox to at most max_span x max_span metres, centred on the bbox's own
+    centre. Returns (window_bbox, was_capped); bbox is returned unchanged if it
+    already fits."""
+    minx, miny, maxx, maxy = bbox
+    width, height = maxx - minx, maxy - miny
+    if width <= max_span and height <= max_span:
+        return bbox, False
+    cx, cy = _bbox_center(bbox)
+    half = max_span / 2.0
+    window = (
+        max(minx, cx - half), max(miny, cy - half),
+        min(maxx, cx + half), min(maxy, cy + half),
+    )
+    return window, True
+
+
+_MAX_MAP_HTML_MB = 30.0
+
+
+def _html_size_mb(html: str) -> float:
+    return len(html.encode("utf-8")) / 1e6
+
+
+def _add_detections_geojson_layer(m, features: list[dict]) -> list[tuple[float, float]]:
+    """Render all detections as ONE folium.GeoJson layer (not one Polygon per
+    feature) — the only way to keep HTML size manageable for thousands of
+    detections. Style/tooltip are driven by per-feature properties."""
+    import folium
+    if not features:
+        return []
+    geo_features = []
+    bounds: list[tuple[float, float]] = []
+    for f in features:
+        ring = [[lon, lat] for lat, lon in f["points"]]
+        geo_features.append({
+            "type": "Feature",
+            "properties": {
+                "name": f["name"],
+                "confidence": f["confidence"],
+                "model": f["model"] or "",
+            },
+            "geometry": {"type": "Polygon", "coordinates": [ring]},
+        })
+        bounds.extend(f["points"])
+    geojson = {"type": "FeatureCollection", "features": geo_features}
+
+    def _style(feature):
+        color = _confidence_color(feature["properties"].get("confidence"))
+        return {"color": color, "fillColor": color, "fillOpacity": 0.35, "weight": 1.5}
+
+    group = folium.FeatureGroup(name="Detections", show=True)
+    folium.GeoJson(
+        geojson,
+        style_function=_style,
+        tooltip=folium.GeoJsonTooltip(
+            fields=["name", "model", "confidence"],
+            aliases=["Detection", "Model", "Confidence"],
+        ),
+    ).add_to(group)
     group.add_to(m)
     return bounds
 
 
-def _add_labels_layer(m, labels_dir: str) -> list[tuple[float, float]]:
+def _add_labels_layer(m, labels_dir: str) -> tuple[list[tuple[float, float]], dict[str, tuple[int, str]]]:
+    """Render training-label points. Type comes from training_data.parse_kml_labels
+    (KML *folder* name), matching how training actually derives the class — not
+    the placemark name, which was the old (wrong) behaviour.
+
+    Returns (bounds, {type: (count, colour)}) so the caller can build a legend
+    from the types actually present.
+    """
     import folium
+    import training_data
+    from pyproj import Transformer
+
     group = folium.FeatureGroup(name="Training labels", show=True)
     bounds: list[tuple[float, float]] = []
-    kml_files = _find_files(labels_dir, ".kml") + _find_files(labels_dir, ".kmz")
-    for kml_path in kml_files:
+    type_counts: dict[str, int] = {}
+    fallback_colors: dict[str, str] = {}
+    to_wgs84 = Transformer.from_crs(3067, 4326, always_xy=True)
+
+    for kml_path in _find_files(labels_dir, ".kml") + _find_files(labels_dir, ".kmz"):
         try:
-            if kml_path.endswith(".kmz"):
-                with zipfile.ZipFile(kml_path) as z:
-                    inner = next(n for n in z.namelist() if n.endswith(".kml"))
-                    with z.open(inner) as f:
-                        root = ET.parse(f).getroot()
-            else:
-                root = ET.parse(kml_path).getroot()
-            for pm in root.iter(f"{{{_MAP_NS}}}Placemark"):
-                label = (pm.findtext(f"{{{_MAP_NS}}}name") or "").strip().lower()
-                point_el = pm.find(f".//{{{_MAP_NS}}}Point")
-                if point_el is None:
-                    continue
-                coords_raw = (point_el.findtext(f"{{{_MAP_NS}}}coordinates") or "").strip()
-                if not coords_raw:
-                    continue
-                parts = coords_raw.split(",")
-                if len(parts) < 2:
-                    continue
-                lon = float(parts[0].split()[0])
-                lat = float(parts[1])
+            for point, ftype in training_data.parse_kml_labels(kml_path):
+                lon, lat = to_wgs84.transform(point.x, point.y)
                 pt = (lat, lon)
                 bounds.append(pt)
-                color = _LABEL_COLORS.get(label, _LABEL_DEFAULT_COLOR)
+                type_counts[ftype] = type_counts.get(ftype, 0) + 1
+                color = _label_color_for(ftype, fallback_colors)
                 folium.CircleMarker(
                     location=pt,
                     radius=6,
@@ -501,46 +657,28 @@ def _add_labels_layer(m, labels_dir: str) -> list[tuple[float, float]]:
                     fill_color=color,
                     fill_opacity=0.85,
                     weight=1.5,
-                    tooltip=label or "unknown",
+                    tooltip=ftype or "unknown",
                 ).add_to(group)
         except Exception as exc:
             print(f"Warning: could not parse {kml_path}: {exc}")
     group.add_to(m)
-    return bounds
+    legend = {t: (n, _label_color_for(t, fallback_colors)) for t, n in type_counts.items()}
+    return bounds, legend
 
 
-_HYDRO_SIMPLIFY_M = 5.0   # metres; invisible at map zoom but cuts vertex count significantly
+_HYDRO_SIMPLIFY_M = 5.0          # metres; normal (small-extent) simplify tolerance
+_HYDRO_SIMPLIFY_CAPPED_M = 30.0  # metres; heavier simplify when the window was capped
 _HYDRO_LAYERS = ("virtavesialue", "virtavesikapea")
-
-
-def _kml_bbox_3067(kml_path: str):
-    """Return (minx, miny, maxx, maxy) in EPSG:3067 from a detections KML, or None."""
-    if not kml_path or not Path(kml_path).exists():
-        return None
-    lons: list[float] = []
-    lats: list[float] = []
-    try:
-        root = ET.parse(kml_path).getroot()
-        for coords_el in root.iter(f"{{{_MAP_NS}}}coordinates"):
-            for part in (coords_el.text or "").strip().split():
-                vals = part.split(",")
-                if len(vals) >= 2:
-                    lons.append(float(vals[0]))
-                    lats.append(float(vals[1]))
-    except Exception:
-        return None
-    if not lons:
-        return None
-    from pyproj import Transformer
-    t = Transformer.from_crs(4326, 3067, always_xy=True)
-    xs, ys = t.transform(lons, lats)
-    return (min(xs), min(ys), max(xs), max(ys))
+# Narrow-stream lines are skipped entirely when the window was capped — they
+# dominate vertex count for little visual payoff at that zoom level.
+_HYDRO_LAYERS_CAPPED = ("virtavesialue",)
 
 
 def _add_hydro_layer(
     m,
     hydro_dir: str,
     bbox_3067: tuple,
+    capped: bool = False,
 ) -> list[tuple[float, float]]:
     import fiona
     import folium
@@ -552,11 +690,14 @@ def _add_hydro_layer(
     if not files:
         return []
 
+    wanted_layers = _HYDRO_LAYERS_CAPPED if capped else _HYDRO_LAYERS
+    simplify_m = _HYDRO_SIMPLIFY_CAPPED_M if capped else _HYDRO_SIMPLIFY_M
+
     gdfs: list[gpd.GeoDataFrame] = []
     for f in files:
         try:
             available = fiona.listlayers(str(f))
-            layers = [l for l in _HYDRO_LAYERS if l in available] or available[:1]
+            layers = [l for l in wanted_layers if l in available] or available[:1]
         except Exception:
             layers = [None]
         for layer in layers:
@@ -583,7 +724,7 @@ def _add_hydro_layer(
 
     # Simplify in projected CRS (metres) before reprojection — much smaller GeoJSON
     combined = combined.copy()
-    combined["geometry"] = combined.geometry.simplify(_HYDRO_SIMPLIFY_M, preserve_topology=True)
+    combined["geometry"] = combined.geometry.simplify(simplify_m, preserve_topology=True)
     combined = combined[~combined.geometry.is_empty & combined.geometry.notna()]
     if combined.empty:
         return []
@@ -614,6 +755,7 @@ def _build_map(
     show_detections: bool = True,
     show_labels: bool = True,
     show_hydro: bool = True,
+    confidence_threshold: float = 0.0,
 ) -> str:
     import folium
     satellite_url = (
@@ -631,25 +773,42 @@ def _build_map(
 
     bounds: list[tuple[float, float]] = []
 
+    # Parse the detections KML once — reused for both the layer and the hydro bbox.
+    detection_features: list[dict] = []
+    if kml_path and Path(kml_path).exists():
+        detection_features = _parse_detections_kml(kml_path)
+        if confidence_threshold:
+            detection_features = _filter_detections(detection_features, confidence_threshold)
+
+    hydro_notice: str | None = None
     if show_hydro and hydro_dir:
-        hydro_bbox = _kml_bbox_3067(kml_path)
-        if hydro_bbox is not None:
-            bounds.extend(_add_hydro_layer(m, hydro_dir, hydro_bbox))
+        source_bbox = _detections_bbox_3067(detection_features) if detection_features else None
+        source_label = "detections"
+        if source_bbox is None and labels_dir:
+            source_bbox = _labels_bbox_3067(labels_dir)
+            source_label = "labels"
+        if source_bbox is not None:
+            window_bbox, was_capped = _cap_hydro_window(source_bbox)
+            bounds.extend(_add_hydro_layer(m, hydro_dir, window_bbox, capped=was_capped))
+            if was_capped:
+                span_km = _HYDRO_MAX_SPAN_M / 1000.0
+                hydro_notice = (
+                    f"Hydrography shown only for the central {span_km:.0f}×{span_km:.0f} km "
+                    f"of the {source_label} extent — reload with a smaller KML/area for full coverage."
+                )
         else:
-            import folium as _folium
-            m.get_root().html.add_child(_folium.Element(
-                '<div style="position:fixed;top:10px;right:10px;z-index:9999;'
-                'background:#fff3cd;padding:8px 12px;border-radius:4px;'
-                'border:1px solid #ffc107;font-size:12px">'
-                'Hydrography skipped — a Detections KML is required to define the load area.'
-                '</div>'
-            ))
+            hydro_notice = (
+                "Hydrography skipped — a Detections KML or Labels directory is "
+                "required to define the load area."
+            )
 
-    if show_detections and kml_path and Path(kml_path).exists():
-        bounds.extend(_add_detections_layer(m, kml_path))
+    if show_detections and detection_features:
+        bounds.extend(_add_detections_geojson_layer(m, detection_features))
 
+    label_legend: dict[str, tuple[int, str]] = {}
     if show_labels and labels_dir:
-        bounds.extend(_add_labels_layer(m, labels_dir))
+        lbl_bounds, label_legend = _add_labels_layer(m, labels_dir)
+        bounds.extend(lbl_bounds)
 
     folium.LayerControl(collapsed=False).add_to(m)
 
@@ -658,27 +817,41 @@ def _build_map(
         lons = [b[1] for b in bounds]
         m.fit_bounds([[min(lats), min(lons)], [max(lats), max(lons)]])
 
-    legend_html = """
+    if hydro_notice:
+        m.get_root().html.add_child(folium.Element(
+            '<div style="position:fixed;top:10px;right:10px;z-index:9999;'
+            'background:#fff3cd;padding:8px 12px;border-radius:4px;'
+            'border:1px solid #ffc107;font-size:12px;max-width:320px">'
+            f'{hydro_notice}</div>'
+        ))
+
+    labels_legend_html = "".join(
+        f'<span style="color:{color}">&#9679;</span> {ftype} ({count}) &nbsp;'
+        for ftype, (count, color) in sorted(label_legend.items())
+    ) or "(none loaded)"
+
+    legend_html = f"""
     <div style="
         position:fixed;bottom:30px;left:30px;z-index:9999;
         background:rgba(255,255,255,0.9);padding:10px 14px;
-        border-radius:6px;border:1px solid #ccc;font-size:12px;line-height:1.8">
+        border-radius:6px;border:1px solid #ccc;font-size:12px;line-height:1.8;max-width:360px">
       <b>Detections (confidence)</b><br>
       <span style="color:#00cc44">&#9632;</span> ≥ 0.85 &nbsp;
       <span style="color:#ffcc00">&#9632;</span> 0.75–0.85 &nbsp;
       <span style="color:#ff4400">&#9632;</span> 0.65–0.75 &nbsp;
       <span style="color:#888888">&#9632;</span> &lt; 0.65<br>
       <b>Labels</b><br>
-      <span style="color:#ff7700">&#9679;</span> wet_forest &nbsp;
-      <span style="color:#00aaff">&#9679;</span> beaver_flood<br>
-      <span style="color:#888888">&#9679;</span> negative &nbsp;
-      <span style="color:#8b4513">&#9679;</span> dam<br>
+      {labels_legend_html}<br>
       <b>Hydrography</b><br>
       <span style="color:#1a6aa8">&#9644;</span> streams / water bodies
     </div>"""
     m.get_root().html.add_child(folium.Element(legend_html))
 
-    # Click handler: store lat/lon in window globals so the Diagnose button can read them
+    # Click handler: store lat/lon in window globals so the Diagnose button can
+    # read them. This script runs inside the folium map's iframe (m._repr_html_()
+    # wraps everything in <iframe srcdoc="...">), which has its own `window` —
+    # separate from the parent Gradio page where the Diagnose button's JS runs.
+    # Write to window.parent too (same-origin srcdoc) so the button can see it.
     map_var = m.get_name()
     click_js = f"""
     <div id="map-click-coords" style="text-align:center;font-size:12px;color:#555;padding:4px 0">
@@ -692,6 +865,10 @@ def _build_map(
           {map_var}.on('click', function(e) {{
             window._mapClickLat = e.latlng.lat;
             window._mapClickLon = e.latlng.lng;
+            try {{
+              window.parent._mapClickLat = e.latlng.lat;
+              window.parent._mapClickLon = e.latlng.lng;
+            }} catch (err) {{}}
             var el = document.getElementById('map-click-coords');
             if (el) el.textContent = 'Selected: ' + e.latlng.lat.toFixed(6)
                                      + ', ' + e.latlng.lng.toFixed(6);
@@ -702,7 +879,16 @@ def _build_map(
     </script>"""
     m.get_root().html.add_child(folium.Element(click_js))
 
-    return f'<div style="height:580px">{m._repr_html_()}</div>'
+    html = f'<div style="height:580px">{m._repr_html_()}</div>'
+    size_mb = _html_size_mb(html)
+    if size_mb > _MAX_MAP_HTML_MB:
+        return (
+            "<p style='color:#c00;padding:1em'><b>Too much to draw:</b> "
+            f"{len(detection_features)} detections produced {size_mb:.1f} MB of map HTML "
+            f"(limit {_MAX_MAP_HTML_MB:.0f} MB). Raise the confidence threshold or use a "
+            "smaller detections file, then reload the map.</p>"
+        )
+    return html
 
 
 def handle_export_filtered_kml(kml_path: str, threshold: float):
@@ -743,6 +929,7 @@ def handle_load_map(
     show_detections: bool,
     show_labels: bool,
     show_hydro: bool,
+    confidence_threshold: float = 0.0,
 ) -> str:
     kml_path   = (kml_path   or "").strip()
     labels_dir = (labels_dir or "").strip()
@@ -755,7 +942,8 @@ def handle_load_map(
         )
     try:
         return _build_map(kml_path, labels_dir, hydro_dir, basemap,
-                          show_detections, show_labels, show_hydro)
+                          show_detections, show_labels, show_hydro,
+                          float(confidence_threshold or 0.0))
     except Exception as exc:
         return f"<p style='color:red'><b>ERROR:</b> {exc}</p>"
 
@@ -945,6 +1133,26 @@ def handle_diagnose(
     return chip_img, ndwi_img, ndvi_img, prob_img, log or "No output."
 
 
+def handle_map_click_followup(
+    status_msg: str,
+    lon: float,
+    lat: float,
+    imagery_dir: str,
+    rf_model_path: str,
+):
+    """After the map-click JS fills diag_lon/diag_lat: switch to the Diagnose Point
+    tab and run the diagnosis automatically — but only if a point was actually
+    clicked (status_msg starts with "Selected:"; see the map_diagnose_btn wiring).
+    Otherwise leave everything as-is so the "click the map first" message stands.
+    """
+    if not (status_msg or "").startswith("Selected:"):
+        return gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
+    chip_img, ndwi_img, ndvi_img, prob_img, log = handle_diagnose(
+        lon, lat, imagery_dir, rf_model_path
+    )
+    return gr.Tabs(selected="diagnose"), chip_img, ndwi_img, ndvi_img, prob_img, log
+
+
 def _do_overview(
     imagery_dir: str,
     labels_dir: str,
@@ -994,20 +1202,15 @@ def _do_overview(
         kml_files = _find_files(labels_dir, ".kml") + _find_files(labels_dir, ".kmz")
         if kml_files:
             lines.append(f"  {len(kml_files)} KML/KMZ file(s)")
+            # Feature type comes from the enclosing KML *folder* name — the same
+            # resolution training_data.parse_kml_labels uses to derive the class,
+            # not the placemark name (which training ignores when inside a folder).
+            import training_data
             counts: dict[str, int] = {}
             for kp in kml_files:
                 try:
-                    if kp.endswith(".kmz"):
-                        with zipfile.ZipFile(kp) as z:
-                            inner = next(n for n in z.namelist() if n.endswith(".kml"))
-                            with z.open(inner) as f:
-                                root = ET.parse(f).getroot()
-                    else:
-                        root = ET.parse(kp).getroot()
-                    for pm in root.iter(f"{{{_MAP_NS}}}Placemark"):
-                        if pm.find(f".//{{{_MAP_NS}}}Point") is not None:
-                            lbl = (pm.findtext(f"{{{_MAP_NS}}}name") or "unknown").strip().lower()
-                            counts[lbl] = counts.get(lbl, 0) + 1
+                    for _, ftype in training_data.parse_kml_labels(kp):
+                        counts[ftype] = counts.get(ftype, 0) + 1
                 except Exception:
                     pass
             for k, v in sorted(counts.items()):
@@ -1191,7 +1394,7 @@ with gr.Blocks(title="CastorDetector") as demo:
         save_btn    = gr.Button("Save as defaults", variant="secondary", scale=0)
         save_status = gr.Textbox(label="", interactive=False, scale=1, max_lines=1,
                                  show_label=False, placeholder="")
-    with gr.Tabs():
+    with gr.Tabs() as main_tabs:
 
         # ------------------------------------------------------------------ #
         # Train RF
@@ -1383,7 +1586,7 @@ with gr.Blocks(title="CastorDetector") as demo:
         # ------------------------------------------------------------------ #
         # Diagnose Point
         # ------------------------------------------------------------------ #
-        with gr.Tab("Diagnose Point"):
+        with gr.Tab("Diagnose Point", id="diagnose"):
             gr.Markdown(
                 "## Diagnose Point\n"
                 "Extract the chip at a known WGS84 location, run the RF classifier, "
@@ -1467,26 +1670,52 @@ with gr.Blocks(title="CastorDetector") as demo:
             map_diagnose_btn = gr.Button(
                 "Diagnose selected point (click map first)", variant="secondary"
             )
+            map_click_status = gr.Textbox(
+                label="", interactive=False, show_label=False, max_lines=1,
+                value="Click a point on the map, then press the button above.",
+            )
             gr.Markdown("### Export filtered detections")
             with gr.Row():
                 map_filter_threshold = gr.Slider(
                     minimum=0.0, maximum=1.0, value=0.75, step=0.05,
-                    label="Minimum confidence to keep",
+                    label="Minimum confidence to keep (applies to map load & export)",
                 )
                 map_export_btn = gr.Button("Export filtered KML", variant="secondary", scale=0)
             map_export_file = gr.File(label="Filtered KML download", interactive=False)
             map_btn.click(
                 fn=handle_load_map,
                 inputs=[map_kml, map_labels, map_hydro, map_basemap,
-                        map_show_det, map_show_labels, map_show_hydro],
+                        map_show_det, map_show_labels, map_show_hydro,
+                        map_filter_threshold],
                 outputs=map_html,
             )
-            # Reads JS globals set by the Leaflet click handler; populates Diagnose tab
-            map_diagnose_btn.click(
+            # Click-to-diagnose: the folium map is embedded via an <iframe srcdoc="...">
+            # (see _build_map's click_js), which has its own `window` — separate from
+            # this parent Gradio page, where this button's JS runs. The iframe's click
+            # handler writes to window.parent too, so plain window._mapClickLat/Lon
+            # here (in the parent) sees it. Falls back to the current lon/lat plus a
+            # "click first" message if nothing has been clicked yet.
+            map_click_event = map_diagnose_btn.click(
                 fn=None,
-                inputs=[],
-                outputs=[diag_lon, diag_lat],
-                js="() => [window._mapClickLon ?? 25.0, window._mapClickLat ?? 62.0]",
+                inputs=[diag_lon, diag_lat],
+                outputs=[diag_lon, diag_lat, map_click_status],
+                js="""
+                (lon, lat) => {
+                  const clat = window._mapClickLat, clon = window._mapClickLon;
+                  if (clat === undefined || clon === undefined) {
+                    return [lon, lat, 'Click a point on the map first, then press this button.'];
+                  }
+                  return [clon, clat, 'Selected: ' + clat.toFixed(6) + ', ' + clon.toFixed(6)
+                          + ' - running diagnosis...'];
+                }
+                """,
+            )
+            # Switch to the Diagnose Point tab and run the diagnosis automatically —
+            # only if a point was actually clicked (see handle_map_click_followup).
+            map_click_event.then(
+                fn=handle_map_click_followup,
+                inputs=[map_click_status, diag_lon, diag_lat, diag_imagery, diag_rf_model],
+                outputs=[main_tabs, diag_chip, diag_ndwi, diag_ndvi, diag_prob, diag_log],
             )
             map_export_btn.click(
                 fn=handle_export_filtered_kml,
