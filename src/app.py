@@ -404,6 +404,7 @@ def _do_train_rf(
     flood_samples: int,
     hydro_negatives: bool,
     neg_ratio: float,
+    run_cv: bool = True,
 ) -> None:
     from cli import cmd_train
     paths = derive_paths(project_dir, rf_model_override)
@@ -420,6 +421,7 @@ def _do_train_rf(
         flood_samples=flood_samples,
         no_hydro_negatives=not hydro_negatives,
         neg_ratio=neg_ratio,
+        no_cv=not run_cv,
     ))
 
 
@@ -433,6 +435,7 @@ def handle_train_rf(
     flood_samples: float,
     hydro_negatives: bool,
     neg_ratio: float,
+    run_cv: bool = True,
     progress: gr.Progress = gr.Progress(),
 ):
     if not imagery_dir or not imagery_dir.strip():
@@ -451,6 +454,7 @@ def handle_train_rf(
         imagery_dir.strip(), labels_dir.strip(), (hydro_dir or "").strip(),
         project_dir.strip(), (rf_model_override or "").strip(),
         int(augment), int(flood_samples), bool(hydro_negatives), float(neg_ratio),
+        bool(run_cv),
     ):
         new = log[len(last_log):]
         if "Training Random Forest" in new:
@@ -1958,7 +1962,7 @@ with gr.Blocks(title="CastorDetector") as demo:
             tr_event = tr_btn.click(
                 fn=handle_train_rf,
                 inputs=[proj_imagery, proj_labels, proj_hydro, proj_dir, proj_rf_model_override,
-                        tr_augment, tr_flood_samples, tr_hydro_negatives, tr_neg_ratio],
+                        tr_augment, tr_flood_samples, tr_hydro_negatives, tr_neg_ratio, tr_run_cv],
                 outputs=tr_log,
             )
 

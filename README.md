@@ -1,19 +1,23 @@
 # CastorDetector — Beaver Activity Detection in MML Aerial Imagery
 
-CLI tool for detecting beaver activity in Finnish National Land Survey (MML) aerial imagery using spectral analysis.
+GUI and CLI tool for detecting beaver activity in Finnish National Land Survey (MML) aerial imagery using spectral analysis.
 
 ## How It Works
 
-The pipeline slides a 512×512px window over MML `.jp2` tiles, classifies each window as beaver activity or background, and exports detections as KML polygons for verification in Google Earth.
+The detector scans MML `.jp2` tiles in 64×64 px patches (32×32 m), each classified using its surrounding 512×512 px context. It merges positive patches into polygons and exports them as KML for verification in Google Earth.
 
-The primary detection model is the **Random Forest (RF)**, trained on manually labelled point observations (`wet_forest`, `beaver_flood`) placed on top of beaver-influenced landscape features in Google Earth. A CNN (Prithvi-EO) path also exists for experimental comparison.
+The primary detection model is a **Random Forest (RF)**. It is trained on point labels placed in Google Earth (`dead_forest`, `beaver_flood`/`flood`, `hard_negatives`) plus automatically sampled negatives. A CNN (Prithvi-EO) path also exists for experimental comparison.
 
-**RF feature vector (70 elements, computed at two spatial scales):**
+**RF feature vector (109 elements, three spatial scales).** Computed on 32 px and 64 px centre crops and on the 512 px context:
 - Per-band mean, std, p25, p75 (NIR, Red, Green)
 - NDVI and NDWI statistics + high-value pixel fractions
 - NDWI spatial gradient std (water-edge sharpness)
-- GLCM texture on NIR (contrast, homogeneity, energy, correlation)
-- Connected wet-region stats at three NDWI thresholds: wet fraction, component count, largest blob area fraction, blob shape index
+- GLCM texture on NIR, and on NDVI at 32/64 px
+- Low-NDVI-in-textured-area fraction (dead standing trees) at 32/64 px
+- Connected wet-region stats at three NDWI thresholds (32/64 px only)
+- 6 cross-scale contrast features (fine scale − landscape scale)
+
+See `src/spectral.py` for the exact layout. Changing the feature vector makes previously trained models incompatible; `detect` refuses them with a "retrain" message.
 
 ## Data
 
@@ -21,9 +25,10 @@ The primary detection model is the **Random Forest (RF)**, trained on manually l
 |---|---|
 | `data/imagery/` | MML JPEG2000 tiles (`.jp2`), EPSG:3067, Vääräväri (CIR) band order: NIR, Red, Green |
 | `data/hydrography/` | MML Virtavesi vector files (`.gpkg` / `.shp`), directory accepted |
-| `data/labels/` | Google Earth ground truth (`.kml` / `.kmz`) with point placemarks named `wet_forest`, `beaver_flood`, or `dam` |
+| `data/labels/` | Google Earth ground truth (`.kml` / `.kmz`); the label type comes from the enclosing **folder** name (see [Label format](#label-format)) |
+| `data/chips/` | Extracted training chips, `manifest.csv`, feature cache and `oof.csv` (cross-validation predictions) |
 | `data/output/` | Generated KML detection files |
-| `data/models/` | Trained model weights |
+| `data/models/` | Trained model weights plus a `model.json` metadata file next to each RF model |
 
 ## Installation
 
@@ -64,12 +69,17 @@ An **Advanced** accordion in the Project panel lets you override the RF model fi
 
 ### Label format
 
-Place point placemarks in Google Earth and name them:
-- `wet_forest` — flooded/saturated forest with dead standing trees
-- `beaver_flood` — open water impoundment behind a beaver dam
-- `negative` — stream-adjacent area with no beaver activity (optional; the pipeline also auto-samples negatives)
+Put placemarks in Google Earth **folders**. The folder name is the label type; it is lowercased and spaces become underscores, so "Dead Forest" becomes `dead_forest`. Placemarks outside any folder use their own name.
 
-Placemarks named `dam` or `lodge` are excluded from training by default.
+| Type (folder name) | Class | Meaning |
+|---|---|---|
+| `dead_forest` | positive | Standing dead trees killed by beaver flooding |
+| `beaver_flood`, `flood`, `flooded_areas` | positive | Open-water impoundment |
+| `wet_forest` | positive | Saturated forest (legacy) |
+| `hard_negatives`, `negative` | negative | Look-alikes near streams: bogs, ditches, lakes, clearcuts |
+| `dam`, `lodge`, `other` | excluded | Not used for training |
+
+Any other name is **excluded with a warning**; it is not silently treated as positive. Point and polygon placemarks both work, and a polygon yields up to 10 sample points spread inside it.
 
 ### Train
 
@@ -78,14 +88,17 @@ python src/cli.py train \
   --imagery data/imagery/ \
   --labels data/labels/ \
   --model data/models/model.pkl \
-  --hydro data/hydrography/ \       # optional but recommended
-  --chip-dir data/chips/            # optional: keep chips for evaluate-rf
+  --hydro data/hydrography/ \
+  --chip-dir data/chips/
 ```
 
 The training pipeline:
-1. Parses `wet_forest` and `beaver_flood` labels from all KML/KMZ files in `--labels`
-2. Auto-samples an equal number of negatives from the stream corridor, excluding any point within 200 m of a positive and enforcing 100 m minimum spacing between negatives
-3. Extracts 70-element feature vectors per chip and trains a balanced Random Forest
+1. Parses labels from all KML/KMZ files in `--labels`. Positives and hand-labelled negatives get 6 extra chips each at small random offsets (`--augment-positives`).
+2. Auto-samples `auto_negative` points: one per positive chip by default (`--neg-ratio`). They are drawn half from the stream corridor and half from the whole imagery extent, at least 200 m from any label and 100 m apart.
+3. Trains the Random Forest (300 trees, `min_samples_leaf=3`, balanced class weights).
+4. Runs spatial cross-validation (skip with `--no-cv`). It writes `model.json` next to the model with the recommended threshold and CV metrics.
+
+To try other classifier settings, run `tune` (below) and pass its output with `--classifier-config data/chips/tuning.json`.
 
 ### Detect
 
@@ -95,34 +108,35 @@ python src/cli.py detect \
   --output data/output/detections_rf.kml \
   --method rf \
   --rf-model data/models/model.pkl \
-  --hydro data/hydrography/ \
-  --threshold 0.5                  # optional, default 0.5
+  --hydro data/hydrography/
 ```
+
+- **Threshold:** defaults to the recommended threshold stored in `model.json` (else 0.5); override with `--threshold`.
+- **Clean-up:** the patch probability map is smoothed. A region is kept only if it contains at least one patch above a stricter seed threshold (`--seed-threshold`, default threshold + 0.15) and covers at least 2048 m² (`--min-area`). Disable the smoothing with `--no-smooth`.
 
 ### Evaluate RF (spatial cross-validation)
 
-Standard random splits are unreliable for spatial data. Use spatial leave-one-cluster-out CV instead — label points within 500 m of each other form one fold:
+Random train/test splits are unreliable for spatial data. `evaluate-rf` instead groups label points within 500 m into spatial clusters and runs 5-fold grouped cross-validation. All metrics come from the pooled out-of-fold predictions.
 
 ```bash
-# Overall metrics (accuracy, precision, recall, F1 — mean/min/max across folds)
-python src/cli.py evaluate-rf \
-  --manifest data/chips/manifest.csv \
-  --rf-model data/models/model.pkl
-
-# Per-class breakdown (wet_forest vs beaver_flood separately)
-python src/cli.py evaluate-rf \
-  --manifest data/chips/manifest.csv \
-  --rf-model data/models/model.pkl \
-  --per-class
-
-# Adjust cluster radius if your territories are closer/further apart
-python src/cli.py evaluate-rf \
-  --manifest data/chips/manifest.csv \
-  --rf-model data/models/model.pkl \
-  --cluster-radius 300
+python src/cli.py evaluate-rf --manifest data/chips/manifest.csv --per-class
 ```
 
-> **Note:** The manifest CSV is written into the chip directory. By default `train` uses a temp directory that is deleted after training. Pass `--chip-dir data/chips/` to keep chips and the manifest on disk for use with `evaluate-rf`.
+It reports:
+- ROC-AUC and PR-AUC;
+- the recommended threshold (max F1) and a high-recall threshold;
+- precision/recall/F1 per chip and per label point;
+- recall or specificity for each label type.
+
+Out-of-fold predictions are written to `data/chips/oof.csv`, which the GUI's label audit uses. Features are cached next to the manifest; pass `--no-cache` to recompute them.
+
+### Tune the classifier
+
+```bash
+python src/cli.py tune --manifest data/chips/manifest.csv
+```
+
+Runs the same spatial cross-validation for several RandomForest, ExtraTrees and HistGradientBoosting settings. It prints a ranked table and writes `tuning.json` for `train --classifier-config`.
 
 ## CNN (Prithvi-EO-1.0-100M)
 
@@ -185,15 +199,18 @@ KML colour coding:
 
 ## Evaluate RF vs CNN
 
-Runs both models on a held-out split of the training manifest and prints accuracy, precision, recall, and F1.
+Scores both saved models and prints accuracy, precision, recall and F1.
 
 ```bash
 python src/cli.py evaluate \
   --manifest data/chips/manifest.csv \
   --rf-model data/models/model.pkl \
   --cnn-model data/models/beaver_cnn_v1.pth \
-  --norm-stats data/models/norm_stats.json
+  --norm-stats data/models/norm_stats.json \
+  --test-manifest path/to/other_tiles/manifest.csv   # recommended
 ```
+
+Without `--test-manifest`, it holds out spatial clusters of the training manifest. The saved models were trained on those same chips, so the numbers are **in-sample and optimistic**. For a real comparison, build a manifest from tiles that were not used for training.
 
 ## Diagnose a Single Point
 
