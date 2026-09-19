@@ -84,6 +84,10 @@ def cmd_train(args: argparse.Namespace) -> None:
         if args.chip_dir is None
         else _NullContext(args.chip_dir)
     )
+    # GUI callers (src/app.py) build a hand-crafted Namespace that may not
+    # carry newly-added attributes — fall back to the CLI default.
+    neg_ratio = getattr(args, "neg_ratio", 1.0)
+
     with chip_dir_ctx as chip_dir:
         print("Extracting training chips ...")
         manifest = build_training_dataset(
@@ -94,6 +98,7 @@ def cmd_train(args: argparse.Namespace) -> None:
             hydro_flood_samples=args.flood_samples,
             hydro_negatives=not args.no_hydro_negatives,
             augment_positives=args.augment_positives,
+            neg_ratio=neg_ratio,
         )
 
         import csv
@@ -104,11 +109,16 @@ def cmd_train(args: argparse.Namespace) -> None:
         by_type: dict[str, int] = {}
         for r in flood_chips:
             by_type[r["feature_type"]] = by_type.get(r["feature_type"], 0) + 1
+        neg_by_type: dict[str, int] = {}
+        for r in neg_chips:
+            neg_by_type[r["feature_type"]] = neg_by_type.get(r["feature_type"], 0) + 1
 
         print(f"  Flood chips    : {len(flood_chips)}")
         for ftype, count in sorted(by_type.items()):
             print(f"    {ftype}: {count}")
         print(f"  Negative chips : {len(neg_chips)}")
+        for ftype, count in sorted(neg_by_type.items()):
+            print(f"    {ftype}: {count}")
 
         if not flood_chips:
             sys.exit(
@@ -196,6 +206,13 @@ def cmd_detect(args: argparse.Namespace) -> None:
         with open(args.norm_stats) as f:
             norm_stats = json.load(f)
 
+    # GUI callers (src/app.py) build a hand-crafted Namespace that may not
+    # carry newly-added attributes — fall back to the CLI defaults.
+    from polygonizer import MIN_AREA_M2
+    min_area = getattr(args, "min_area", MIN_AREA_M2)
+    seed_threshold = getattr(args, "seed_threshold", None)
+    smooth = not getattr(args, "no_smooth", False)
+
     all_rois: list[tuple] = []
 
     for jp2_path in jp2_files:
@@ -204,18 +221,30 @@ def cmd_detect(args: argparse.Namespace) -> None:
         stream_mask = _load_mask(args.hydro, bbox=_tile_bbox(jp2_path) if args.hydro else None)
 
         if method == "rf":
-            rois = detect_rois_rf_segmentation(jp2_path, rf_clf, stream_mask, args.threshold)
+            rois = detect_rois_rf_segmentation(
+                jp2_path, rf_clf, stream_mask, args.threshold,
+                min_area_m2=min_area, seed_threshold=seed_threshold, smooth=smooth,
+            )
             print(f"  RF detections: {len(rois)}")
             all_rois.extend(rois)
 
         elif method == "cnn":
-            rois = detect_rois_cnn(jp2_path, cnn_model, norm_stats, stream_mask, args.threshold)
+            rois = detect_rois_cnn(
+                jp2_path, cnn_model, norm_stats, stream_mask, args.threshold,
+                min_area_m2=min_area,
+            )
             print(f"  CNN detections: {len(rois)}")
             all_rois.extend(rois)
 
         elif method == "both":
-            rf_rois  = detect_rois_rf_segmentation(jp2_path, rf_clf, stream_mask, args.threshold)
-            cnn_rois = detect_rois_cnn(jp2_path, cnn_model, norm_stats, stream_mask, args.threshold)
+            rf_rois  = detect_rois_rf_segmentation(
+                jp2_path, rf_clf, stream_mask, args.threshold,
+                min_area_m2=min_area, seed_threshold=seed_threshold, smooth=smooth,
+            )
+            cnn_rois = detect_rois_cnn(
+                jp2_path, cnn_model, norm_stats, stream_mask, args.threshold,
+                min_area_m2=min_area,
+            )
             print(f"  RF detections: {len(rf_rois)}  CNN detections: {len(cnn_rois)}")
             combined = _merge_multi_model(rf_rois, cnn_rois)
             print(f"  After merge — rf:{sum(1 for r in combined if r[3]=='rf')}  "
@@ -325,6 +354,10 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Sample auto-negatives from the full imagery extent instead of "
                               "the stream corridor. Useful when --hydro is only needed for "
                               "--flood-samples and you do not want stream-mask filtering.")
+    p_train.add_argument("--neg-ratio", type=float, default=1.0, dest="neg_ratio",
+                         help="Auto-negative chip count relative to the number of positive "
+                              "chips after augmentation (default 1.0). Ignored if the "
+                              "positive:negative balance is overridden elsewhere.")
 
     # -- cnn-train --
     p_cnn = sub.add_parser("cnn-train", help="Train the CNN classifier (Prithvi head)")
@@ -352,6 +385,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_detect.add_argument("--hydro",     default=None, help="Hydrography directory or file (optional)")
     p_detect.add_argument("--threshold", type=float, default=0.5,
                           help="Confidence threshold (default 0.5)")
+    p_detect.add_argument("--min-area", type=float, default=2048.0, dest="min_area",
+                          help="Minimum detection area in m^2 (default 2048 — "
+                               "roughly 2 RF patches; a single 64px patch is 1024 m^2)")
+    p_detect.add_argument("--seed-threshold", type=float, default=None, dest="seed_threshold",
+                          help="RF only: hysteresis seed threshold — a region is kept only if "
+                               "it contains a cell at or above this confidence (default: "
+                               "min(--threshold + 0.15, 0.95))")
+    p_detect.add_argument("--no-smooth", action="store_true", dest="no_smooth",
+                          help="RF only: disable 3x3 NaN-aware smoothing of the probability "
+                               "map before hysteresis thresholding")
 
     # -- evaluate --
     p_eval = sub.add_parser("evaluate", help="Compare RF vs CNN on a held-out test set")
