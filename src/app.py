@@ -773,17 +773,27 @@ def _do_evaluate_rf(
     from cli import cmd_evaluate_rf
     cmd_evaluate_rf(argparse.Namespace(
         manifest=manifest_path,
-        rf_model=rf_model_path,
+        rf_model=rf_model_path or None,
         cluster_radius=cluster_radius,
+        n_splits=5,
+        oof_path=None,     # defaults to <manifest_dir>/oof.csv — read back by _confusion_matrix_image
+        cache_dir=None,    # defaults to the manifest's own directory
+        no_cache=False,
         per_class=per_class,
     ))
 
 
 def _confusion_matrix_image(manifest_path: str, rf_model_path: str):
-    """Predict on all manifest chips and return a confusion matrix as a numpy RGB image."""
-    if not manifest_path or not Path(manifest_path).exists():
+    """Build a confusion matrix from the out-of-fold predictions CSV written by
+    the last evaluate_rf_spatial run (<manifest_dir>/oof.csv) — NOT from the
+    model's own training data, which would be in-sample and near-perfect."""
+    if not manifest_path or not manifest_path.strip():
         return None
-    if not rf_model_path or not Path(rf_model_path).exists():
+    try:
+        oof_path = Path(manifest_path.strip()).resolve().parent / "oof.csv"
+    except Exception:
+        return None
+    if not oof_path.exists():
         return None
     try:
         import io as _io
@@ -791,33 +801,26 @@ def _confusion_matrix_image(manifest_path: str, rf_model_path: str):
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
-        from spectral import extract_features
-        from models.random_forest import load_model
+        from models.evaluate import _recommended_thresholds
 
-        with open(manifest_path) as f:
-            rows = list(csv.DictReader(f))
-
-        feats_list, labels = [], []
-        for r in rows:
-            try:
-                chip = np.load(r["path"])
-                feats_list.append(extract_features(chip))
-                labels.append(int(r["label"]))
-            except Exception:
-                pass
-        if not feats_list:
+        with open(oof_path) as f:
+            oof_rows = list(csv.DictReader(f))
+        if not oof_rows:
             return None
 
-        X = np.array(feats_list)
-        y = np.array(labels)
-        clf = load_model(rf_model_path)
-        y_pred = clf.predict(X)
+        y = np.array([int(r["label"]) for r in oof_rows])
+        prob = np.array([float(r["prob"]) for r in oof_rows])
+        if len(set(y.tolist())) > 1:
+            threshold, _, _ = _recommended_thresholds(y, prob)
+        else:
+            threshold = 0.5
+        y_pred = (prob >= threshold).astype(int)
 
         cm = confusion_matrix(y, y_pred)
-        disp = ConfusionMatrixDisplay(cm, display_labels=["negative", "flood"])
+        disp = ConfusionMatrixDisplay(cm, display_labels=["negative", "positive"])
         fig, ax = plt.subplots(figsize=(4, 4))
         disp.plot(ax=ax, cmap="Blues", colorbar=False)
-        ax.set_title("Confusion Matrix (full dataset)")
+        ax.set_title(f"Spatial CV (out-of-fold), threshold {threshold:.2f}")
         fig.tight_layout()
 
         buf = _io.BytesIO()
@@ -1172,11 +1175,11 @@ def handle_evaluate_rf(
 ):
     if not manifest_path or not manifest_path.strip():
         yield "ERROR: Manifest CSV path is required."; return
-    if not rf_model_path or not rf_model_path.strip():
-        yield "ERROR: RF model path is required."; return
+    # RF model path is optional here — CV folds are always trained fresh
+    # (see models.random_forest.make_classifier); it's only echoed for reference.
     yield from _stream(
         _do_evaluate_rf,
-        manifest_path.strip(), rf_model_path.strip(),
+        manifest_path.strip(), (rf_model_path or "").strip(),
         float(cluster_radius), bool(per_class),
     )
 
@@ -1312,26 +1315,31 @@ with gr.Blocks(title="CastorDetector") as demo:
         with gr.Tab("Evaluate RF"):
             gr.Markdown(
                 "## Evaluate RF\n"
-                "Assess model quality using spatial leave-one-cluster-out cross-validation.\n"
-                "Label points within the cluster radius are grouped into the same fold, "
-                "avoiding the spatial autocorrelation leak that a random split introduces."
+                "Assess model quality using pooled out-of-fold spatial cross-validation: "
+                "label points within the cluster radius are grouped into the same fold "
+                "(avoiding the spatial autocorrelation leak a random split introduces), each "
+                "fold's held-out probabilities are pooled before computing metrics, and results "
+                "are reported at both a chip level and a point level (chips from the same label "
+                "point, including augmented copies, are averaged together).\n"
+                "Reports ROC-AUC, PR-AUC, a recommended (max-F1) threshold, and a breakdown by "
+                "feature type. Results are written to `oof.csv` next to the manifest."
             )
             with gr.Row():
                 with gr.Column():
                     ev_manifest     = gr.Textbox(label="Manifest CSV path",    placeholder="data/chips/manifest.csv", value=_s.get("ev_manifest", ""))
                     ev_manifest_btn = gr.UploadButton("📂 Browse", file_types=[".csv"], size="sm")
                 with gr.Column():
-                    ev_rf_model     = gr.Textbox(label="RF model path (.pkl)", placeholder="data/models/model.pkl",   value=_s.get("ev_rf_model", ""))
+                    ev_rf_model     = gr.Textbox(label="RF model path (.pkl, optional — for reference only; CV folds are always trained fresh)", placeholder="data/models/model.pkl",   value=_s.get("ev_rf_model", ""))
                     ev_rf_model_btn = gr.UploadButton("📂 Browse", file_types=[".pkl"], size="sm")
             with gr.Row():
                 ev_radius    = gr.Slider(minimum=100, maximum=2000, value=float(_s.get("ev_radius", 500)), step=50,
                                          label="Cluster radius (metres)")
-                ev_per_class = gr.Checkbox(label="Per-class breakdown (wet_forest / beaver_flood)", value=bool(_s.get("ev_per_class", False)))
+                ev_per_class = gr.Checkbox(label="Per-feature-type breakdown (recall for positive types, specificity for negative types)", value=bool(_s.get("ev_per_class", False)))
             with gr.Row():
                 ev_btn  = gr.Button("Evaluate RF", variant="primary")
                 ev_stop = gr.Button("Stop", variant="stop")
             ev_log = gr.Textbox(label="Results", lines=20, interactive=False)
-            ev_cm  = gr.Image(label="Confusion matrix", type="numpy", height=320)
+            ev_cm  = gr.Image(label="Confusion matrix — spatial CV (out-of-fold)", type="numpy", height=320)
             ev_history_state = gr.State([])
             with gr.Accordion("Previous runs", open=False):
                 ev_history_text = gr.Textbox(label="", lines=10, interactive=False, show_label=False)
@@ -1347,9 +1355,13 @@ with gr.Blocks(title="CastorDetector") as demo:
         with gr.Tab("Evaluate RF vs CNN"):
             gr.Markdown(
                 "## Evaluate RF vs CNN\n"
-                "Compare both models on a random held-out split of the training manifest.\n"
-                "> **Note:** Uses a random split — results are indicative. "
-                "Use the **Evaluate RF** tab for spatially rigorous cross-validation."
+                "Compare the two saved models on a spatially-held-out slice of the training "
+                "manifest.\n"
+                "> **⚠ IN-SAMPLE — these chips were used to train the saved models; numbers "
+                "are optimistic.** Both models were fit on the full manifest, so no split of "
+                "it is truly held out. Pass `--test-manifest` on the CLI with chips built from "
+                "separate, unseen tiles for a genuine out-of-sample comparison. "
+                "Use the **Evaluate RF** tab for spatially rigorous cross-validation of the RF model."
             )
             with gr.Row():
                 with gr.Column():

@@ -239,25 +239,23 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
         rf_model_path=args.rf_model,
         cnn_model_path=args.cnn_model,
         norm_stats_path=args.norm_stats,
+        test_manifest_path=args.test_manifest,
         test_fraction=args.test_fraction,
     )
 
 
 def cmd_evaluate_rf(args: argparse.Namespace) -> None:
-    if args.per_class:
-        from models.evaluate import evaluate_rf_per_class
-        evaluate_rf_per_class(
-            manifest_path=args.manifest,
-            rf_model_path=args.rf_model,
-            cluster_radius=args.cluster_radius,
-        )
-    else:
-        from models.evaluate import evaluate_rf_spatial
-        evaluate_rf_spatial(
-            manifest_path=args.manifest,
-            rf_model_path=args.rf_model,
-            cluster_radius=args.cluster_radius,
-        )
+    from models.evaluate import evaluate_rf_spatial
+    evaluate_rf_spatial(
+        manifest_path=args.manifest,
+        rf_model_path=args.rf_model,
+        cluster_radius=args.cluster_radius,
+        n_splits=args.n_splits,
+        oof_path=args.oof_path,
+        cache_dir=args.cache_dir,
+        use_cache=not args.no_cache,
+        per_class=args.per_class,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -359,20 +357,43 @@ def build_parser() -> argparse.ArgumentParser:
     p_eval.add_argument("--rf-model",      required=True, dest="rf_model",  help="RF model path (.pkl)")
     p_eval.add_argument("--cnn-model",     required=True, dest="cnn_model", help="CNN weights path (.pth)")
     p_eval.add_argument("--norm-stats",    required=True, dest="norm_stats", help="Norm stats JSON")
+    p_eval.add_argument("--test-manifest", default=None, dest="test_manifest",
+                        help="Separate manifest CSV built from held-out tiles, for a true "
+                             "out-of-sample comparison. Without this, evaluation falls back to "
+                             "a spatially-held-out slice of --manifest and is still in-sample "
+                             "(both models were trained on it) — a warning is printed.")
     p_eval.add_argument("--test-fraction", type=float, default=0.2, dest="test_fraction",
-                        help="Fraction of manifest to hold out (default 0.2)")
+                        help="Fraction of --manifest to hold out when --test-manifest is not "
+                             "given (default 0.2)")
 
     # -- evaluate-rf --
     p_eval_rf = sub.add_parser(
         "evaluate-rf",
-        help="Evaluate RF with spatial leave-one-cluster-out cross-validation",
+        help="Evaluate RF with pooled out-of-fold spatial cross-validation",
     )
     p_eval_rf.add_argument("--manifest",       required=True, help="Training manifest CSV")
-    p_eval_rf.add_argument("--rf-model",       required=True, dest="rf_model", help="RF model path (.pkl)")
+    p_eval_rf.add_argument("--rf-model",       default=None, dest="rf_model",
+                           help="RF model path (.pkl) — optional, kept for reference in the "
+                                "output; CV folds are always trained fresh with "
+                                "models.random_forest.make_classifier's defaults")
     p_eval_rf.add_argument("--cluster-radius", type=float, default=500.0, dest="cluster_radius",
-                           help="Group label points within this radius (metres) into one fold (default 500)")
+                           help="Group label points within this radius (metres) into one spatial "
+                                "cluster (default 500)")
+    p_eval_rf.add_argument("--n-splits", type=int, default=5, dest="n_splits",
+                           help="Number of CV folds, capped at the number of spatial clusters "
+                                "(default 5)")
+    p_eval_rf.add_argument("--oof-path", default=None, dest="oof_path",
+                           help="Where to write out-of-fold predictions CSV "
+                                "(default: <manifest_dir>/oof.csv)")
+    p_eval_rf.add_argument("--cache-dir", default=None, dest="cache_dir",
+                           help="Where to read/write the feature cache and default OOF CSV "
+                                "(default: the manifest's own directory)")
+    p_eval_rf.add_argument("--no-cache", action="store_true", dest="no_cache",
+                           help="Force recomputation of the feature matrix instead of reusing "
+                                "a cached one")
     p_eval_rf.add_argument("--per-class", action="store_true", dest="per_class",
-                           help="Break results down by feature type (wet_forest, beaver_flood)")
+                           help="Print the per-feature-type breakdown table (always computed "
+                                "and returned; this only toggles printing it)")
 
     return parser
 
