@@ -66,57 +66,11 @@ def _spatial_clusters(rows: list[dict], radius: float) -> list[int]:
     return [cluster_of_coord[c] for c in coords]
 
 
-def _feature_cache_paths(cache_base: Path) -> tuple[Path, Path]:
-    return cache_base / "features.npy", cache_base / "features.key.json"
-
-
-def _load_or_compute_features(
-    rows: list[dict],
-    manifest_path: str,
-    cache_base: Path,
-    use_cache: bool = True,
-) -> np.ndarray:
-    """Compute the (N, 99) feature matrix, or reuse a cached one keyed by the
-    manifest's mtime/size and row count. Feature extraction (GLCM in
-    particular) dominates evaluate-rf's runtime, so this cache matters a lot
-    when re-running with different cluster radii / thresholds."""
-    from spectral import extract_features
-
-    feat_path, key_path = _feature_cache_paths(cache_base)
-    stat = Path(manifest_path).stat()
-    key = {"manifest_mtime": stat.st_mtime, "manifest_size": stat.st_size, "n_rows": len(rows)}
-
-    if use_cache and feat_path.exists() and key_path.exists():
-        try:
-            with open(key_path) as f:
-                cached_key = json.load(f)
-            if (cached_key.get("manifest_mtime") == key["manifest_mtime"]
-                    and cached_key.get("manifest_size") == key["manifest_size"]
-                    and cached_key.get("n_rows") == key["n_rows"]):
-                X = np.load(feat_path)
-                if X.shape[0] == len(rows) and X.shape[1] == cached_key.get("feature_len"):
-                    print(f"Using cached features: {feat_path} ({X.shape})")
-                    return X
-        except Exception:
-            pass  # fall through to recompute
-
-    print("Computing features ..." if use_cache else "Computing features (--no-cache) ...")
-    X = np.array([extract_features(np.load(r["path"])) for r in rows], dtype=np.float32)
-    print(f"  Done. Feature matrix: {X.shape}")
-
-    # Always refresh the cache after a real computation (even under --no-cache, which only
-    # controls whether a *stale-looking* cache is trusted, not whether one is written) — the
-    # next run benefits either way.
-    try:
-        cache_base.mkdir(parents=True, exist_ok=True)
-        np.save(feat_path, X)
-        key["feature_len"] = int(X.shape[1])
-        with open(key_path, "w") as f:
-            json.dump(key, f)
-    except Exception as exc:
-        print(f"  (could not write feature cache: {exc})")
-
-    return X
+# Feature-matrix caching lives in models.random_forest (train() needs it too,
+# to avoid recomputing features that cli.cmd_train's pre-training CV already
+# cached) — re-exported here under its old name so this module's existing
+# call sites are unchanged.
+from models.random_forest import load_or_compute_features as _load_or_compute_features
 
 
 def _recommended_thresholds(
@@ -154,83 +108,49 @@ def _recommended_thresholds(
 
 # ---------------------------------------------------------------------------
 # R0.1 — pooled out-of-fold spatial cross-validation
+#
+# The fold-fitting loop (_run_cv_folds) and the metrics computation
+# (_summarize_cv) are factored out so `tune` (below) can run the identical CV
+# procedure for several classifier candidates against one shared spatial
+# clustering and one shared cached feature matrix, instead of duplicating
+# this logic.
 # ---------------------------------------------------------------------------
 
-def evaluate_rf_spatial(
-    manifest_path: str,
-    rf_model_path: str | None = None,
-    cluster_radius: float = 500.0,
-    n_splits: int = 5,
-    random_seed: int = 42,
-    oof_path: str | None = None,
-    cache_dir: str | None = None,
-    use_cache: bool = True,
-    per_class: bool = True,
-) -> dict:
+def _run_cv_folds(
+    X_all: np.ndarray,
+    y_all: np.ndarray,
+    clusters_arr: np.ndarray,
+    classifier_factory,
+    n_splits: int,
+    random_seed: int,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Core pooled out-of-fold spatial CV loop. Splits by StratifiedGroupKFold
+    over clusters_arr (capped at the number of distinct clusters), fits a
+    fresh classifier per fold via
+    classifier_factory(random_state=random_seed, groups=<fold's train-set
+    clusters>), and predicts probabilities for the held-out chips.
+
+    Returns (oof_prob, fold_of, n_splits_eff) — oof_prob and fold_of are
+    parallel to X_all/y_all (NaN / -1 for any chip never held out, which
+    shouldn't happen with StratifiedGroupKFold but is guarded against by the
+    caller).
     """
-    Evaluate the RF classifier with pooled out-of-fold spatial cross-validation.
-
-    Label points within cluster_radius metres of each other are grouped into
-    the same spatial cluster (so nearby chips never straddle train/test).
-    Clusters are split into folds with StratifiedGroupKFold (n_splits, capped
-    at the number of clusters) so each fold has a mix of both classes where
-    possible. A fresh classifier (models.random_forest.make_classifier) is
-    trained per fold and predicts probabilities for its held-out chips; those
-    probabilities are pooled across all folds before any metric is computed,
-    which avoids the degenerate 0/1 precision-recall folds produce when a
-    fold's test set happens to contain only one class.
-
-    rf_model_path is accepted for interface/logging continuity (it is not
-    used to fit the CV folds — those always use make_classifier's defaults,
-    the same ones train() uses).
-
-    Returns a dict with ROC-AUC, PR-AUC, recommended/high-recall thresholds,
-    chip- and point-level metrics at 0.5 and the recommended threshold, a
-    per-feature-type breakdown, and the path to the written OOF CSV.
-    """
-    from sklearn.metrics import roc_auc_score, average_precision_score
     from sklearn.model_selection import StratifiedGroupKFold
 
-    from models.random_forest import make_classifier
-
-    with open(manifest_path) as f:
-        rows = list(csv.DictReader(f))
-    if not rows:
-        raise ValueError(f"No rows in manifest {manifest_path}")
-
-    manifest_dir = Path(manifest_path).resolve().parent
-    cache_base = Path(cache_dir).resolve() if cache_dir else manifest_dir
-    oof_out = Path(oof_path).resolve() if oof_path else cache_base / "oof.csv"
-
-    if rf_model_path:
-        print(f"Model (unused for CV fitting, kept for reference): {rf_model_path}")
-
-    clusters = _spatial_clusters(rows, cluster_radius)
-    clusters_arr = np.array(clusters, dtype=int)
     n_clusters = int(clusters_arr.max()) + 1
-    print(f"Spatial CV: {len(rows)} chips in {n_clusters} clusters (radius={cluster_radius:.0f} m)")
-    if n_clusters < 2:
-        raise ValueError(
-            f"Need at least 2 spatial clusters for cross-validation (found {n_clusters}); "
-            "reduce --cluster-radius or add more spatially separated labels."
-        )
-
-    X_all = _load_or_compute_features(rows, manifest_path, cache_base, use_cache)
-    y_all = np.array([min(int(r["label"]), 1) for r in rows], dtype=np.int32)
-
     n_splits_eff = min(n_splits, n_clusters)
     if n_splits_eff < n_splits:
         print(f"  (capping n_splits to {n_splits_eff}; only {n_clusters} spatial clusters available)")
 
     splitter = StratifiedGroupKFold(n_splits=n_splits_eff, shuffle=True, random_state=random_seed)
 
-    oof_prob = np.full(len(rows), np.nan, dtype=np.float64)
-    fold_of  = np.full(len(rows), -1, dtype=int)
+    oof_prob = np.full(len(y_all), np.nan, dtype=np.float64)
+    fold_of  = np.full(len(y_all), -1, dtype=int)
 
     for fold_idx, (train_idx, test_idx) in enumerate(splitter.split(X_all, y_all, groups=clusters_arr)):
         print(f"  Fold {fold_idx + 1}/{n_splits_eff}: "
               f"train={len(train_idx)}, test={len(test_idx)} chips", end=" ... ")
-        clf = make_classifier(random_state=random_seed)
+        clf = classifier_factory(random_state=random_seed, groups=clusters_arr[train_idx])
         clf.fit(X_all[train_idx], y_all[train_idx])
         classes = list(clf.classes_)
         if 1 in classes:
@@ -241,11 +161,33 @@ def evaluate_rf_spatial(
         fold_of[test_idx] = fold_idx
         print("done")
 
+    return oof_prob, fold_of, n_splits_eff
+
+
+def _summarize_cv(
+    rows: list[dict],
+    y_all: np.ndarray,
+    oof_prob: np.ndarray,
+    fold_of: np.ndarray,
+    clusters_arr: np.ndarray,
+    cluster_radius: float,
+    n_clusters: int,
+    n_splits_eff: int,
+    oof_out: Path | None,
+    per_class: bool = True,
+    write_oof: bool = True,
+    print_summary: bool = True,
+) -> dict:
+    """Turn pooled out-of-fold probabilities into the full metrics dict
+    returned by evaluate_rf_spatial / used per-candidate by tune."""
+    from sklearn.metrics import roc_auc_score, average_precision_score
+
     valid_mask = ~np.isnan(oof_prob)
     if not valid_mask.all():
         print(f"  WARNING: {int((~valid_mask).sum())} chips were never held out; excluded from pooled metrics.")
 
-    _write_oof_csv(oof_out, rows, y_all, oof_prob, clusters_arr, fold_of, valid_mask)
+    if write_oof and oof_out is not None:
+        _write_oof_csv(oof_out, rows, y_all, oof_prob, clusters_arr, fold_of, valid_mask)
 
     y_true = y_all[valid_mask]
     y_prob = oof_prob[valid_mask]
@@ -298,10 +240,105 @@ def evaluate_rf_spatial(
         "point_metrics_at_recommended": point_metrics_rec,
         "confusion_matrix_at_recommended": {k: metrics_rec[k] for k in ("tp", "fp", "fn", "tn")},
         "per_type": per_type,
-        "oof_csv": str(oof_out),
+        "oof_csv": str(oof_out) if (write_oof and oof_out is not None) else None,
     }
-    _print_summary(result, print_per_type=per_class)
+    if print_summary:
+        _print_summary(result, print_per_type=per_class)
     return result
+
+
+def _prepare_cv_inputs(
+    manifest_path: str,
+    cluster_radius: float,
+    cache_dir: str | None,
+    use_cache: bool,
+) -> tuple[list[dict], np.ndarray, np.ndarray, np.ndarray, int, Path]:
+    """Shared setup for evaluate_rf_spatial and tune_rf: load the manifest,
+    build spatial clusters, and compute/reuse the cached feature matrix.
+    Returns (rows, X_all, y_all, clusters_arr, n_clusters, cache_base)."""
+    with open(manifest_path) as f:
+        rows = list(csv.DictReader(f))
+    if not rows:
+        raise ValueError(f"No rows in manifest {manifest_path}")
+
+    manifest_dir = Path(manifest_path).resolve().parent
+    cache_base = Path(cache_dir).resolve() if cache_dir else manifest_dir
+
+    clusters = _spatial_clusters(rows, cluster_radius)
+    clusters_arr = np.array(clusters, dtype=int)
+    n_clusters = int(clusters_arr.max()) + 1
+    print(f"{len(rows)} chips in {n_clusters} clusters (radius={cluster_radius:.0f} m)")
+    if n_clusters < 2:
+        raise ValueError(
+            f"Need at least 2 spatial clusters for cross-validation (found {n_clusters}); "
+            "reduce --cluster-radius or add more spatially separated labels."
+        )
+
+    X_all = _load_or_compute_features(rows, manifest_path, cache_base, use_cache)
+    y_all = np.array([min(int(r["label"]), 1) for r in rows], dtype=np.int32)
+
+    return rows, X_all, y_all, clusters_arr, n_clusters, cache_base
+
+
+def evaluate_rf_spatial(
+    manifest_path: str,
+    rf_model_path: str | None = None,
+    cluster_radius: float = 500.0,
+    n_splits: int = 5,
+    random_seed: int = 42,
+    oof_path: str | None = None,
+    cache_dir: str | None = None,
+    use_cache: bool = True,
+    per_class: bool = True,
+    classifier_factory=None,
+) -> dict:
+    """
+    Evaluate a classifier with pooled out-of-fold spatial cross-validation.
+
+    Label points within cluster_radius metres of each other are grouped into
+    the same spatial cluster (so nearby chips never straddle train/test).
+    Clusters are split into folds with StratifiedGroupKFold (n_splits, capped
+    at the number of clusters) so each fold has a mix of both classes where
+    possible. A fresh classifier is trained per fold and predicts
+    probabilities for its held-out chips; those probabilities are pooled
+    across all folds before any metric is computed, which avoids the
+    degenerate 0/1 precision-recall folds produce when a fold's test set
+    happens to contain only one class.
+
+    classifier_factory, if given, is a callable(random_state=..., groups=...)
+    -> unfitted estimator, used to build the classifier trained per fold —
+    `tune` uses this to run the exact same CV procedure for several candidate
+    classifier configs. Defaults to models.random_forest.make_classifier
+    (config=None), i.e. the project's default RandomForestClassifier.
+
+    rf_model_path is accepted for interface/logging continuity (it is not
+    used to fit the CV folds).
+
+    Returns a dict with ROC-AUC, PR-AUC, recommended/high-recall thresholds,
+    chip- and point-level metrics at 0.5 and the recommended threshold, a
+    per-feature-type breakdown, and the path to the written OOF CSV.
+    """
+    from models.random_forest import make_classifier
+
+    if rf_model_path:
+        print(f"Model (unused for CV fitting, kept for reference): {rf_model_path}")
+
+    rows, X_all, y_all, clusters_arr, n_clusters, cache_base = _prepare_cv_inputs(
+        manifest_path, cluster_radius, cache_dir, use_cache
+    )
+    oof_out = Path(oof_path).resolve() if oof_path else cache_base / "oof.csv"
+
+    if classifier_factory is None:
+        classifier_factory = lambda **kw: make_classifier(**kw)
+
+    oof_prob, fold_of, n_splits_eff = _run_cv_folds(
+        X_all, y_all, clusters_arr, classifier_factory, n_splits, random_seed
+    )
+
+    return _summarize_cv(
+        rows, y_all, oof_prob, fold_of, clusters_arr, cluster_radius, n_clusters, n_splits_eff,
+        oof_out, per_class=per_class, write_oof=True, print_summary=True,
+    )
 
 
 def _write_oof_csv(
@@ -420,6 +457,188 @@ def evaluate_rf_per_class(
         manifest_path, rf_model_path=rf_model_path, cluster_radius=cluster_radius, **kwargs
     )
     return result["per_type"]
+
+
+# ---------------------------------------------------------------------------
+# R3.1/R3.2/R3.4 — tune: compare classifier candidates on identical CV
+# ---------------------------------------------------------------------------
+
+def default_tune_candidates() -> list[dict]:
+    """The default `tune` grid — a small, deliberately cheap set of
+    alternatives to the plain default RandomForestClassifier:
+
+    - RF at higher min_samples_leaf / a smaller max_features fraction
+      (more regularisation, in case the default RF is overfitting to
+      near-duplicate chips within a cluster)
+    - ExtraTreesClassifier (fully random split thresholds — usually more
+      resistant to overfitting than RF at the cost of some bias)
+    - HistGradientBoostingClassifier (a different bias/variance tradeoff,
+      handles the mixed feature scales natively)
+    - RF + isotonic probability calibration (same decision boundary, better
+      calibrated probabilities — useful since detection thresholds are
+      chosen directly off predict_proba)
+
+    Each entry is {"name": str, "config": {"type", "params"}} as accepted by
+    models.random_forest.make_classifier.
+    """
+    candidates: list[dict] = []
+
+    for msl in (1, 3, 5, 10):
+        for mf in ("sqrt", 0.3):
+            candidates.append({
+                "name": f"rf_leaf{msl}_mf{mf}",
+                "config": {"type": "rf", "params": {
+                    "n_estimators": 300, "min_samples_leaf": msl, "max_features": mf,
+                }},
+            })
+
+    for msl in (1, 5):
+        candidates.append({
+            "name": f"extra_trees_leaf{msl}",
+            "config": {"type": "extra_trees", "params": {
+                "n_estimators": 300, "min_samples_leaf": msl,
+            }},
+        })
+
+    for lr, mln in ((0.05, 31), (0.1, 31), (0.1, 63)):
+        candidates.append({
+            "name": f"hgb_lr{lr}_leaves{mln}",
+            "config": {"type": "hgb", "params": {
+                "learning_rate": lr, "max_leaf_nodes": mln,
+            }},
+        })
+
+    candidates.append({
+        "name": "rf_calibrated_isotonic",
+        "config": {"type": "rf_calibrated", "params": {
+            "n_estimators": 300, "method": "isotonic",
+        }},
+    })
+
+    return candidates
+
+
+def tune_rf(
+    manifest_path: str,
+    cache_dir: str | None = None,
+    out_path: str | None = None,
+    cluster_radius: float = 500.0,
+    n_splits: int = 5,
+    random_seed: int = 42,
+    candidates: list[dict] | None = None,
+) -> dict:
+    """
+    Evaluate a grid of classifier candidates with the same pooled
+    out-of-fold spatial CV used by evaluate_rf_spatial. The spatial
+    clustering and the feature matrix are computed once and shared across
+    every candidate (via _prepare_cv_inputs) — only the fold-fitting cost
+    (_run_cv_folds) is repeated per candidate.
+
+    candidates overrides the default grid (default_tune_candidates()) — this
+    is also the `tune` CLI command's test hook, letting tests run a couple of
+    cheap candidates on tiny synthetic manifests instead of the full grid.
+
+    Writes {"results": [ranked by PR-AUC], "best": <top result>} to out_path
+    (default: <cache_base>/tuning.json) and returns the same dict (plus
+    "out_path").
+    """
+    import time
+
+    from models.random_forest import make_classifier
+
+    rows, X_all, y_all, clusters_arr, n_clusters, cache_base = _prepare_cv_inputs(
+        manifest_path, cluster_radius, cache_dir, use_cache=True
+    )
+
+    if candidates is None:
+        candidates = default_tune_candidates()
+
+    results: list[dict] = []
+    for cand in candidates:
+        name, config = cand["name"], cand["config"]
+        print(f"\n--- {name} ---")
+        t0 = time.time()
+
+        def _factory(config=config, **kw):
+            return make_classifier(config=config, **kw)
+
+        oof_prob, fold_of, n_splits_eff = _run_cv_folds(
+            X_all, y_all, clusters_arr, _factory, n_splits, random_seed,
+        )
+        fit_time = time.time() - t0
+
+        summary = _summarize_cv(
+            rows, y_all, oof_prob, fold_of, clusters_arr, cluster_radius,
+            n_clusters, n_splits_eff, oof_out=None,
+            per_class=True, write_oof=False, print_summary=False,
+        )
+        per_type = summary["per_type"]
+        # "hard_negatives" is chips_new's naming; fall back to "negative" for
+        # older/synthetic manifests that don't distinguish hard negatives.
+        hard_neg = per_type.get("hard_negatives") or per_type.get("negative") or {}
+
+        entry = {
+            "name": name,
+            "config": config,
+            "roc_auc": summary["roc_auc"],
+            "pr_auc": summary["pr_auc"],
+            "point_f1_at_recommended": summary["point_metrics_at_recommended"]["f1"],
+            "positive_recall_at_recommended": summary["metrics_at_recommended"]["recall"],
+            "hard_negative_specificity": hard_neg.get("specificity"),
+            "recommended_threshold": summary["recommended_threshold"],
+            "fit_time_sec": round(fit_time, 2),
+        }
+        results.append(entry)
+        spec_str = (f"{entry['hard_negative_specificity']:.3f}"
+                    if entry["hard_negative_specificity"] is not None else "n/a")
+        print(f"  pr_auc={entry['pr_auc']:.3f}  roc_auc={entry['roc_auc']:.3f}  "
+              f"point_f1={entry['point_f1_at_recommended']:.3f}  "
+              f"recall={entry['positive_recall_at_recommended']:.3f}  "
+              f"hard_neg_spec={spec_str}  time={entry['fit_time_sec']:.1f}s")
+
+    def _sort_key(r: dict) -> float:
+        v = r["pr_auc"]
+        return v if v == v else -1.0  # NaN (single-class pooled OOF) sorts last
+
+    results_sorted = sorted(results, key=_sort_key, reverse=True)
+    best = results_sorted[0] if results_sorted else None
+
+    out_file = Path(out_path).resolve() if out_path else cache_base / "tuning.json"
+    out = {
+        "manifest": str(Path(manifest_path).resolve()),
+        "cluster_radius": cluster_radius,
+        "n_clusters": n_clusters,
+        "n_candidates": len(results),
+        "results": results_sorted,
+        "best": best,
+        "out_path": str(out_file),
+    }
+
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_file, "w") as f:
+        json.dump(out, f, indent=2, default=str)
+
+    _print_tune_table(results_sorted)
+    if best:
+        print(f"\nBest by PR-AUC: {best['name']}  (results written to {out_file})")
+
+    return out
+
+
+def _print_tune_table(results: list[dict]) -> None:
+    print(f"\n{'=' * 100}")
+    print(f"Tuning results ({len(results)} candidates, ranked by PR-AUC)")
+    print("=" * 100)
+    header = (f"{'Name':<26} {'PR-AUC':>8} {'ROC-AUC':>8} {'PointF1':>8} "
+              f"{'Recall':>8} {'HardNegSpec':>12} {'Fit(s)':>8}")
+    print(header)
+    print("-" * len(header))
+    for r in results:
+        spec = (f"{r['hard_negative_specificity']:.3f}"
+                if r["hard_negative_specificity"] is not None else "n/a")
+        print(f"{r['name']:<26} {r['pr_auc']:>8.3f} {r['roc_auc']:>8.3f} "
+              f"{r['point_f1_at_recommended']:>8.3f} {r['positive_recall_at_recommended']:>8.3f} "
+              f"{spec:>12} {r['fit_time_sec']:>8.1f}")
 
 
 # ---------------------------------------------------------------------------

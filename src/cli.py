@@ -67,9 +67,32 @@ def _union_bbox(jp2_paths: list[str]):
 # train (RF)
 # ---------------------------------------------------------------------------
 
+def _load_classifier_config(path: str) -> dict:
+    """Load a classifier config for train --classifier-config. Accepts either
+    a raw {"type", "params"} dict, or a `tune` output file (its "best" entry's
+    "config" is used)."""
+    import json as _json
+
+    with open(path) as f:
+        data = _json.load(f)
+
+    if isinstance(data, dict):
+        if "type" in data and "params" in data:
+            return data
+        best = data.get("best")
+        if isinstance(best, dict) and "config" in best:
+            return best["config"]
+
+    sys.exit(
+        f"--classifier-config {path}: could not find a classifier config "
+        "(expected a `tune` output file with a 'best' entry, or a raw "
+        "{'type', 'params'} config)."
+    )
+
+
 def cmd_train(args: argparse.Namespace) -> None:
     from training_data import build_training_dataset
-    from models.random_forest import train
+    from models.random_forest import make_classifier, train
 
     jp2_files = _find_files(args.imagery, ".jp2")
     kml_files = _find_files(args.labels, ".kml") + _find_files(args.labels, ".kmz")
@@ -87,6 +110,9 @@ def cmd_train(args: argparse.Namespace) -> None:
     # GUI callers (src/app.py) build a hand-crafted Namespace that may not
     # carry newly-added attributes — fall back to the CLI default.
     neg_ratio = getattr(args, "neg_ratio", 1.0)
+    run_cv = not getattr(args, "no_cv", False)
+    classifier_config_path = getattr(args, "classifier_config", None)
+    classifier_config = _load_classifier_config(classifier_config_path) if classifier_config_path else None
 
     with chip_dir_ctx as chip_dir:
         print("Extracting training chips ...")
@@ -129,12 +155,40 @@ def cmd_train(args: argparse.Namespace) -> None:
             print(f"\nWARNING: Only {len(flood_chips)} positive chips — model will be "
                   "unreliable. Add more imagery tiles that cover your labeled features.")
 
-        print("Training Random Forest ...")
-        train(manifest, args.model)
+        # Spatial CV runs (by default) before the final fit, sharing chip_dir as the
+        # feature cache — train() below reuses the same cache, so features aren't
+        # extracted twice in one `train` invocation. Works with a temp chip_dir too:
+        # the cache lives for the lifetime of the `with chip_dir_ctx` block, which
+        # covers both this CV run and the train() call.
+        cv_results = None
+        if run_cv:
+            from models.evaluate import evaluate_rf_spatial
+            print("Running spatial CV before saving the final model ...")
+            classifier_factory = (
+                (lambda **kw: make_classifier(config=classifier_config, **kw))
+                if classifier_config is not None else None
+            )
+            try:
+                cv_results = evaluate_rf_spatial(
+                    manifest, cache_dir=chip_dir, use_cache=True, per_class=True,
+                    classifier_factory=classifier_factory,
+                )
+            except ValueError as exc:
+                print(f"  Skipping CV: {exc}")
+                cv_results = None
+
+        print("Training Random Forest ..." if classifier_config is None
+              else f"Training classifier (config: {classifier_config.get('type')}) ...")
+        train(
+            manifest, args.model,
+            classifier_config=classifier_config,
+            cache_dir=chip_dir, use_cache=True,
+            cv_results=cv_results,
+        )
 
     print(f"Model saved to {args.model}")
+    print(f"Model metadata saved to {Path(args.model).with_suffix('.json')}")
     if args.chip_dir is not None:
-        from pathlib import Path
         manifest_path = Path(args.chip_dir) / "manifest.csv"
         print(f"Chips and manifest saved to {args.chip_dir}/")
         print(f"  Run evaluate-rf with: --manifest {manifest_path}")
@@ -181,6 +235,34 @@ def cmd_cnn_train(args: argparse.Namespace) -> None:
 # detect
 # ---------------------------------------------------------------------------
 
+def _resolve_detect_threshold(
+    explicit_threshold: float | None,
+    method: str,
+    rf_model_path: str | None,
+) -> float:
+    """Resolve the confidence threshold for `detect`: an explicit
+    --threshold always wins (this is how the GUI, which always passes one,
+    picks its threshold). Otherwise fall back to the RF model's .json
+    metadata sidecar recommended_threshold (R3.5), else 0.5. Prints which
+    source was used."""
+    if explicit_threshold is not None:
+        threshold = float(explicit_threshold)
+        print(f"Using explicit confidence threshold: {threshold:.3f}")
+        return threshold
+
+    if method in ("rf", "both") and rf_model_path:
+        from models.random_forest import load_model_metadata
+        meta = load_model_metadata(rf_model_path)
+        rec = meta.get("recommended_threshold") if meta else None
+        if rec is not None:
+            threshold = float(rec)
+            print(f"Using recommended threshold from model metadata: {threshold:.3f}")
+            return threshold
+
+    print("Using default confidence threshold: 0.500")
+    return 0.5
+
+
 def cmd_detect(args: argparse.Namespace) -> None:
     from polygonizer import detect_rois_rf_segmentation, detect_rois_cnn
     from export import export_kml
@@ -195,9 +277,13 @@ def cmd_detect(args: argparse.Namespace) -> None:
     rf_clf = cnn_model = norm_stats = None
 
     if method in ("rf", "both"):
-        from models.random_forest import load_model as load_rf
+        from models.random_forest import check_feature_length, load_model as load_rf
         print(f"Loading RF model from {args.rf_model} ...")
         rf_clf = load_rf(args.rf_model)
+        try:
+            check_feature_length(rf_clf)
+        except ValueError as exc:
+            sys.exit(str(exc))
 
     if method in ("cnn", "both"):
         import json
@@ -205,6 +291,11 @@ def cmd_detect(args: argparse.Namespace) -> None:
         cnn_model = load_cnn(args.cnn_model)
         with open(args.norm_stats) as f:
             norm_stats = json.load(f)
+
+    # Threshold resolution: an explicit --threshold always wins (this is how the
+    # GUI, which always passes one, picks the threshold). Otherwise fall back to
+    # the RF model's metadata sidecar (R3.5) recommended_threshold, else 0.5.
+    threshold = _resolve_detect_threshold(getattr(args, "threshold", None), method, args.rf_model)
 
     # GUI callers (src/app.py) build a hand-crafted Namespace that may not
     # carry newly-added attributes — fall back to the CLI defaults.
@@ -222,7 +313,7 @@ def cmd_detect(args: argparse.Namespace) -> None:
 
         if method == "rf":
             rois = detect_rois_rf_segmentation(
-                jp2_path, rf_clf, stream_mask, args.threshold,
+                jp2_path, rf_clf, stream_mask, threshold,
                 min_area_m2=min_area, seed_threshold=seed_threshold, smooth=smooth,
             )
             print(f"  RF detections: {len(rois)}")
@@ -230,7 +321,7 @@ def cmd_detect(args: argparse.Namespace) -> None:
 
         elif method == "cnn":
             rois = detect_rois_cnn(
-                jp2_path, cnn_model, norm_stats, stream_mask, args.threshold,
+                jp2_path, cnn_model, norm_stats, stream_mask, threshold,
                 min_area_m2=min_area,
             )
             print(f"  CNN detections: {len(rois)}")
@@ -238,11 +329,11 @@ def cmd_detect(args: argparse.Namespace) -> None:
 
         elif method == "both":
             rf_rois  = detect_rois_rf_segmentation(
-                jp2_path, rf_clf, stream_mask, args.threshold,
+                jp2_path, rf_clf, stream_mask, threshold,
                 min_area_m2=min_area, seed_threshold=seed_threshold, smooth=smooth,
             )
             cnn_rois = detect_rois_cnn(
-                jp2_path, cnn_model, norm_stats, stream_mask, args.threshold,
+                jp2_path, cnn_model, norm_stats, stream_mask, threshold,
                 min_area_m2=min_area,
             )
             print(f"  RF detections: {len(rf_rois)}  CNN detections: {len(cnn_rois)}")
@@ -284,6 +375,21 @@ def cmd_evaluate_rf(args: argparse.Namespace) -> None:
         cache_dir=args.cache_dir,
         use_cache=not args.no_cache,
         per_class=args.per_class,
+    )
+
+
+# ---------------------------------------------------------------------------
+# tune
+# ---------------------------------------------------------------------------
+
+def cmd_tune(args: argparse.Namespace) -> None:
+    from models.evaluate import tune_rf
+    tune_rf(
+        manifest_path=args.manifest,
+        cache_dir=args.cache_dir,
+        out_path=args.out,
+        cluster_radius=args.cluster_radius,
+        n_splits=args.n_splits,
     )
 
 
@@ -356,6 +462,15 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Auto-negative chip count relative to the number of positive "
                               "chips after augmentation (default 1.0). Ignored if the "
                               "positive:negative balance is overridden elsewhere.")
+    p_train.add_argument("--classifier-config", default=None, dest="classifier_config",
+                         help="Path to a classifier config JSON — either a `tune` output file "
+                              "(its best candidate is used) or a raw {'type','params'} config "
+                              "as accepted by models.random_forest.make_classifier. Default: "
+                              "the project's default RandomForestClassifier.")
+    p_train.add_argument("--no-cv", action="store_true", dest="no_cv",
+                         help="Skip the spatial CV run performed after training by default. "
+                              "CV results (including the recommended threshold) are stored in "
+                              "the model's .json metadata sidecar when CV runs.")
 
     # -- cnn-train --
     p_cnn = sub.add_parser("cnn-train", help="Train the CNN classifier (Prithvi head)")
@@ -381,8 +496,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_detect.add_argument("--norm-stats", default=None, dest="norm_stats",
                           help="Norm stats JSON — required for --method cnn or both")
     p_detect.add_argument("--hydro",     default=None, help="Hydrography directory or file (optional)")
-    p_detect.add_argument("--threshold", type=float, default=0.5,
-                          help="Confidence threshold (default 0.5)")
+    p_detect.add_argument("--threshold", type=float, default=None,
+                          help="Confidence threshold. Default: the RF model's recommended "
+                               "threshold from its .json metadata sidecar (R3.5) if present, "
+                               "else 0.5.")
     p_detect.add_argument("--min-area", type=float, default=2048.0, dest="min_area",
                           help="Minimum detection area in m^2 (default 2048 — "
                                "roughly 2 RF patches; a single 64px patch is 1024 m^2)")
@@ -438,6 +555,25 @@ def build_parser() -> argparse.ArgumentParser:
                            help="Print the per-feature-type breakdown table (always computed "
                                 "and returned; this only toggles printing it)")
 
+    # -- tune --
+    p_tune = sub.add_parser(
+        "tune",
+        help="Compare classifier candidates (RF variants, ExtraTrees, HistGradientBoosting, "
+             "calibrated RF) with the same pooled spatial CV and write a ranked report",
+    )
+    p_tune.add_argument("--manifest", required=True, help="Training manifest CSV")
+    p_tune.add_argument("--cache-dir", default=None, dest="cache_dir",
+                        help="Where to read/write the shared feature cache and the default "
+                             "tuning.json output (default: the manifest's own directory)")
+    p_tune.add_argument("--out", default=None,
+                        help="Output JSON path (default: <cache-dir or manifest dir>/tuning.json)")
+    p_tune.add_argument("--cluster-radius", type=float, default=500.0, dest="cluster_radius",
+                        help="Group label points within this radius (metres) into one spatial "
+                             "cluster (default 500)")
+    p_tune.add_argument("--n-splits", type=int, default=5, dest="n_splits",
+                        help="Number of CV folds per candidate, capped at the number of spatial "
+                             "clusters (default 5)")
+
     return parser
 
 
@@ -465,6 +601,7 @@ def main() -> None:
         "detect":      cmd_detect,
         "evaluate":    cmd_evaluate,
         "evaluate-rf": cmd_evaluate_rf,
+        "tune":        cmd_tune,
     }
     dispatch[args.command](args)
 
