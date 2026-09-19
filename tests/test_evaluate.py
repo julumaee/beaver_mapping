@@ -1,6 +1,7 @@
 """Tests for src/models/evaluate.py — pooled out-of-fold spatial CV."""
 
 import csv
+import json
 import sys
 from pathlib import Path
 
@@ -9,7 +10,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from models.evaluate import evaluate_rf_spatial, evaluate_rf_per_class, _spatial_clusters
+from models.evaluate import evaluate_rf_spatial, evaluate_rf_per_class, tune_rf, _spatial_clusters
 
 
 # 6 well-separated cluster origins, alternating positive/negative, 2 label
@@ -156,3 +157,66 @@ class TestEvaluateRFPerClass:
         manifest = _make_manifest(tmp_path)
         result = evaluate_rf_per_class(manifest, cluster_radius=500.0, n_splits=3, random_seed=0)
         assert "flood" in result and "negative" in result
+
+
+class TestTuneRF:
+    """R3.1/R3.2/R3.4 — tune runs the same pooled spatial CV per classifier
+    candidate and writes a ranked report. Uses the `candidates` test hook to
+    run only 2 cheap candidates instead of the full default grid."""
+
+    _TEST_CANDIDATES = [
+        {"name": "rf_default", "config": {"type": "rf", "params": {"n_estimators": 20}}},
+        {"name": "extra_trees_small",
+         "config": {"type": "extra_trees", "params": {"n_estimators": 20, "min_samples_leaf": 3}}},
+    ]
+
+    def test_writes_json_with_best_config(self, tmp_path):
+        manifest = _make_manifest(tmp_path)
+        out_path = tmp_path / "tuning.json"
+
+        result = tune_rf(
+            manifest, cluster_radius=500.0, n_splits=3, random_seed=0,
+            candidates=self._TEST_CANDIDATES, out_path=str(out_path),
+        )
+
+        assert out_path.exists()
+        with open(out_path) as f:
+            written = json.load(f)
+
+        assert written["n_candidates"] == 2
+        assert len(written["results"]) == 2
+        assert written["best"] is not None
+        assert written["best"]["name"] in {"rf_default", "extra_trees_small"}
+        assert written["best"]["config"]["type"] in {"rf", "extra_trees"}
+        assert written == result
+
+    def test_each_result_has_ranking_metrics(self, tmp_path):
+        manifest = _make_manifest(tmp_path)
+        result = tune_rf(
+            manifest, cluster_radius=500.0, n_splits=3, random_seed=0,
+            candidates=self._TEST_CANDIDATES,
+        )
+        for entry in result["results"]:
+            for key in ("roc_auc", "pr_auc", "point_f1_at_recommended",
+                        "positive_recall_at_recommended", "hard_negative_specificity",
+                        "recommended_threshold", "fit_time_sec"):
+                assert key in entry
+
+    def test_results_sorted_by_pr_auc_descending(self, tmp_path):
+        manifest = _make_manifest(tmp_path)
+        result = tune_rf(
+            manifest, cluster_radius=500.0, n_splits=3, random_seed=0,
+            candidates=self._TEST_CANDIDATES,
+        )
+        pr_aucs = [r["pr_auc"] for r in result["results"]]
+        assert pr_aucs == sorted(pr_aucs, reverse=True)
+
+    def test_default_out_path_under_cache_dir(self, tmp_path):
+        manifest = _make_manifest(tmp_path)
+        cache_dir = tmp_path / "cache"
+        result = tune_rf(
+            manifest, cluster_radius=500.0, n_splits=3, random_seed=0,
+            candidates=self._TEST_CANDIDATES, cache_dir=str(cache_dir),
+        )
+        assert Path(result["out_path"]) == (cache_dir / "tuning.json").resolve()
+        assert (cache_dir / "tuning.json").exists()
