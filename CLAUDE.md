@@ -34,6 +34,7 @@ data/
   models/         # model.pkl + model.json metadata sidecar (RF), .pth + norm_stats.json (CNN)
   output/         # generated KML detection files (GUI: detections_<method>_<timestamp>.kml)
   settings.json   # GUI settings, auto-saved (override path with CASTOR_SETTINGS env var)
+  review_state.json  # review-queue decisions (GUI Map & Review tab), keyed by rounded EPSG:3067 coords
 src/
   app.py              # Gradio GUI: Project panel + Data check → Train → Evaluate → Detect → Map & Review → Experimental (CNN)
   cli.py              # argparse CLI: train, tune, detect, evaluate-rf, evaluate, cnn-train (GUI delegates to cmd_*)
@@ -45,6 +46,7 @@ src/
   export.py           # reproject to EPSG:4326, write KML with confidence colours
   diagnose_point.py   # visualise chip + RF prediction at a single lon/lat
   label_audit.py      # flag suspicious labels from out-of-fold CV predictions
+  review_queue.py     # detection review queue (active learning): order, persist decisions, export review.kml
   models/
     random_forest.py  # make_classifier (single config source), train, model.json sidecar, feature-length check
     evaluate.py       # pooled out-of-fold spatial CV, per-type breakdown, tuning, RF vs CNN

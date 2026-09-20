@@ -40,6 +40,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import gradio as gr
 
+import review_queue
+
 # --------------------------------------------------------------------------- #
 # Project paths — G1.1: one shared Project panel, everything else derived
 # --------------------------------------------------------------------------- #
@@ -1236,6 +1238,14 @@ def _build_map(
             if (el) el.textContent = 'Selected: ' + e.latlng.lat.toFixed(6)
                                      + ', ' + e.latlng.lng.toFixed(6);
           }});
+          // Review queue (G2.1): let the parent page re-centre this already-
+          // rendered map on the current item without redrawing it — redrawing
+          // the whole detections layer per decision is too expensive.
+          try {{
+            window.parent._panReviewMap = function(lat, lon) {{
+              try {{ {map_var}.setView([lat, lon], 16); }} catch (e) {{}}
+            }};
+          }} catch (err) {{}}
         }}
       }}, 100);
     }})();
@@ -1647,6 +1657,238 @@ def handle_map_click_followup(
         lon, lat, imagery_dir, project_dir, rf_model_override
     )
     return chip_img, ndwi_img, ndvi_img, prob_img, log
+
+
+# --------------------------------------------------------------------------- #
+# Review queue (Map & Review tab) — G2.1
+#
+# Turns the detection verification a reviewer already does into training
+# data. A gr.State holds the in-memory review_queue.ReviewQueue for the
+# session; every handler here mutates it (decide/next/previous) and returns
+# it back out as the first output so Gradio keeps the (same) object in
+# state. Rendering only ever touches the *current* item's chip/NDWI/RF-prob
+# images — never the whole map or the whole KML — so this stays responsive
+# with thousands of detections (see tests/test_review_queue.py and the
+# manual timing check against the real 7,220-item detections.kml).
+# --------------------------------------------------------------------------- #
+
+# Cache the loaded RF model (keyed by path+mtime) and each imagery directory's
+# tile bounds index, so stepping through the queue doesn't reload the model
+# or re-open every .jp2 file on every click.
+_REVIEW_MODEL_CACHE: dict[str, tuple[float, object]] = {}
+_REVIEW_TILE_CACHE: dict[str, list[tuple[str, tuple]]] = {}
+
+
+def _review_load_model(rf_model_path: str):
+    from models.random_forest import load_model
+    mtime = Path(rf_model_path).stat().st_mtime
+    cached = _REVIEW_MODEL_CACHE.get(rf_model_path)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+    clf = load_model(rf_model_path)
+    _REVIEW_MODEL_CACHE[rf_model_path] = (mtime, clf)
+    return clf
+
+
+def _review_tile_index(imagery_dir: str) -> list[tuple[str, tuple]]:
+    cached = _REVIEW_TILE_CACHE.get(imagery_dir)
+    if cached is not None:
+        return cached
+    import rasterio
+    index: list[tuple[str, tuple]] = []
+    for p in Path(imagery_dir).rglob("*.jp2"):
+        try:
+            with rasterio.open(str(p)) as src:
+                b = src.bounds
+                index.append((str(p), (b.left, b.bottom, b.right, b.top)))
+        except Exception:
+            continue
+    _REVIEW_TILE_CACHE[imagery_dir] = index
+    return index
+
+
+def _review_find_tile(imagery_dir: str, x: float, y: float) -> str | None:
+    for path, (left, bottom, right, top) in _review_tile_index(imagery_dir):
+        if left <= x <= right and bottom <= y <= top:
+            return path
+    return None
+
+
+def _review_extract_chip(item, imagery_dir: str):
+    """Windowed chip read at the item's location, or (None, error). Shared by
+    the fast chip/NDWI render and the on-demand probability-map compute."""
+    if not imagery_dir or not imagery_dir.strip() or not Path(imagery_dir).exists():
+        return None, "Imagery directory not set — see the Project panel above."
+    tile = _review_find_tile(imagery_dir.strip(), item.x, item.y)
+    if tile is None:
+        return None, "No imagery tile covers this detection's location."
+    from diagnose_point import extract_chip_at
+    try:
+        return extract_chip_at(tile, item.x, item.y), ""
+    except Exception as exc:
+        return None, f"ERROR reading chip: {exc}"
+
+
+def _render_review_chip_ndwi(item, imagery_dir: str):
+    """Chip + NDWI images for one review item — fast (~0.5s): a windowed
+    raster read plus two colour-mapped renders, reusing the Diagnose Point
+    helpers (_chip_to_image, _colormap_image). The RF probability map is
+    deliberately NOT computed here — see _review_compute_prob and the
+    "Compute probability map" button — because it runs the RF classifier
+    over a whole grid of sub-patches and takes ~15-20s per item on this
+    machine, which would make stepping through a large queue painful.
+    Returns (chip_img, ndwi_img, error)."""
+    chip, err = _review_extract_chip(item, imagery_dir)
+    if chip is None:
+        return None, None, err
+    from spectral import compute_ndwi
+    try:
+        chip_img = _chip_to_image(chip)
+        ndwi_img = _colormap_image(compute_ndwi(chip), "RdBu", vmin=-1, vmax=1)
+        return chip_img, ndwi_img, ""
+    except Exception as exc:
+        return None, None, f"ERROR rendering chip: {exc}"
+
+
+def _review_compute_prob(item, imagery_dir: str, rf_model_path: str):
+    """The slow part: the RF probability heatmap for one item. Returns
+    (prob_img, error). Called only from the explicit "Compute probability
+    map" button, never automatically when stepping through the queue."""
+    chip, err = _review_extract_chip(item, imagery_dir)
+    if chip is None:
+        return None, err
+    if not rf_model_path or not Path(rf_model_path).exists():
+        return None, "RF model not found — train a model first."
+    try:
+        clf = _review_load_model(rf_model_path)
+        return _probability_heatmap(chip, clf), ""
+    except Exception as exc:
+        return None, f"ERROR computing probability map: {exc}"
+
+
+def _review_item_info(item) -> str:
+    conf = f"{item.confidence:.2f}" if item.confidence is not None else "n/a"
+    area = f"{item.area_m2:.0f} m²" if item.area_m2 is not None else "n/a"
+    model = item.model or "unknown"
+    return (
+        f"**Confidence:** {conf}  \n**Area:** {area}  \n**Model:** {model}  \n"
+        f"**Location:** {item.lat:.6f}, {item.lon:.6f} (WGS84)"
+    )
+
+
+def _review_view(q, imagery_dir: str):
+    """Shared output tuple for every review handler:
+    (chip, ndwi, info_md, position_text, progress_text, status, lat, lon).
+    The probability map is intentionally not part of this tuple — see
+    _review_compute_prob — so every navigation/decision handler stays fast
+    regardless of queue size."""
+    if q is None:
+        return (None, None,
+                "Load a detections KML above to start reviewing.",
+                "0 / 0", "0 reviewed, 0 flagged as beaver", "", 62.0, 25.0)
+    item = q.current()
+    if item is None:
+        rank, total = q.position()
+        msg = (
+            "All items reviewed." if total else
+            "No detections found in this KML — nothing to review."
+        )
+        return (None, None, msg, f"{total} / {total}", q.progress_text(), "", 62.0, 25.0)
+    chip_img, ndwi_img, err = _render_review_chip_ndwi(item, imagery_dir)
+    rank, total = q.position()
+    return (
+        chip_img, ndwi_img, _review_item_info(item),
+        f"{rank} / {total}", q.progress_text(), err, item.lat, item.lon,
+    )
+
+
+def handle_review_compute_prob(q, imagery_dir: str, project_dir: str, rf_model_override: str):
+    """Wired to the "Compute probability map" button — the one slow (~15-20s)
+    step, run only when the reviewer explicitly asks for it."""
+    if q is None:
+        return None, "No queue loaded yet — click \"Load / refresh queue\" first."
+    item = q.current()
+    if item is None:
+        return None, "Nothing to compute — the queue is empty or fully reviewed."
+    paths = derive_paths(project_dir, rf_model_override)
+    prob_img, err = _review_compute_prob(item, imagery_dir, paths["rf_model"])
+    return prob_img, err
+
+
+def handle_review_load(
+    project_dir: str,
+    kml_path: str,
+    imagery_dir: str,
+    rf_model_override: str,
+    order_mode: str,
+    threshold: float,
+):
+    # rf_model_override is accepted (and kept in the signature so the GUI
+    # wiring stays uniform across review handlers) but not needed here — the
+    # RF model is only touched on demand, by "Compute probability map".
+    paths = derive_paths(project_dir, rf_model_override)
+    state_path = review_queue.default_state_path(paths["project_dir"])
+    q = review_queue.ReviewQueue.load(
+        (kml_path or "").strip(), state_path, order_mode or "uncertain", float(threshold or 0.5),
+    )
+    return (q,) + _review_view(q, imagery_dir)
+
+
+def handle_review_decide(
+    q,
+    decision: str,
+    label_type: str | None,
+    kml_path: str,
+    imagery_dir: str,
+    project_dir: str,
+    rf_model_override: str,
+):
+    if q is not None:
+        item = q.current()
+        if item is not None:
+            q.decide(item.id, decision, label_type=label_type, kml_path=(kml_path or "").strip())
+    return (q,) + _review_view(q, imagery_dir)
+
+
+def handle_review_beaver(q, label_type, kml_path, imagery_dir, project_dir, rf_model_override):
+    return handle_review_decide(q, "beaver", label_type, kml_path, imagery_dir, project_dir, rf_model_override)
+
+
+def handle_review_not_beaver(q, kml_path, imagery_dir, project_dir, rf_model_override):
+    return handle_review_decide(q, "not_beaver", None, kml_path, imagery_dir, project_dir, rf_model_override)
+
+
+def handle_review_skip(q, kml_path, imagery_dir, project_dir, rf_model_override):
+    return handle_review_decide(q, "skip", None, kml_path, imagery_dir, project_dir, rf_model_override)
+
+
+def handle_review_next(q, imagery_dir, project_dir, rf_model_override):
+    if q is not None:
+        q.next()
+    return (q,) + _review_view(q, imagery_dir)
+
+
+def handle_review_previous(q, imagery_dir, project_dir, rf_model_override):
+    if q is not None:
+        q.previous()
+    return (q,) + _review_view(q, imagery_dir)
+
+
+def handle_review_export(q, labels_dir: str):
+    if q is None:
+        return "No queue loaded yet — click \"Load / refresh queue\" first."
+    if not labels_dir or not labels_dir.strip():
+        return "ERROR: Labels directory is required — set it in the Project panel above."
+    if not q.decisions:
+        return "Nothing to export yet — no decisions recorded."
+    out_path = q.export_kml(labels_dir.strip())
+    n_beaver = q.beaver_count()
+    n_not = q.not_beaver_count()
+    return (
+        f"Exported {n_beaver + n_not} label(s) ({n_beaver} beaver, {n_not} not-beaver) "
+        f"→ {out_path}\nThe next Train run picks this up automatically — every "
+        ".kml/.kmz file under the labels directory is parsed."
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -2163,6 +2405,145 @@ with gr.Blocks(title="CastorDetector") as demo:
             gr.Markdown("### Export filtered detections")
             mp_export_btn = gr.Button("Export filtered KML (above threshold)", variant="secondary", scale=0)
             mp_export_file = gr.File(label="Filtered KML download", interactive=False)
+
+            # -------------------------------------------------------------- #
+            # Review queue (active learning) — G2.1
+            # -------------------------------------------------------------- #
+            gr.Markdown("### Review queue (active learning)")
+            gr.Markdown(
+                "Step through the detections above (from the **Detections KML** dropdown) "
+                "one at a time, most-uncertain-first by default, and turn your verification "
+                "into training data. Decisions are saved to `review_state.json` in the "
+                "project directory as you go, so you can stop and resume — reviewed items "
+                "are not shown again. Only the current item's imagery is rendered, so this "
+                "stays fast even with thousands of detections."
+            )
+            rv_queue_state = gr.State(None)
+            with gr.Row():
+                rv_order_mode = gr.Dropdown(
+                    choices=[
+                        ("Most uncertain first", "uncertain"),
+                        ("Highest confidence first", "confidence"),
+                        ("Largest area first", "area"),
+                    ],
+                    value="uncertain", label="Order",
+                )
+                rv_threshold = gr.Slider(
+                    minimum=0.0, maximum=1.0, value=0.5, step=0.05,
+                    label="Threshold (for \"most uncertain\" ordering)",
+                )
+                rv_load_btn = gr.Button("Load / refresh queue", variant="primary")
+            with gr.Row():
+                rv_position = gr.Textbox(label="Position", value="0 / 0", interactive=False, scale=0)
+                rv_progress = gr.Textbox(
+                    label="Progress", value="0 reviewed, 0 flagged as beaver",
+                    interactive=False,
+                )
+            with gr.Row():
+                rv_chip = gr.Image(label="CIR chip (NIR=R, Red=G, Green=B)", type="numpy")
+                rv_ndwi = gr.Image(label="NDWI (blue=water, red=dry)", type="numpy")
+                rv_prob = gr.Image(label="RF probability map (bright=flood)", type="numpy")
+            rv_prob_btn = gr.Button(
+                "Compute probability map for this item (slow, ~15-20s)", size="sm",
+            )
+            rv_info = gr.Markdown("Load a detections KML above to start reviewing.")
+            rv_status = gr.Textbox(label="", show_label=False, interactive=False, max_lines=2)
+            rv_lat = gr.Number(value=62.0, visible=False)
+            rv_lon = gr.Number(value=25.0, visible=False)
+            with gr.Row():
+                rv_beaver_type = gr.Dropdown(
+                    choices=list(review_queue.BEAVER_LABEL_TYPES),
+                    value="beaver_flood", label="Type (if beaver activity)", scale=0,
+                )
+                rv_beaver_btn = gr.Button("Beaver activity", variant="primary")
+                rv_not_beaver_btn = gr.Button("Not beaver")
+                rv_skip_btn = gr.Button("Skip")
+            with gr.Row():
+                rv_prev_btn = gr.Button("◀ Previous")
+                rv_next_btn = gr.Button("Next ▶")
+            with gr.Row():
+                rv_export_btn = gr.Button("Export / refresh review.kml", variant="secondary")
+            rv_export_status = gr.Textbox(label="Export status", interactive=False, lines=2)
+
+            # Note: rv_prob is NOT in this list — the probability map is only
+            # ever set by rv_prob_btn (handle_review_compute_prob); every
+            # navigation/decision handler below explicitly clears it instead
+            # (via the .then(..., outputs=[rv_prob]) chained on each event),
+            # so a stale heatmap from the previous item is never shown.
+            _rv_view_outputs = [
+                rv_chip, rv_ndwi, rv_info, rv_position, rv_progress, rv_status, rv_lat, rv_lon,
+            ]
+            # Best-effort re-centre of the already-rendered map on the current item
+            # (see _build_map's window.parent._panReviewMap) — never redraws the map.
+            _rv_pan_js = (
+                "(lat, lon) => { try { if (window._panReviewMap) window._panReviewMap(lat, lon); } "
+                "catch (e) {} return []; }"
+            )
+
+            def _rv_clear_prob():
+                return None
+
+            rv_load_event = rv_load_btn.click(
+                fn=handle_review_load,
+                inputs=[proj_dir, mp_kml_dropdown, proj_imagery, proj_rf_model_override,
+                        rv_order_mode, rv_threshold],
+                outputs=[rv_queue_state] + _rv_view_outputs,
+            )
+            rv_load_event.then(fn=_rv_clear_prob, outputs=[rv_prob])
+            rv_load_event.then(fn=None, inputs=[rv_lat, rv_lon], outputs=[], js=_rv_pan_js)
+
+            rv_beaver_event = rv_beaver_btn.click(
+                fn=handle_review_beaver,
+                inputs=[rv_queue_state, rv_beaver_type, mp_kml_dropdown, proj_imagery,
+                        proj_dir, proj_rf_model_override],
+                outputs=[rv_queue_state] + _rv_view_outputs,
+            )
+            rv_beaver_event.then(fn=_rv_clear_prob, outputs=[rv_prob])
+            rv_beaver_event.then(fn=None, inputs=[rv_lat, rv_lon], outputs=[], js=_rv_pan_js)
+
+            rv_not_beaver_event = rv_not_beaver_btn.click(
+                fn=handle_review_not_beaver,
+                inputs=[rv_queue_state, mp_kml_dropdown, proj_imagery, proj_dir, proj_rf_model_override],
+                outputs=[rv_queue_state] + _rv_view_outputs,
+            )
+            rv_not_beaver_event.then(fn=_rv_clear_prob, outputs=[rv_prob])
+            rv_not_beaver_event.then(fn=None, inputs=[rv_lat, rv_lon], outputs=[], js=_rv_pan_js)
+
+            rv_skip_event = rv_skip_btn.click(
+                fn=handle_review_skip,
+                inputs=[rv_queue_state, mp_kml_dropdown, proj_imagery, proj_dir, proj_rf_model_override],
+                outputs=[rv_queue_state] + _rv_view_outputs,
+            )
+            rv_skip_event.then(fn=_rv_clear_prob, outputs=[rv_prob])
+            rv_skip_event.then(fn=None, inputs=[rv_lat, rv_lon], outputs=[], js=_rv_pan_js)
+
+            rv_next_event = rv_next_btn.click(
+                fn=handle_review_next,
+                inputs=[rv_queue_state, proj_imagery, proj_dir, proj_rf_model_override],
+                outputs=[rv_queue_state] + _rv_view_outputs,
+            )
+            rv_next_event.then(fn=_rv_clear_prob, outputs=[rv_prob])
+            rv_next_event.then(fn=None, inputs=[rv_lat, rv_lon], outputs=[], js=_rv_pan_js)
+
+            rv_prev_event = rv_prev_btn.click(
+                fn=handle_review_previous,
+                inputs=[rv_queue_state, proj_imagery, proj_dir, proj_rf_model_override],
+                outputs=[rv_queue_state] + _rv_view_outputs,
+            )
+            rv_prev_event.then(fn=_rv_clear_prob, outputs=[rv_prob])
+            rv_prev_event.then(fn=None, inputs=[rv_lat, rv_lon], outputs=[], js=_rv_pan_js)
+
+            rv_prob_btn.click(
+                fn=handle_review_compute_prob,
+                inputs=[rv_queue_state, proj_imagery, proj_dir, proj_rf_model_override],
+                outputs=[rv_prob, rv_status],
+            )
+
+            rv_export_btn.click(
+                fn=handle_review_export,
+                inputs=[rv_queue_state, proj_labels],
+                outputs=[rv_export_status],
+            )
 
             gr.Markdown("### Diagnose Point")
             gr.Markdown(

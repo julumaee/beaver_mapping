@@ -60,8 +60,16 @@ The workflow is ordered left to right; each tab streams log output live and has 
 | **2. Train** | Extract chips (always kept under `<project>/chips/`) and train the Random Forest; optionally chains straight into spatial cross-validation when finished |
 | **3. Evaluate** | Pooled out-of-fold spatial cross-validation — confusion matrix, per-feature-type breakdown, and a **label audit** table of suspicious label points (positives the model scores low, hand-labelled negatives it scores high) |
 | **4. Detect** | Run the RF model on imagery and export a timestamped KML (`detections_rf_<YYYYmmdd-HHMM>.kml`); threshold defaults to the model's recommended value when available |
-| **5. Map & Review** | Interactive satellite/OSM map — detections, training labels, hydrography, and toggleable label-audit rings; a "past runs" dropdown lists `<project>/output/*.kml`, newest first; click any point (including a marker) to run **Diagnose Point**, shown directly below the map |
+| **5. Map & Review** | Interactive satellite/OSM map — detections, training labels, hydrography, and toggleable label-audit rings; a "past runs" dropdown lists `<project>/output/*.kml`, newest first; click any point (including a marker) to run **Diagnose Point**, shown directly below the map; also hosts the **review queue** (below) |
 | **6. Experimental (CNN)** | Prithvi-EO CNN training, RF-vs-CNN comparison, and CNN/"both" detection — collapsed by default and marked slow (CPU inference ~15–40 min/tile) |
+
+### Review queue (active learning)
+
+The **Map & Review** tab has a review queue that turns the verification work you already do into training data (`src/review_queue.py`; roadmap G2.1). It steps through the detections in the selected KML one at a time — most-uncertain-first by default (`|confidence − threshold|` ascending; also selectable: highest-confidence-first, largest-area-first) — showing the CIR chip and NDWI for the current item immediately, plus a **Compute probability map** button for the RF heatmap (kept separate because it runs the classifier over a whole patch grid and takes ~15–20s, vs. under 100ms to step to a new item).
+
+For each item, click **Beaver activity** (choosing `dead_forest` or `beaver_flood` from the type dropdown), **Not beaver**, or **Skip**; **Previous**/**Next** move around without deciding. Decisions are written immediately to `<project>/review_state.json`, keyed by the item's rounded EPSG:3067 centroid — so a re-run of detection that reproduces the same flood area maps onto the same decision, and a closed/reopened session resumes where you left off without re-showing already-reviewed items.
+
+Click **Export / refresh review.kml** to write `<labels_dir>/review.kml` — beaver decisions grouped into a `dead_forest`/`beaver_flood` folder (per item), not-beaver decisions into `hard_negatives`; skips are never exported. Because it's a `.kml` file in the labels directory, the **next Train run picks it up automatically** — no extra step needed, and no need to keep the original detections KML around (positions are recovered from the state file's item ids).
 
 An **Advanced** accordion in the Project panel lets you override the RF model file (e.g. to compare a saved checkpoint) without touching the default `<project>/models/model.pkl`; each tab has its own **Advanced** accordion for the less-common flags (augmentation, flood samples, negative ratio, CV folds/cluster radius, min detection area, seed threshold, smoothing, CNN epochs/LR), each with inline help text.
 
