@@ -14,17 +14,21 @@ import app
 
 class TestDerivePaths:
     def test_default_project_dir(self):
+        # An empty project dir falls back to the detected data directory, which
+        # is the repo's own data/ or — from a worktree — the main checkout's.
+        root = Path(app.DEFAULT_PROJECT_DIR)
+        assert root.name == "data"
         paths = app.derive_paths("")
-        assert paths["project_dir"] == "data"
-        assert paths["models_dir"] == str(Path("data/models"))
-        assert paths["rf_model"] == str(Path("data/models/model.pkl"))
-        assert paths["rf_sidecar"] == str(Path("data/models/model.json"))
-        assert paths["chips_dir"] == str(Path("data/chips"))
-        assert paths["manifest"] == str(Path("data/chips/manifest.csv"))
-        assert paths["oof_csv"] == str(Path("data/chips/oof.csv"))
-        assert paths["cnn_model"] == str(Path("data/models/beaver_cnn_v1.pth"))
-        assert paths["norm_stats"] == str(Path("data/models/norm_stats.json"))
-        assert paths["output_dir"] == str(Path("data/output"))
+        assert paths["project_dir"] == str(root)
+        assert paths["models_dir"] == str(root / "models")
+        assert paths["rf_model"] == str(root / "models/model.pkl")
+        assert paths["rf_sidecar"] == str(root / "models/model.json")
+        assert paths["chips_dir"] == str(root / "chips")
+        assert paths["manifest"] == str(root / "chips/manifest.csv")
+        assert paths["oof_csv"] == str(root / "chips/oof.csv")
+        assert paths["cnn_model"] == str(root / "models/beaver_cnn_v1.pth")
+        assert paths["norm_stats"] == str(root / "models/norm_stats.json")
+        assert paths["output_dir"] == str(root / "output")
 
     def test_custom_project_dir(self):
         paths = app.derive_paths("/tmp/myproj")

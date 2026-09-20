@@ -44,7 +44,36 @@ import gradio as gr
 # Project paths — G1.1: one shared Project panel, everything else derived
 # --------------------------------------------------------------------------- #
 
-DEFAULT_PROJECT_DIR = "data"
+def _default_data_dir() -> Path:
+    """Locate the data directory holding imagery/, labels/ and hydrography/.
+
+    data/ is gitignored, so a git worktree of this repo doesn't have one; fall
+    back to the main checkout's data/ so the GUI still opens on the real data.
+    Override with the CASTOR_DATA environment variable.
+    """
+    env = os.environ.get("CASTOR_DATA")
+    if env:
+        return Path(env)
+
+    repo_root = Path(__file__).parent.parent
+    candidates = [repo_root / "data"]
+    parts = repo_root.parts
+    if ".claude" in parts:                      # .../<main checkout>/.claude/worktrees/<name>
+        candidates.append(Path(*parts[:parts.index(".claude")]) / "data")
+    for candidate in candidates:
+        if (candidate / "imagery").is_dir() or (candidate / "labels").is_dir():
+            return candidate
+    return repo_root / "data"
+
+
+def _default_subdir(name: str) -> str:
+    """Path to a standard data subdirectory, or "" when it doesn't exist."""
+    path = DEFAULT_DATA_DIR / name
+    return str(path) if path.is_dir() else ""
+
+
+DEFAULT_DATA_DIR = _default_data_dir()
+DEFAULT_PROJECT_DIR = str(DEFAULT_DATA_DIR)
 RF_MODEL_FILENAME = "model.pkl"
 CNN_MODEL_FILENAME = "beaver_cnn_v1.pth"
 NORM_STATS_FILENAME = "norm_stats.json"
@@ -299,6 +328,9 @@ def handle_autosave(*values) -> str:
 
 
 _s = _load_settings()
+
+# Saved value wins; otherwise fall back to the detected data directory.
+_PROJECT_DIR_VALUE = _s.get("project_dir") or DEFAULT_PROJECT_DIR
 
 
 _MAX_LOG_HISTORY = 5
@@ -1844,7 +1876,10 @@ def handle_chip_gallery(project_dir: str) -> list:
 with gr.Blocks(title="CastorDetector") as demo:
     gr.Markdown("# CastorDetector\nBeaver activity detection in MML aerial imagery.")
 
-    _project_configured = bool(_s.get("imagery_dir") or _s.get("labels_dir"))
+    _project_configured = bool(
+        _s.get("imagery_dir") or _s.get("labels_dir")
+        or _default_subdir("imagery") or _default_subdir("labels")
+    )
 
     # ------------------------------------------------------------------ #
     # G1.1 — Shared Project panel (collapsible once set)
@@ -1853,27 +1888,27 @@ with gr.Blocks(title="CastorDetector") as demo:
         with gr.Row():
             proj_imagery = gr.Textbox(
                 label="Imagery directory", placeholder="data/imagery/",
-                value=_s.get("imagery_dir", ""),
+                value=_s.get("imagery_dir") or _default_subdir("imagery"),
             )
             proj_labels = gr.Textbox(
                 label="Labels directory", placeholder="data/labels/",
-                value=_s.get("labels_dir", ""),
+                value=_s.get("labels_dir") or _default_subdir("labels"),
             )
         with gr.Row():
             proj_hydro = gr.Textbox(
                 label="Hydrography directory (optional)", placeholder="data/hydrography/",
-                value=_s.get("hydro_dir", ""),
+                value=_s.get("hydro_dir") or _default_subdir("hydrography"),
             )
             proj_dir = gr.Textbox(
                 label="Project directory", placeholder=DEFAULT_PROJECT_DIR,
-                value=_s.get("project_dir", DEFAULT_PROJECT_DIR),
+                value=_PROJECT_DIR_VALUE,
                 info="Models, chips, and detection outputs are all derived from this directory.",
             )
         with gr.Accordion("Advanced: override model path", open=False):
             proj_rf_model_override = gr.Dropdown(
                 label="RF model file (.pkl) — default: <project>/models/model.pkl",
                 choices=list_model_files(
-                    derive_paths(_s.get("project_dir", DEFAULT_PROJECT_DIR))["models_dir"], ".pkl"
+                    derive_paths(_PROJECT_DIR_VALUE)["models_dir"], ".pkl"
                 ),
                 value=_s.get("rf_model_override", ""),
                 allow_custom_value=True,
@@ -1881,7 +1916,7 @@ with gr.Blocks(title="CastorDetector") as demo:
             )
             proj_refresh_models_btn = gr.Button("Refresh list", size="sm", scale=0)
         status_line = gr.Markdown(build_status_line(
-            derive_paths(_s.get("project_dir", DEFAULT_PROJECT_DIR),
+            derive_paths(_PROJECT_DIR_VALUE,
                          _s.get("rf_model_override", ""))["rf_model"],
             _s.get("labels_dir", ""),
         ))
@@ -2041,12 +2076,12 @@ with gr.Blocks(title="CastorDetector") as demo:
             )
             dt_method_state = gr.State("rf")
             det_threshold_default = float((read_model_sidecar(
-                derive_paths(_s.get("project_dir", DEFAULT_PROJECT_DIR),
+                derive_paths(_PROJECT_DIR_VALUE,
                              _s.get("rf_model_override", ""))["rf_model"]
             ) or {}).get("recommended_threshold") or _s.get("det_threshold", 0.5) or 0.5)
             det_threshold_label = "Confidence threshold"
             _det_meta = read_model_sidecar(derive_paths(
-                _s.get("project_dir", DEFAULT_PROJECT_DIR), _s.get("rf_model_override", ""))["rf_model"])
+                _PROJECT_DIR_VALUE, _s.get("rf_model_override", ""))["rf_model"])
             if _det_meta and _det_meta.get("recommended_threshold") is not None:
                 det_threshold_label = f"Confidence threshold (recommended: {_det_meta['recommended_threshold']:.2f})"
             dt_threshold = gr.Slider(
@@ -2095,7 +2130,7 @@ with gr.Blocks(title="CastorDetector") as demo:
             with gr.Row():
                 mp_kml_dropdown = gr.Dropdown(
                     label="Detections KML (past runs, newest first)",
-                    choices=list_output_kmls(_s.get("project_dir", DEFAULT_PROJECT_DIR)),
+                    choices=list_output_kmls(_PROJECT_DIR_VALUE),
                     value=_s.get("map_kml", ""), allow_custom_value=True,
                 )
                 mp_refresh_btn = gr.Button("Refresh list", size="sm", scale=0)
@@ -2362,11 +2397,23 @@ with gr.Blocks(title="CastorDetector") as demo:
         f"_AUTOSAVE_COMPONENTS ({len(_AUTOSAVE_COMPONENTS)}) must line up 1:1 with "
         f"_SETTINGS_KEYS ({len(_SETTINGS_KEYS)})"
     )
+    # Text/number fields save on blur or Enter, sliders on release, and the rest
+    # on change. Using .change everywhere fired one save per keystroke, which
+    # queued up behind long-running jobs and made the UI look stuck.
+    def _autosave_triggers(component):
+        if isinstance(component, (gr.Textbox, gr.Number)):
+            return [component.blur, component.submit]
+        if isinstance(component, gr.Slider):
+            return [component.release]
+        return [component.change]
+
     gr.on(
-        triggers=[c.change for c in _AUTOSAVE_COMPONENTS],
+        triggers=[t for c in _AUTOSAVE_COMPONENTS for t in _autosave_triggers(c)],
         fn=handle_autosave,
         inputs=_AUTOSAVE_COMPONENTS,
         outputs=[save_status],
+        queue=False,
+        show_progress="hidden",
     )
 
 demo.queue()
