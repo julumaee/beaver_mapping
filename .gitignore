@@ -16,6 +16,12 @@ data/imagery/
 data/hydrography/
 data/labels/
 data/output/
+data/chips/
+data/models/
+
+# Per-machine GUI state
+data/settings.json
+data/review_state.json
 
 # Generated artefacts — models and training chips
 *.pkl
