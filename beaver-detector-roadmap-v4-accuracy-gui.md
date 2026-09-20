@@ -83,7 +83,10 @@ With ~99 positive locations, better data will help more than a better model.
 - [x] **R4.2: Smooth and use hysteresis thresholding.** Apply a 3 × 3 mean filter to the probability map, then seed regions at ≥ 0.7 and grow them at ≥ 0.5. This removes speckle false positives while keeping flood outlines. *(S, P1)*
 - [ ] **R4.3: Wider or softer stream mask.** Large floods can extend more than 100 m from the stream line and get clipped at the mask edge. Widen the mask to 200–300 m and let R2.2's distance feature do the fine discrimination. *(S)*
 - [ ] **R4.4: Optional 32 px stride** for finer outlines (4× the compute). *(M, P3)*
-- [ ] **R4.5: Stop loading the full tile into memory.** `detect_rois_rf_segmentation` reads the whole tile into RAM and pads it (`polygonizer.py:83-93`), against the project's memory constraint. Read in row strips with a 512 px halo instead. This doesn't affect accuracy. *(M, P3)*
+- [ ] **R4.5: Stop loading the full tile into memory. (P1 — raised from P3 after a real incident.)** `detect_rois_rf_segmentation` reads the whole tile into RAM and pads it (`polygonizer.py:83-93`): for a 6 km tile that is ~432 MB plus a ~508 MB padded copy, about 1 GB resident.
+  - **Incident 2026-09-19:** a single-tile detection run took **over 12 hours at 3 % CPU** instead of ~12 minutes. Not a deadlock — the machine (13 GB RAM, 7 GB swap) was already swapping because three build agents and a leftover GUI process were running, and this 1 GB allocation tipped it into thrash. The same command on an idle machine finished in 11.7 minutes.
+  - Fix: process the tile in row strips with a 512 px halo so peak memory stays bounded (target well under ~200 MB), and verify the detections are unchanged.
+  - Also consider a `--workers` option: the thread pool defaults to 8 and each worker holds chip-sized temporaries. *(M)*
 
 **Suggested order:** R0.1–R0.5 → R1.3, R4.1, R4.2 (quick wins) → R1.1, R1.4, R1.5 → R3.1, R3.5 → R1.2 with G2.1 → R2.1, R2.2, R2.3 → the rest.
 
